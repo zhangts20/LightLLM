@@ -161,6 +161,25 @@ class MMWeightTpl(BaseWeightTpl):
         ), f"dim must be divisible by tp_world_size_, but found: {dim} % {self.tp_world_size_}"
         return dim // self.tp_world_size_
 
+    def _to_device(self, device: str) -> None:
+        target_device = f"{device}:{get_current_device_id()}"
+        if self.mm_param.weight is not None:
+            if self.quant_method is not None:
+                self.mm_param.weight = self.mm_param.weight.to(device=target_device)
+            else:
+                # 让 k dim 更连续，大多数split k 算法的算子可能能更快
+                self.mm_param.weight = (
+                    self.mm_param.weight.to(self.data_type_).to(device=target_device).transpose(0, 1)
+                )
+        if self.mm_param.weight_scale is not None:
+            self.mm_param.weight_scale = self.mm_param.weight_scale.to(device=target_device)
+        if self.mm_param.weight_zero_point is not None:
+            self.mm_param.weight_zero_point = self.mm_param.weight_zero_point.to(device=target_device)
+        if self.mm_param.bias is not None:
+            # TODO 是不是所有的bias都需要转换为全局设置的数据类型吗，会不会影响精度
+            self.mm_param.bias = self.mm_param.bias.to(self.data_type_).to(device=target_device)
+        return
+
 
 class BMMWeightTpl(BaseWeightTpl):
     def __init__(

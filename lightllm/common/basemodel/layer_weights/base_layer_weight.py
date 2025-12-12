@@ -42,3 +42,6 @@ class BaseLayerWeight:
 
     def _cuda(self, cpu_tensor):
         return cpu_tensor.contiguous().to(self.data_type_).cuda(get_current_device_id())
+
+    def _npu(self, cpu_tensor):
+        return cpu_tensor.contiguous().to(self.data_type_).npu(get_current_device_id())

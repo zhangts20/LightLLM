@@ -115,6 +115,43 @@ def token_att_fwd(q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen
     return
 
 
+@torch.no_grad()
+def torch_token_att_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    att_out: torch.Tensor,
+    req_to_tokens: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_Start_Loc: torch.Tensor,
+    b_Seqlen: torch.Tensor,
+    max_len_in_batch: int,
+) -> None:
+    batch_size, H, D = q.shape
+    H_k = k.shape[1]
+    kv_group_num = H // H_k
+    sm_scale = 1.0 / (D ** 0.5)
+
+    for b in range(batch_size):
+        seq_len = b_Seqlen[b]
+        start_idx = b_Start_Loc[b]
+        req_idx = b_req_idx[b]
+
+        k_locs = req_to_tokens[req_idx, :seq_len]
+        k_sel = k[k_locs]
+
+        k_full = k_sel[:, :, :].repeat_interleave(kv_group_num, dim=1)
+        k_full = k_full.permute(1, 0, 2)
+        att = torch.bmm(q[b].unsqueeze(1), k_full.transpose(1, 2)).squeeze(1)
+
+        att = att * sm_scale
+        att = att.to(att_out.dtype)
+        out_idx = torch.arange(start_idx, start_idx + seq_len, device=q.device)
+
+        att_out[:, out_idx] = att
+
+    return att_out
+
+
 @triton.jit
 def _fwd_kernel_token_att1_int8(
     Q,

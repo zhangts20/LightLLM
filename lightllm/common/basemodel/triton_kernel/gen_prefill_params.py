@@ -107,5 +107,6 @@ def gen_prefill_params(input_token_num: int, b_ready_cache_len: torch.Tensor, b_
         num_warps=num_warps,
         num_stages=1,
     )
+
     b_kv_seq_len = b_seq_len
     return b_q_seq_len, b1_cu_q_seq_len, b_kv_seq_len, b1_cu_kv_seq_len, position_ids

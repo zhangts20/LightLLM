@@ -7,7 +7,7 @@ from lightllm.distributed import dist_group_manager
 from lightllm.models import get_model
 from lightllm.server.api_cli import make_argument_parser
 from lightllm.utils.dist_utils import init_distributed_env
-from lightllm.utils.envs_utils import DEVICE, set_env_start_args
+from lightllm.utils.envs_utils import set_env_start_args, is_npu
 
 
 class LightLLMInfer:
@@ -15,10 +15,9 @@ class LightLLMInfer:
     def __init__(
         self,
         args: argparse.Namespace,
-        device: str,
     ) -> None:
         self.dtype = getattr(torch, args.data_type)
-        self.device = device
+        self.device = "npu" if is_npu() else "cuda"
         # 初始化模型
         model_cfg, _ = PretrainedConfig.get_config_dict(args.model_dir)
         model_kvargs = {
@@ -89,8 +88,9 @@ class LightLLMInfer:
             "b_ready_cache_len": b_ready_cache_len,
         }
 
-    def prefill(
+    def _infer_impl(
         self,
+        *,
         batch_size: int,
         max_len_in_batch: int,
         input_ids: torch.Tensor,
@@ -99,73 +99,51 @@ class LightLLMInfer:
         b_mtp_index: torch.Tensor,
         b_seq_len: torch.Tensor,
         total_token_num: int,
-        b_ready_cache_len: torch.Tensor,
+        b_ready_cache_len: torch.Tensor = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
-        b_mtp_index = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
-        b_prefill_start_loc = b_seq_len.cumsum(dim=0,
-                                               dtype=torch.int32) - b_seq_len
+        if is_prefill:
+            max_q_seq_len = max_len_in_batch
+            max_kv_seq_len = max_len_in_batch
+            b_mtp_index = torch.zeros(batch_size,
+                                      dtype=torch.int32,
+                                      device="cpu")
+            b_prefill_start_loc = b_seq_len.cumsum(
+                dim=0, dtype=torch.int32) - b_seq_len
+            prefix_total_token_num = 0
+        else:
+            max_q_seq_len = 1
+            max_kv_seq_len = max_len_in_batch
+            b_prefill_start_loc = None
+            prefix_total_token_num = None
+            b_ready_cache_len = None
+
         model_input = ModelInput(
             batch_size=batch_size,
             total_token_num=total_token_num,
             max_len_in_batch=max_len_in_batch,
-            max_q_seq_len=max_len_in_batch,
-            max_kv_seq_len=max_len_in_batch,
-            max_cache_len=0,
+            max_q_seq_len=max_q_seq_len,
+            max_kv_seq_len=max_kv_seq_len,
             input_ids=input_ids,
             b_req_idx=b_req_idx,
             b_seq_len=b_seq_len,
             b_mtp_index=b_mtp_index,
             mem_indexes_cpu=mem_indexes,
-            is_prefill=True,
+            is_prefill=is_prefill,
             b_ready_cache_len=b_ready_cache_len,
             b_prefill_start_loc=b_prefill_start_loc,
-            prefix_total_token_num=0,
+            prefix_total_token_num=prefix_total_token_num,
         )
+        output = self.model_part.forward(model_input)
 
-        model_output = self.model_part.forward(model_input)
-
-        return model_output.logits
-
-    def decode(
-        self,
-        batch_size: int,
-        max_len_in_batch: int,
-        input_ids: torch.Tensor,
-        mem_indexes: torch.Tensor,
-        b_req_idx: torch.Tensor,
-        b_mtp_index: torch.Tensor,
-        b_seq_len: torch.Tensor,
-        total_token_num: torch.Tensor,
-    ) -> torch.Tensor:
-        model_input = ModelInput(
-            batch_size=batch_size,
-            total_token_num=total_token_num,
-            max_len_in_batch=max_len_in_batch,
-            max_q_seq_len=1,
-            max_kv_seq_len=max_len_in_batch,
-            input_ids=input_ids,
-            b_req_idx=b_req_idx,
-            b_seq_len=b_seq_len,
-            b_mtp_index=b_mtp_index,
-            mem_indexes_cpu=mem_indexes,
-            is_prefill=False,
-        )
-        model_output = self.model_part.forward(model_input)
-
-        return model_output.logits
+        return output.logits
 
     def run_infer(self, prompt: str, max_tokens: int):
         all_output_ids = []
         inputs = self.prepare_model_input(prompt)
         for i in range(max_tokens):
-            is_prefill = i == 0
-            if is_prefill:
-                logits = self.prefill(**inputs)
-            else:
-                if "b_ready_cache_len" in inputs:
-                    inputs.pop("b_ready_cache_len")
-                logits = self.decode(**inputs)
-
+            inputs.update({"is_prefill": i == 0})
+            logits = self._infer_impl(**inputs)
             prob_out = torch.softmax(logits, dim=-1)
             predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
             all_output_ids.append(predict_ids.item())
@@ -188,15 +166,14 @@ class LightLLMInfer:
 if __name__ == "__main__":
     parser = make_argument_parser()
     parser.add_argument("--prompt", default="What is AI?")
-    parser.add_argument("--max-tokens", default=17)
-    parser.add_argument("--device", default=DEVICE)
+    parser.add_argument("--max_tokens", type=int, default=17)
 
     args = parser.parse_args()
     set_env_start_args(args)
 
-    torch.multiprocessing.set_start_method("spawn")
+    # torch.multiprocessing.set_start_method("spawn")
 
-    lightllm_infer = LightLLMInfer(args, device=args.device)
+    lightllm_infer = LightLLMInfer(args)
     generated_text = lightllm_infer.run_infer(prompt=args.prompt,
                                               max_tokens=args.max_tokens)
     print(f"{generated_text!r}")

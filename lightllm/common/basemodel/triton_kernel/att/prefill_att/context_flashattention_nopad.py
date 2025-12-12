@@ -123,7 +123,11 @@ def _fwd_kernel(
 def context_attention_fwd(
     q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs
 ):
+    from lightllm.utils.envs_utils import is_npu
+
     BLOCK_M = 128 if not is_tesla() else 64
+    if is_npu():
+        BLOCK_M = 32
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -508,44 +512,56 @@ def context_attention_fwd_contiguous_kv(
     )
 
 
-def torch_context_attention_fwd(q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, req_to_token_indexs):
-
+@torch.no_grad()
+def torch_context_attention_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    b_prompt_cache_len: torch.Tensor,
+    max_len_in_batch: int,
+    req_to_token_indexs: torch.Tensor,
+):
     batch = b_start_loc.shape[0]
-    print(q.shape)
+    Hq = q.shape[1]
+    Hkv = k.shape[1]
+    assert Hq % Hkv == 0
+    kv_group_num = Hq // Hkv
+
+    D = q.shape[-1]
+
+    arange_max = torch.arange(max_len_in_batch, device=q.device)
     for i in range(batch):
         req_idx = b_req_idx[i]
         start_loc = b_start_loc[i]
-        seq_len = b_seq_len[i]
+        seq_len_full = b_seq_len[i]
         prompt_cache_len = b_prompt_cache_len[i]
-        cur_q = q[start_loc : start_loc + seq_len - prompt_cache_len, :, :]
-        cur_q = cur_q.clone().to(torch.float32)
-        print(cur_q.shape)
+        cur_seq_len = seq_len_full - prompt_cache_len
 
-        kv_loc = req_to_token_indexs[req_idx, :seq_len]
-        cur_k = k[kv_loc, :, :]
-        cur_k = cur_k.clone().to(torch.float32)
+        kv_loc_all = req_to_token_indexs[req_idx]
+        kv_loc = kv_loc_all[:cur_seq_len].long()
 
-        cur_v = v[kv_loc, :, :]
-        cur_v = cur_v.clone().to(torch.float32)
+        q_slice = q[start_loc : start_loc + cur_seq_len]
 
-        cur_q = cur_q.transpose(0, 1)
-        cur_k = cur_k.transpose(0, 1)
-        cur_v = cur_v.transpose(0, 1)
+        k_slice = k[kv_loc].repeat_interleave(kv_group_num, dim=1)
+        v_slice = v[kv_loc].repeat_interleave(kv_group_num, dim=1)
 
-        dk = cur_q.shape[-1]
+        scores = torch.einsum("lhd,shd->lhs", q_slice, k_slice) / math.sqrt(D)
 
-        p = torch.matmul(cur_q, cur_k.transpose(-2, -1)) / torch.sqrt(torch.tensor(dk, dtype=torch.float32))
+        q_idx = arange_max[:cur_seq_len].unsqueeze(1)
+        k_idx = arange_max[:cur_seq_len].unsqueeze(0)
+        mask = (q_idx + prompt_cache_len >= k_idx)
 
-        q_index = torch.arange(cur_q.shape[1]).unsqueeze(-1).to(p.device)
-        k_index = torch.arange(cur_k.shape[1]).unsqueeze(0).to(p.device)
-        mask = (q_index + prompt_cache_len >= k_index).int()
-        mask = mask.unsqueeze(0).expand(cur_q.shape[0], -1, -1)
+        scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
 
-        p = p.masked_fill(mask == 0, float("-inf"))
+        att = torch.softmax(scores, dim=-1)
 
-        s = F.softmax(p, dim=-1)
+        out = torch.einsum("lhs,shd->lhd", att, v_slice)
 
-        o[start_loc : start_loc + seq_len - prompt_cache_len, :, :] = torch.matmul(s, cur_v).transpose(0, 1)
+        o[start_loc : start_loc + cur_seq_len] = out.to(o.dtype)
 
 
 @torch.no_grad()

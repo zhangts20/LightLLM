@@ -38,6 +38,18 @@ def embedding_kernel(
 
 
 @torch.no_grad()
+def torch_embedding(
+    input_ids: torch.Tensor,
+    weight: torch.Tensor,
+    vob_start_id: int,
+    vob_end_id: int,
+    out: torch.Tensor,
+) -> None:
+    returned_out = embedding_old(input_ids, weight, vob_start_id, vob_end_id)
+    out.copy_(returned_out)
+
+
+@torch.no_grad()
 def embedding(input_ids, weight: torch.Tensor, vob_start_id, vob_end_id, out: torch.Tensor):
 
     BLOCK_N = 64
