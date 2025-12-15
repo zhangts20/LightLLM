@@ -3,7 +3,7 @@ import collections
 from lightllm.utils.log_utils import init_logger
 from .kv_cache_mem_manager import MemoryManager
 from typing import List, Optional
-from lightllm.common.basemodel.triton_kernel.gen_sampling_params import token_id_counter
+from lightllm.common.basemodel.triton_kernel.gen_sampling_params import token_id_counter, torch_update_req_to_token_id_counter
 from lightllm.common.basemodel.triton_kernel.gen_sampling_params import update_req_to_token_id_counter
 from lightllm.utils.device_utils import is_npu
 from lightllm.utils.envs_utils import enable_env_vars, get_env_start_args
@@ -180,7 +180,8 @@ class ReqSamplingParamsManager:
 
         assert b_req_idx.is_cuda and next_token_ids.is_cuda and b_req_idx.shape[0] == next_token_ids.shape[0]
 
-        update_req_to_token_id_counter(
+        forward_func = torch_update_req_to_token_id_counter if b_req_idx.device.type == "npu" else update_req_to_token_id_counter
+        forward_func(
             b_req_idx=b_req_idx,
             next_token_ids=next_token_ids,
             req_to_out_token_id_counter=self.req_to_out_token_id_counter,

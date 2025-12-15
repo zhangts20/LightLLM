@@ -17,7 +17,7 @@ from lightllm.server.req_id_generator import convert_sub_id_to_group_id
 from lightllm.common.basemodel.infer_lock import g_infer_state_lock
 from lightllm.server.multimodal_params import MultimodalParams
 from lightllm.utils.custom_kernel_utis import custom_cat
-from lightllm.utils.envs_utils import get_env_start_args
+from lightllm.utils.envs_utils import get_env_start_args, is_npu
 from lightllm.server.pd_io_struct import NIXLDecodeNodeInfo
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 
@@ -65,6 +65,7 @@ class InferenceContext:
         return
 
     def get_overlap_stream(self) -> torch.cuda.Stream:
+        stream = torch.npu.Stream() if is_npu() else torch.cuda.Stream()
         if self.overlap_stream is None:
             if is_npu():
                 self.overlap_stream = torch.npu.Stream()
@@ -73,6 +74,7 @@ class InferenceContext:
         return self.overlap_stream
 
     def get_cpu_kv_cache_stream(self) -> torch.cuda.Stream:
+        stream = torch.npu.Stream() if is_npu() else torch.cuda.Stream()
         if self.cpu_kv_cache_stream is None:
             if is_npu():
                 self.cpu_kv_cache_stream = torch.npu.Stream()

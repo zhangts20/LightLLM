@@ -13,7 +13,7 @@ def custom_cat(tensors):
     if not isinstance(tensors, (list, tuple)):
         raise ValueError("Input must be a list of tensors")
 
-    assert tensors[0].is_cuda and len(tensors[0].shape) == 1
+    # assert tensors[0].is_cuda and len(tensors[0].shape) == 1
     sizes = [t.shape[0] for t in tensors]
     dest_size = sum(sizes)
     out_tensor = torch.empty((dest_size,), dtype=tensors[0].dtype, device="cpu", pin_memory=True)

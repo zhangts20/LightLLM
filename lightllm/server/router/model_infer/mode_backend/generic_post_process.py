@@ -141,6 +141,7 @@ def _get_post_sample_tensors(reqs: List[InferReq]):
     length_penalty_param_cpu = torch.tensor(length_penalty_param, dtype=torch.int32, device="cpu", pin_memory=True)
     mask_eos_reqs_cpu = torch.tensor(mask_eos_reqs, dtype=torch.bool, device="cpu", pin_memory=True)
 
+    device = "npu" if is_npu() else "cuda"
     return (
         req_idxes_cpu.to(device=device, non_blocking=True),
         temperatures_cpu.to(device=device, non_blocking=True),

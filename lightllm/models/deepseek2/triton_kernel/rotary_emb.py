@@ -118,13 +118,13 @@ def get_static_key(q, k):
     }
 
 
-@autotune(
-    kernel_name="rotary_emb_fwd:v1",
-    configs_gen_func=get_test_configs,
-    static_key_func=get_static_key,
-    run_key_func=lambda q: q.shape[0],
-    mutates_args=["q", "k"],
-)
+# @autotune(
+#     kernel_name="rotary_emb_fwd:v1",
+#     configs_gen_func=get_test_configs,
+#     static_key_func=get_static_key,
+#     run_key_func=lambda q: q.shape[0],
+#     mutates_args=["q", "k"],
+# )
 @torch.no_grad()
 def rotary_emb_fwd(q, k, cos, sin, run_config=None):
     total_len = q.shape[0]
