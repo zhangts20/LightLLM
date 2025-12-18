@@ -1,5 +1,6 @@
 import torch
 
+from lightllm.utils.envs_utils import is_npu
 import triton
 import triton.language as tl
 import math
@@ -87,6 +88,9 @@ def token_att_fwd(q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen
     else:
         num_warps = 2
 
+    if is_npu():
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
     _fwd_kernel_token_att1[grid](
         q,
         k,
