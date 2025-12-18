@@ -8,6 +8,7 @@ import math
 import torch.nn.functional as F
 
 from lightllm.utils.device_utils import is_tesla
+from lightllm.utils.envs_utils import is_npu
 
 
 @triton.jit

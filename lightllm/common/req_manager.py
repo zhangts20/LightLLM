@@ -180,8 +180,7 @@ class ReqSamplingParamsManager:
 
         assert b_req_idx.is_cuda and next_token_ids.is_cuda and b_req_idx.shape[0] == next_token_ids.shape[0]
 
-        forward_func = torch_update_req_to_token_id_counter if b_req_idx.device.type == "npu" else update_req_to_token_id_counter
-        forward_func(
+        update_req_to_token_id_counter(
             b_req_idx=b_req_idx,
             next_token_ids=next_token_ids,
             req_to_out_token_id_counter=self.req_to_out_token_id_counter,
