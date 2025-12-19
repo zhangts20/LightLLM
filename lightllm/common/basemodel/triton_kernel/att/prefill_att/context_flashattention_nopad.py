@@ -531,43 +531,45 @@ def torch_context_attention_fwd(
     max_len_in_batch: int,
     req_to_token_indexs: torch.Tensor,
 ):
+    device = q.device
     batch = b_start_loc.shape[0]
-    Hq = q.shape[1]
-    Hkv = k.shape[1]
-    assert Hq % Hkv == 0
-    kv_group_num = Hq // Hkv
-
+    H = q.shape[1]
+    kv_group_num = H // k.shape[1]
     D = q.shape[-1]
 
-    arange_max = torch.arange(max_len_in_batch, device=q.device)
-    for i in range(batch):
-        req_idx = b_req_idx[i]
-        start_loc = b_start_loc[i]
-        seq_len_full = b_seq_len[i]
-        prompt_cache_len = b_prompt_cache_len[i]
-        cur_seq_len = seq_len_full - prompt_cache_len
+    scale = 1.0 / math.sqrt(D)
 
-        kv_loc_all = req_to_token_indexs[req_idx]
-        kv_loc = kv_loc_all[:cur_seq_len].long()
+    for b in range(batch):
+        req_idx = b_req_idx[b].item()
+        start_loc = b_start_loc[b].item()
+        seq_len_full = b_seq_len[b].item()
+        prompt_cache_len = b_prompt_cache_len[b].item()
+        L = seq_len_full - prompt_cache_len
+        if L <= 0:
+            continue
 
-        q_slice = q[start_loc : start_loc + cur_seq_len]
+        kv_loc = req_to_token_indexs[req_idx][:seq_len_full].long()
 
+        q_slice = q[start_loc : start_loc + L]
         k_slice = k[kv_loc].repeat_interleave(kv_group_num, dim=1)
         v_slice = v[kv_loc].repeat_interleave(kv_group_num, dim=1)
 
-        scores = torch.einsum("lhd,shd->lhs", q_slice, k_slice) / math.sqrt(D)
+        q_h = q_slice.transpose(0, 1)
+        k_h = k_slice.transpose(0, 1)
+        v_h = v_slice.transpose(0, 1)
 
-        q_idx = arange_max[:cur_seq_len].unsqueeze(1)
-        k_idx = arange_max[:cur_seq_len].unsqueeze(0)
-        mask = (q_idx + prompt_cache_len >= k_idx)
+        scores = torch.matmul(q_h, k_h.transpose(1, 2)) * scale
 
-        scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
+        q_pos = torch.arange(L, device=device) + prompt_cache_len
+        k_pos = torch.arange(seq_len_full, device=device)
+        causal_mask = q_pos[:, None] >= k_pos[None, :]
 
-        att = torch.softmax(scores, dim=-1)
+        scores = scores.masked_fill(~causal_mask[None, :, :], torch.finfo(scores.dtype).min)
 
-        out = torch.einsum("lhs,shd->lhd", att, v_slice)
+        p = F.softmax(scores, dim=-1)
+        out = torch.matmul(p, v_h)
 
-        o[start_loc : start_loc + cur_seq_len] = out.to(o.dtype)
+        o[start_loc : start_loc + L] = out.transpose(0, 1).to(o.dtype)
 
 
 @torch.no_grad()
