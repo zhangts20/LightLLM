@@ -367,6 +367,11 @@ class ModeBackend:
 
     def _try_read_new_reqs_normal(self):
         if self.is_master_in_node:
+            if self.node_broadcast_tensor is None:
+                self.node_broadcast_tensor = torch.tensor([0],
+                                                          dtype=torch.int32,
+                                                          device=self.model.device,
+                                                          requires_grad=False)
             if self.shm_reqs_io_buffer.is_ready():
                 self.node_broadcast_tensor.fill_(1)
             else:
