@@ -268,13 +268,13 @@ def _get_moe_align_fused_configs():
     ]
 
 
-# @autotune(
-#     kernel_name="moe_align_fused:v1",
-#     configs_gen_func=_get_moe_align_fused_configs,
-#     static_key_func=_get_moe_align_fused_static_key,
-#     run_key_func=lambda topk_ids: topk_ids.shape[0],
-#     mutates_args=["expert_to_token_index", "expert_to_weight", "expert_token_num"],
-# )
+@autotune(
+    kernel_name="moe_align_fused:v1",
+    configs_gen_func=_get_moe_align_fused_configs,
+    static_key_func=_get_moe_align_fused_static_key,
+    run_key_func=lambda topk_ids: topk_ids.shape[0],
+    mutates_args=["expert_to_token_index", "expert_to_weight", "expert_token_num"],
+)
 def moe_align_fused(
     expert_to_token_index, expert_to_weight, expert_token_num, topk_ids, topk_weights, run_config: Optional[dict] = None
 ):
@@ -671,13 +671,13 @@ def _get_grouped_matmul_configs():
     ]
 
 
-# @autotune(
-#     kernel_name="grouped_matmul:v1",
-#     configs_gen_func=_get_grouped_matmul_configs,
-#     static_key_func=_get_grouped_matmul_static_key,
-#     run_key_func=lambda token_inputs: token_inputs.shape[0],
-#     mutates_args=["out"],
-# )
+@autotune(
+    kernel_name="grouped_matmul:v1",
+    configs_gen_func=_get_grouped_matmul_configs,
+    static_key_func=_get_grouped_matmul_static_key,
+    run_key_func=lambda token_inputs: token_inputs.shape[0],
+    mutates_args=["out"],
+)
 def grouped_matmul(
     token_num_mul_topk_num: int,
     token_inputs: torch.Tensor,

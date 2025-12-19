@@ -99,13 +99,13 @@ def _get_silu_and_mul_static_key(input: torch.Tensor, output: torch.Tensor):
     return {"N": input.shape[-1] // 2, "out_dtype": str(output.dtype)}
 
 
-# @autotune(
-#     kernel_name="silu_and_mul_fwd:v1",
-#     configs_gen_func=_get_silu_and_mul_configs,
-#     static_key_func=_get_silu_and_mul_static_key,
-#     run_key_func=lambda input: input.shape[0],
-#     mutates_args=["output"],
-# )
+@autotune(
+    kernel_name="silu_and_mul_fwd:v1",
+    configs_gen_func=_get_silu_and_mul_configs,
+    static_key_func=_get_silu_and_mul_static_key,
+    run_key_func=lambda input: input.shape[0],
+    mutates_args=["output"],
+)
 def silu_and_mul_fwd(
     input: torch.Tensor, output: torch.Tensor, layout="blocked", limit=None, alpha=None, run_config=None
 ):
