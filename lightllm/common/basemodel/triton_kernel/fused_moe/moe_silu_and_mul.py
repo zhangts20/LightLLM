@@ -157,3 +157,52 @@ def silu_and_mul_fwd(
         USE_LIMIT_AND_ALPHA=USE_LIMIT_AND_ALPHA,
     )
     return
+
+
+def torch_silu_and_mul_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    layout="blocked",
+    limit=None,
+    alpha=None,
+) -> None:
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert input.dim() == 2
+    assert output.dim() == 2
+    assert (limit is None and alpha is None) or (limit is not None and alpha is not None)
+
+    M = input.shape[0]
+    N = input.shape[1] // 2
+    assert output.shape == (M, N)
+
+    if layout == "blocked":
+        gate = input[:, :N]
+        up   = input[:, N:]
+    elif layout == "interleaved":
+        gate = input[:, 0::2]
+        up   = input[:, 1::2]
+    else:
+        raise ValueError(f"unknown layout: {layout}")
+
+    if limit is not None and alpha is not None:
+        gate_fp32 = gate.float()
+        gate_fp32 = torch.minimum(
+            gate_fp32,
+            torch.tensor(limit, device=gate.device, dtype=gate_fp32.dtype),
+        )
+
+        up_clip = torch.clamp(up, -limit, limit)
+
+        gate_act = torch.sigmoid(gate_fp32 * alpha) * gate_fp32
+        gate_act = gate_act.to(input.dtype)
+
+        out = (up_clip + 1) * gate_act
+    else:
+        gate_fp32 = gate.float()
+        gate_act = gate_fp32 / (1.0 + torch.exp(-gate_fp32))
+        gate_act = gate_act.to(input.dtype)
+
+        out = up * gate_act
+
+    output.copy_(out)

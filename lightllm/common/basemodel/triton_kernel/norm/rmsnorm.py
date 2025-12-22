@@ -79,8 +79,13 @@ def rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float, out=None)
     return y
 
 
-def torch_rms_norm(x, weight, eps):
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+def torch_rms_norm(x, weight, eps, out = None):
+    torch_out = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+    if out is not None:
+        out.copy_(torch_out)
+        return
+
+    return torch_out
 
 
 def test_rms_norm(M, N, dtype, eps=1e-5, device="cuda"):

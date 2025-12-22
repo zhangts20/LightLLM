@@ -156,7 +156,8 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         input = input.view(-1, self.embed_dim_)
         up_gate_out = layer_weight.gate_up_proj.mm(input)
         ffn1_out = self.alloc_tensor((input.size(0), up_gate_out.size(1) // 2), input.dtype, device=input.device)
-        silu_and_mul_fwd(up_gate_out, ffn1_out)
+        forward_call = torch_silu_and_mul_fwd if input.device.type == "npu" else silu_and_mul_fwd
+        forward_call(up_gate_out, ffn1_out)
         input = None
         up_gate_out = None
         ffn2_out = layer_weight.down_proj.mm(ffn1_out)
