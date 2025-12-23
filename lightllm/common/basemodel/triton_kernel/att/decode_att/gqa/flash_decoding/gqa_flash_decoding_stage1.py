@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from lightllm.utils.device_utils import is_npu
 
+from lightllm.utils.envs_utils import is_npu
+
 
 @triton.jit
 def _fwd_kernel_flash_decode_stage1(
@@ -152,7 +154,6 @@ def flash_decode_stage1(
         q = q.to(torch.float32)
         k = k.to(torch.float32)
         v = v.to(torch.float32)
-
     _fwd_kernel_flash_decode_stage1[grid](
         q,
         k,

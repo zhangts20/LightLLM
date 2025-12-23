@@ -44,7 +44,7 @@ def get_output_length(input_num: int, output_len: int) -> List[int]:
 
 
 def gen_random_input_text(input_len, tokenizer) -> str:
-    random_ids = [random.randint(512, 8192) for _ in range(1024)]
+    random_ids = [random.randint(512, 8192) for _ in range(input_len)]
     random_text = tokenizer.decode(random_ids)
     return random_text
 
