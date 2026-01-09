@@ -65,6 +65,7 @@ def init_vision_distributed_env(kvargs):
     visual_gpu_ids = kvargs["visual_gpu_ids"]
     device_id = visual_gpu_ids[kvargs["vit_rank_id"]]
     set_current_device_id(device_id)
+
     device = "npu" if is_npu() else "cuda"
     if device == "cuda":
         torch.cuda.set_device(device_id)
@@ -89,7 +90,7 @@ def init_vision_distributed_env(kvargs):
         # warmup nccl communicator
         _a = torch.zeros([1]).to(f"npu:{device_id}")
     else:
-        raise TypeError(f"Unsupported device type: {DEVICE}")
+        raise TypeError(f"Unsupported device type: {device}")
     dist.all_reduce(_a)
     del _a
 

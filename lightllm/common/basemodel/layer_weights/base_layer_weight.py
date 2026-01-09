@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import threading
 from lightllm.common.basemodel.layer_weights.meta_weights import BaseWeight
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import get_current_device_id, get_current_rank_in_dp, get_dp_world_size
 from lightllm.utils.device_utils import is_npu
 

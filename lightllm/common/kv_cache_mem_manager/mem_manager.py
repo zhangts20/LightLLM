@@ -6,6 +6,7 @@ import torch.multiprocessing as mp
 from typing import List, Union, Tuple, Any
 from lightllm.common.kv_trans_kernel.kv_trans_v2 import kv_trans_for_dp
 from lightllm.server.pd_io_struct import KVMoveTask
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
 from lightllm.utils.profile_max_tokens import get_available_gpu_memory, get_total_gpu_memory

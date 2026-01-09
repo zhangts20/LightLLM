@@ -23,6 +23,7 @@ from lightllm.common.basemodel.cuda_graph import CudaGraph
 from lightllm.common.basemodel.prefill_cuda_graph import PrefillCudaGraph
 from lightllm.common.quantization import Quantcfg
 from lightllm.common.basemodel.triton_kernel.gather_token_id import gather_token
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_dp_world_size
 from lightllm.utils.envs_utils import get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num

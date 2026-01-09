@@ -17,7 +17,7 @@ from lightllm.server.req_id_generator import convert_sub_id_to_group_id
 from lightllm.common.basemodel.infer_lock import g_infer_state_lock
 from lightllm.server.multimodal_params import MultimodalParams
 from lightllm.utils.custom_kernel_utis import custom_cat
-from lightllm.utils.envs_utils import get_env_start_args, is_npu
+from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.server.pd_io_struct import NIXLDecodeNodeInfo
 from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 

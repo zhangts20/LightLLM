@@ -1,5 +1,6 @@
 import torch
 import collections
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from .kv_cache_mem_manager import MemoryManager
 from typing import List, Optional

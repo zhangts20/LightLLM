@@ -6,8 +6,9 @@ from lightllm.common.basemodel.batch_objs import ModelInput
 from lightllm.distributed import dist_group_manager
 from lightllm.models import get_model
 from lightllm.server.api_cli import make_argument_parser
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import init_distributed_env
-from lightllm.utils.envs_utils import set_env_start_args, is_npu
+from lightllm.utils.envs_utils import set_env_start_args 
 
 
 class LightLLMInfer:
@@ -141,6 +142,34 @@ class LightLLMInfer:
     def run_infer(self, prompt: str, max_tokens: int):
         all_output_ids = []
         inputs = self.prepare_model_input(prompt)
+
+        # import torch_npu
+        # experimental_config = torch_npu.profiler._ExperimentalConfig(
+        #     export_type=[
+        #         torch_npu.profiler.ExportType.Text
+        #         ],
+        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+        #     msprof_tx=False,
+        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        #     l2_cache=False,
+        #     op_attr=False,
+        #     data_simplification=False,
+        #     record_op_args=False,
+        #     gc_detect_threshold=None
+        # )
+        # with torch_npu.profiler.profile(
+        #     activities=[
+        #         torch_npu.profiler.ProfilerActivity.CPU,
+        #         torch_npu.profiler.ProfilerActivity.NPU
+        #         ],
+        #     schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=1),
+        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
+        #     record_shapes=False,
+        #     profile_memory=False,
+        #     with_stack=False,
+        #     with_modules=False,
+        #     with_flops=False,
+        #     experimental_config=experimental_config) as prof:
         for i in range(max_tokens):
             inputs.update({"is_prefill": i == 0})
             logits = self._infer_impl(**inputs)
@@ -155,6 +184,8 @@ class LightLLMInfer:
                 "mem_indexes"] = self.model_part.req_manager.mem_manager.alloc(
                     predict_ids.shape[0])
             inputs["max_len_in_batch"] = inputs["max_len_in_batch"] + i + 1
+            # prof.step()
+        
         # 释放
         self.model_part.mem_manager.free_all()
         self.model_part.req_manager.free_all()
@@ -165,7 +196,7 @@ class LightLLMInfer:
 
 if __name__ == "__main__":
     parser = make_argument_parser()
-    parser.add_argument("--prompt", default="What is AI?")
+    parser.add_argument("--prompt", default="What is Deep Learning?")
     parser.add_argument("--max_tokens", type=int, default=17)
 
     args = parser.parse_args()

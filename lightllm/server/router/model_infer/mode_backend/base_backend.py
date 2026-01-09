@@ -18,7 +18,7 @@ from lightllm.common.basemodel.basemodel import TpPartBaseModel
 from lightllm.common.basemodel.batch_objs import ModelOutput, ModelInput
 from lightllm.common.basemodel.triton_kernel.mtp_utils import mtp_verify
 from lightllm.utils.dist_utils import init_distributed_env
-from lightllm.utils.envs_utils import get_unique_server_name, is_npu
+from lightllm.utils.envs_utils import get_unique_server_name
 from lightllm.server.core.objs import ShmReqManager, StartArgs
 from lightllm.server.core.objs.io_objs import AbortedReqCmd, StopStrMatchedReqCmd
 from lightllm.server.router.model_infer.infer_batch import g_infer_context

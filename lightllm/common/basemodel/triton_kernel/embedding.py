@@ -1,5 +1,4 @@
 import torch
-from lightllm.utils.envs_utils import is_npu
 import triton
 import triton.language as tl
 
@@ -97,11 +96,15 @@ def embedding(input_ids, weight: torch.Tensor, vob_start_id, vob_end_id, out: to
 
     grid = (triton.cdiv(n_ctx, BLOCK_N), 1, 1)
 
-    forward_call = embedding_kernel
-    if is_npu():
-        weight = weight.to(torch.float32)
-        forward_call = npu_embedding_kernel
-    forward_call[grid](
+    # Ascend NPU
+    if input_ids.device.type == "npu":
+        torch_out = torch.nn.functional.embedding(input_ids, weight)
+        if out is not None:
+            out.copy_(torch_out)
+            return
+        return torch_out
+
+    embedding_kernel[grid](
         weight,
         input_ids,
         out,

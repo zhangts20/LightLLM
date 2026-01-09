@@ -1,6 +1,6 @@
 import torch
 
-from lightllm.utils.envs_utils import is_npu
+from lightllm.utils.device_utils import is_npu
 import triton
 import triton.language as tl
 import math

@@ -36,6 +36,11 @@ def is_4090():
 
 
 @lru_cache(maxsize=None)
+def is_npu():
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+@lru_cache(maxsize=None)
 def get_device_sm_count():
     import triton
     from triton.runtime import driver
