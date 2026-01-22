@@ -186,23 +186,19 @@ def torch_silu_and_mul_fwd(
         raise ValueError(f"unknown layout: {layout}")
 
     if limit is not None and alpha is not None:
-        gate_fp32 = gate.float()
-        gate_fp32 = torch.minimum(
-            gate_fp32,
-            torch.tensor(limit, device=gate.device, dtype=gate_fp32.dtype),
+        gate_fp32_limit = torch.minimum(
+            gate.float(),
+            torch.tensor(limit, device=gate.device, dtype=torch.float32),
         )
 
-        up_clip = torch.clamp(up, -limit, limit)
-
-        gate_act = torch.sigmoid(gate_fp32 * alpha) * gate_fp32
+        gate_act = torch.sigmoid(gate_fp32_limit * alpha) * gate_fp32_limit
         gate_act = gate_act.to(input.dtype)
 
+        up_clip = torch.clamp(up, -limit, limit)
         out = (up_clip + 1) * gate_act
     else:
-        gate_fp32 = gate.float()
-        gate_act = gate_fp32 / (1.0 + torch.exp(-gate_fp32))
-        gate_act = gate_act.to(input.dtype)
+        import torch_npu
 
-        out = up * gate_act
+        out = torch_npu.npu_swiglu(input, dim=-1)
 
     output.copy_(out)
