@@ -46,9 +46,8 @@ def gen_cumsum_pad0_tensor(b_q_seq_len: torch.Tensor, b_kv_seq_len: torch.Tensor
     assert b_q_seq_len.shape == b_kv_seq_len.shape
     assert b_q_seq_len.is_contiguous()
 
-    device = b_q_seq_len.device
-    b1_cu_q_seq_len = torch.empty((b_q_seq_len.shape[0] + 1,), dtype=torch.int32, device=device)
-    b1_cu_kv_seq_len = torch.empty((b_kv_seq_len.shape[0] + 1,), dtype=torch.int32, device=device)
+    b1_cu_q_seq_len = torch.empty((b_q_seq_len.shape[0] + 1,), dtype=torch.int32, device=b_q_seq_len.device)
+    b1_cu_kv_seq_len = torch.empty((b_kv_seq_len.shape[0] + 1,), dtype=torch.int32, device=b_q_seq_len.device)
     _gen_cumsum_pad0_kernel[(1,)](
         b_q_seq_len,
         b1_cu_q_seq_len,

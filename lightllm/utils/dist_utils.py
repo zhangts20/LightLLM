@@ -66,19 +66,7 @@ def init_vision_distributed_env(kvargs):
     device_id = visual_gpu_ids[kvargs["vit_rank_id"]]
     set_current_device_id(device_id)
 
-    device = "npu" if is_npu() else "cuda"
-    if device == "cuda":
-        torch.cuda.set_device(device_id)
-        dist.init_process_group(
-            "nccl",
-            init_method=f'tcp://127.0.0.1:{kvargs["visual_nccl_port"]}',
-            rank=kvargs["tp_rank_id"],
-            world_size=tp_world_size,
-            device_id=torch.device(f"cuda:{device_id}"),
-        )
-        # warmup nccl communicator
-        _a = torch.zeros([1]).to(f"cuda:{device_id}")
-    elif device == "npu":
+    if is_npu():
         torch.npu.set_device(device_id)
         dist.init_process_group(
             "hccl",
@@ -90,7 +78,16 @@ def init_vision_distributed_env(kvargs):
         # warmup nccl communicator
         _a = torch.zeros([1]).to(f"npu:{device_id}")
     else:
-        raise TypeError(f"Unsupported device type: {device}")
+        torch.cuda.set_device(device_id)
+        dist.init_process_group(
+            "nccl",
+            init_method=f'tcp://127.0.0.1:{kvargs["visual_nccl_port"]}',
+            rank=kvargs["tp_rank_id"],
+            world_size=tp_world_size,
+            device_id=torch.device(f"cuda:{device_id}"),
+        )
+        # warmup nccl communicator
+        _a = torch.zeros([1]).to(f"cuda:{device_id}")
     dist.all_reduce(_a)
     del _a
 

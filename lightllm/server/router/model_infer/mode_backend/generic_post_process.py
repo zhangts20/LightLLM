@@ -143,7 +143,10 @@ def _get_post_sample_tensors(reqs: List[InferReq]):
 
     from lightllm.utils.device_utils import is_npu
 
-    device = "npu" if is_npu() else "cuda"
+    if is_npu():
+        device = "npu"
+    else:
+        device = "cuda"
     return (
         req_idxes_cpu.to(device=device, non_blocking=True),
         temperatures_cpu.to(device=device, non_blocking=True),

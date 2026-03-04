@@ -65,7 +65,10 @@ class InferenceContext:
         return
 
     def get_overlap_stream(self) -> torch.cuda.Stream:
-        stream = torch.npu.Stream() if is_npu() else torch.cuda.Stream()
+        if is_npu():
+            stream = torch.npu.Stream()
+        else:
+            stream = torch.cuda.Stream()
         if self.overlap_stream is None:
             if is_npu():
                 self.overlap_stream = torch.npu.Stream()
@@ -74,7 +77,10 @@ class InferenceContext:
         return self.overlap_stream
 
     def get_cpu_kv_cache_stream(self) -> torch.cuda.Stream:
-        stream = torch.npu.Stream() if is_npu() else torch.cuda.Stream()
+        if is_npu():
+            stream = torch.npu.Stream()
+        else:
+            stream = torch.cuda.Stream()
         if self.cpu_kv_cache_stream is None:
             if is_npu():
                 self.cpu_kv_cache_stream = torch.npu.Stream()

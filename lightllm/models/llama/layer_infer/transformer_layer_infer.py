@@ -154,17 +154,6 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
 
     def _ffn(self, input, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeight) -> torch.Tensor:
         input = input.view(-1, self.embed_dim_)
-        # bad acc 
-        # if input.device.type == "npu":
-        #     import torch_npu
-
-        #     out = torch_npu.npu_ffn(x=input.to(torch.float16),
-        #                             weight1=layer_weight.gate_up_proj.mm_param.weight.to(torch.float16),
-        #                             weight2=layer_weight.down_proj.mm_param.weight.to(torch.float16),
-        #                             activation="swiglu",
-        #                             inner_precise=1,
-        #                             output_dtype=torch.bfloat16)
-
         up_gate_out = layer_weight.gate_up_proj.mm(input)
         ffn1_out = self.alloc_tensor((input.size(0), up_gate_out.size(1) // 2), input.dtype, device=input.device)
         forward_call = torch_silu_and_mul_fwd if input.device.type == "npu" else silu_and_mul_fwd
