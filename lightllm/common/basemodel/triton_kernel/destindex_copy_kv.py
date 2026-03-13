@@ -2,7 +2,6 @@ import torch
 
 import triton
 import triton.language as tl
-from lightllm.utils.device_utils import is_npu
 
 
 @triton.jit
@@ -45,9 +44,6 @@ def destindex_copy_kv(K, DestLoc, Out):
     grid = (seq_len,)
     num_warps = 1
 
-    if is_npu():
-        K = K.to(torch.float32)
-
     _fwd_kernel_destindex_copy_kv[grid](
         K,
         DestLoc,
@@ -66,3 +62,8 @@ def destindex_copy_kv(K, DestLoc, Out):
         num_stages=1,
     )
     return
+
+
+@torch.no_grad()
+def npu_destindex_copy_kv(K, DestLoc, Out):
+    Out.index_copy_(0, DestLoc, K)

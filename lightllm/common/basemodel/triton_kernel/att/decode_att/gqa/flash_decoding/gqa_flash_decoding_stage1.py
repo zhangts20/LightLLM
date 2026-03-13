@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from lightllm.utils.device_utils import is_npu
 
 
 @triton.jit
@@ -147,6 +148,10 @@ def flash_decode_stage1(
     grid = (batch, kv_head_num, triton.cdiv(max_len_in_batch, BLOCK_SEQ))
     gqa_group_size = q.shape[1] // k.shape[1]
 
+    if is_npu():
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
+        v = v.to(torch.float32)
     _fwd_kernel_flash_decode_stage1[grid](
         q,
         k,

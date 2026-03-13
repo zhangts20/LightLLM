@@ -217,6 +217,7 @@ class QKRMSNORMWeight(RMSNormWeight):
         eps: float,
     ) -> None:
         assert input.ndim == 2 and self.weight.ndim == 1
+        # assert input.shape[-1] == self.dim, f"Expected hidden_size to be {self.dim}, but found: {input.shape[-1]}"
         head_dim = self.weight.shape[0]
         x = input.to(torch.float32)
         x = x.view(-1, head_dim)

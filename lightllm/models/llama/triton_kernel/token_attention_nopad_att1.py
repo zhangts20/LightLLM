@@ -1,6 +1,5 @@
 import torch
 
-from lightllm.utils.device_utils import is_npu
 import triton
 import triton.language as tl
 import math
@@ -88,9 +87,6 @@ def token_att_fwd(q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen
     else:
         num_warps = 2
 
-    if is_npu():
-        q = q.to(torch.float32)
-        k = k.to(torch.float32)
     _fwd_kernel_token_att1[grid](
         q,
         k,
@@ -117,51 +113,6 @@ def token_att_fwd(q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen
         num_stages=1,
     )
     return
-
-
-@torch.inference_mode()
-def npu_token_att_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    att_out: torch.Tensor,
-    req_to_tokens_indexes: torch.Tensor,
-    b_req_idx: torch.Tensor,
-    b_Start_Loc: torch.Tensor,
-    b_Seqlen: torch.Tensor,
-    max_len_in_batch: int,
-) -> None:
-    import torch_npu
-
-    batch_size, H, D = q.shape
-    # get qkv
-    q_padded = q.view(batch_size, 1, H, D).contiguous()
-    req_indices = req_to_tokens_indexes[b_req_idx][:, :max_len_in_batch]
-    k_padded = k[req_indices]
-    v_padded = v[req_indices]
-
-    k_idx = torch.arange(max_len_in_batch, device=q.device).view(1, 1, -1)
-    seq_len_expanded = b_Seqlen.view(batch_size, 1, 1)
-    mask_padding = k_idx >= seq_len_expanded
-    mask_padding = mask_padding.unsqueeze(1)
-
-    # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_fusion_attention.md
-    _attn_out, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
-        query=q_padded,
-        key=k_padded,
-        value=v_padded,
-        head_num=H,
-        input_layout="BSND",
-        atten_mask=mask_padding,
-        scale=1.0 / math.sqrt(D),
-        inner_precise=0,
-        sparse_mode=0,
-        # we can't use stream in graph mode 
-        gen_mask_parallel=False,
-        sync=True,
-    )
-    
-    att_out.copy_(_attn_out.view(batch_size, H, D))
 
 
 @triton.jit

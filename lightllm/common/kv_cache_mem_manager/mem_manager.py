@@ -74,9 +74,14 @@ class MemoryManager:
         """
         将每一层生成的kv拷贝到mem manager对应mem_index 位置中
         """
-        from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_copy_kv
+        from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_copy_kv, npu_destindex_copy_kv
 
-        destindex_copy_kv(kv, mem_index, self.kv_buffer[layer_index])
+        if is_npu():
+            destindex_copy_kv_call = npu_destindex_copy_kv
+        else:
+            destindex_copy_kv_call = destindex_copy_kv
+
+        destindex_copy_kv_call(kv, mem_index, self.kv_buffer[layer_index])
         return
 
     def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:

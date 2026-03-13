@@ -7,7 +7,7 @@ import triton.language as tl
 import math
 import torch.nn.functional as F
 
-from lightllm.utils.device_utils import is_npu, is_tesla
+from lightllm.utils.device_utils import is_tesla
 
 
 @triton.jit
