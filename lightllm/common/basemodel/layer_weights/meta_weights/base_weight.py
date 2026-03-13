@@ -1,6 +1,7 @@
 import torch
 from abc import ABC, abstractmethod
 from typing import Dict, Tuple
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import get_dp_world_size, get_current_rank_in_dp, get_current_device_id
 
 
@@ -27,6 +28,10 @@ class BaseWeightTpl(BaseWeight):
         super().__init__()
         self.tp_world_size_ = tp_world_size if tp_world_size is not None else get_dp_world_size()
         self.tp_rank_ = tp_rank if tp_rank is not None else get_current_rank_in_dp()
+        if is_npu():
+            self.device_ = "npu"
+        else:
+            self.device_ = "cuda"
         self.device_id_ = get_current_device_id()
         self.data_type_ = data_type
 

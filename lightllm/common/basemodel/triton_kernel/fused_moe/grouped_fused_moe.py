@@ -946,10 +946,9 @@ def fused_experts_impl(
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
-        device = hidden_states.device
-        expert_to_tokens = torch.empty((E, topk_num * tokens_in_chunk), dtype=torch.int32, device=device)
-        expert_to_weights = torch.empty((E, topk_num * tokens_in_chunk), dtype=torch.float32, device=device)
-        expert_to_token_num = torch.zeros((E,), dtype=torch.int32, device=device)
+        expert_to_tokens = torch.empty((E, topk_num * tokens_in_chunk), dtype=torch.int32, device=hidden_states.device)
+        expert_to_weights = torch.empty((E, topk_num * tokens_in_chunk), dtype=torch.float32, device=hidden_states.device)
+        expert_to_token_num = torch.zeros((E,), dtype=torch.int32, device=hidden_states.device)
         moe_align_fused(
             expert_to_token_index=expert_to_tokens,
             expert_to_weight=expert_to_weights,

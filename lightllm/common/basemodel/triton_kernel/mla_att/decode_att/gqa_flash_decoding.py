@@ -44,9 +44,9 @@ def gqa_token_decode_attention_flash_decoding(
     from .gqa_flash_decoding_stage1 import flash_decode_stage1
     from .gqa_flash_decoding_stage2 import flash_decode_stage2
 
-    o_tensor = alloc_tensor_func(q_nope.shape, q_nope.dtype, q_nope.device) if out is None else out
-
     device = q_rope.device
+    o_tensor = alloc_tensor_func(q_nope.shape, q_nope.dtype, device) if out is None else out
+
     fake_decode_att_block_seq = torch.empty([0], dtype=torch.int64, device=device)
     mid_o = torch.empty([q_head_num, 0, kv_lora_rank], dtype=torch.float32, device=device)
     mid_o_logexpsum = torch.empty([q_head_num, 0], dtype=torch.float32, device=device)

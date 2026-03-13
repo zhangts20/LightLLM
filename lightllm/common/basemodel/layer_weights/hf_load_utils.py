@@ -4,7 +4,6 @@ import gc
 from safetensors import safe_open
 from tqdm import tqdm
 import lightllm.utils.petrel_helper as utils
-from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import get_current_device_id
 
 

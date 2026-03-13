@@ -121,14 +121,9 @@ def _fwd_kernel(
 
 @torch.no_grad()
 def context_attention_fwd(
-    q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs
+    q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, max_kv_len, req_to_token_indexs
 ):
-    BLOCK_M = 128
-    if is_npu():
-        BLOCK_M = 32
-    else:
-        if is_tesla():
-            BLOCK_M = 64
+    BLOCK_M = 128 if not is_tesla() else 64
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -146,10 +141,6 @@ def context_attention_fwd(
     num_warps = 4 if Lk <= 64 else 8
     num_stages = 1
 
-    if is_npu():
-        q = q.to(torch.float32)
-        k = k.to(torch.float32)
-        v = v.to(torch.float32)
     _fwd_kernel[grid](
         q,
         k,
@@ -517,58 +508,44 @@ def context_attention_fwd_contiguous_kv(
     )
 
 
-@torch.no_grad()
-def torch_context_attention_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    b_req_idx: torch.Tensor,
-    b_start_loc: torch.Tensor,
-    b_seq_len: torch.Tensor,
-    b_prompt_cache_len: torch.Tensor,
-    max_len_in_batch: int,
-    req_to_token_indexs: torch.Tensor,
-):
-    device = q.device
+def torch_context_attention_fwd(q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, req_to_token_indexs):
+
     batch = b_start_loc.shape[0]
-    H = q.shape[1]
-    kv_group_num = H // k.shape[1]
-    D = q.shape[-1]
+    print(q.shape)
+    for i in range(batch):
+        req_idx = b_req_idx[i]
+        start_loc = b_start_loc[i]
+        seq_len = b_seq_len[i]
+        prompt_cache_len = b_prompt_cache_len[i]
+        cur_q = q[start_loc : start_loc + seq_len - prompt_cache_len, :, :]
+        cur_q = cur_q.clone().to(torch.float32)
+        print(cur_q.shape)
+    
+        kv_loc = req_to_token_indexs[req_idx, :seq_len]
+        cur_k = k[kv_loc, :, :]
+        cur_k = cur_k.clone().to(torch.float32)
 
-    scale = 1.0 / math.sqrt(D)
+        cur_v = v[kv_loc, :, :]
+        cur_v = cur_v.clone().to(torch.float32)
 
-    for b in range(batch):
-        req_idx = b_req_idx[b].item()
-        start_loc = b_start_loc[b].item()
-        seq_len_full = b_seq_len[b].item()
-        prompt_cache_len = b_prompt_cache_len[b].item()
-        L = seq_len_full - prompt_cache_len
-        if L <= 0:
-            continue
+        cur_q = cur_q.transpose(0, 1)
+        cur_k = cur_k.transpose(0, 1)
+        cur_v = cur_v.transpose(0, 1)
 
-        kv_loc = req_to_token_indexs[req_idx][:seq_len_full].long()
+        dk = cur_q.shape[-1]
 
-        q_slice = q[start_loc : start_loc + L]
-        k_slice = k[kv_loc].repeat_interleave(kv_group_num, dim=1)
-        v_slice = v[kv_loc].repeat_interleave(kv_group_num, dim=1)
+        p = torch.matmul(cur_q, cur_k.transpose(-2, -1)) / torch.sqrt(torch.tensor(dk, dtype=torch.float32))
 
-        q_h = q_slice.transpose(0, 1)
-        k_h = k_slice.transpose(0, 1)
-        v_h = v_slice.transpose(0, 1)
+        q_index = torch.arange(cur_q.shape[1]).unsqueeze(-1).to(p.device)
+        k_index = torch.arange(cur_k.shape[1]).unsqueeze(0).to(p.device)
+        mask = (q_index + prompt_cache_len >= k_index).int()
+        mask = mask.unsqueeze(0).expand(cur_q.shape[0], -1, -1)
 
-        scores = torch.matmul(q_h, k_h.transpose(1, 2)) * scale
+        p = p.masked_fill(mask == 0, float("-inf"))
 
-        q_pos = torch.arange(L, device=device) + prompt_cache_len
-        k_pos = torch.arange(seq_len_full, device=device)
-        causal_mask = q_pos[:, None] >= k_pos[None, :]
+        s = F.softmax(p, dim=-1)
 
-        scores = scores.masked_fill(~causal_mask[None, :, :], torch.finfo(scores.dtype).min)
-
-        p = F.softmax(scores, dim=-1)
-        out = torch.matmul(p, v_h)
-
-        o[start_loc : start_loc + L] = out.transpose(0, 1).to(o.dtype)
+        o[start_loc : start_loc + seq_len - prompt_cache_len, :, :] = torch.matmul(s, cur_v).transpose(0, 1)
 
 
 @torch.no_grad()
@@ -582,6 +559,7 @@ def npu_context_attention_fwd(
     b_seq_len: torch.Tensor,
     b_prompt_cache_len: torch.Tensor,
     max_len_in_batch: int,
+    max_kv_seq_len: int,
     req_to_token_indexs: torch.Tensor,
 ) -> None:
     import torch_npu
@@ -590,7 +568,6 @@ def npu_context_attention_fwd(
     H = q.shape[1]
     D = q.shape[-1]  
 
-    max_k_len = b_seq_len.max().item()
     # (batch_size, max_q, H, D)
     q_padded = torch.zeros((batch, max_len_in_batch, H, D), dtype=q.dtype, device=q.device)
     q_lens = b_seq_len - b_prompt_cache_len
@@ -599,20 +576,16 @@ def npu_context_attention_fwd(
     q_mask = row_idx < q_lens.unsqueeze(1)
     q_padded[q_mask] = q
     # get kv
-    req_indices = req_to_token_indexs[b_req_idx][:, :max_k_len]
+    req_indices = req_to_token_indexs[b_req_idx][:, :max_kv_seq_len]
     k_padded = k[req_indices]
     v_padded = v[req_indices]
     # generate mask
-    q_idx = torch.arange(max_len_in_batch, device=q.device)[None, :, None]
-    k_idx = torch.arange(max_k_len, device=q.device)[None, None, :]
-    prompt_len_expanded = b_prompt_cache_len[:, None, None]
-    mask_causal = (q_idx + prompt_len_expanded) < k_idx
-    seq_len_expanded = b_seq_len[:, None, None]
-    mask_padding = k_idx >= seq_len_expanded
+    q_idx = torch.arange(max_len_in_batch, device=q.device)
+    k_idx = torch.arange(max_kv_seq_len, device=q.device)
+    mask_causal = (q_idx[None, :, None] + b_prompt_cache_len[:, None, None]) < k_idx[None, None, :]
+    mask_padding = k_idx[None, None, :] >= b_seq_len[:, None, None]
 
-    final_mask = mask_causal | mask_padding
-    final_mask = final_mask.unsqueeze(1)
-
+    final_mask = (mask_causal | mask_padding).unsqueeze(1)
     # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_fusion_attention.md
     attn_out, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
         query=q_padded,
