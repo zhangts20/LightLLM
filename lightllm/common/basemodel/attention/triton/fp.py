@@ -1,6 +1,7 @@
 import dataclasses
 import torch
 from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, AttControl
+from typing import Optional
 from lightllm.utils.device_utils import is_npu
 
 
@@ -60,7 +61,7 @@ class TritonPrefillAttState(BasePrefillAttState):
         return out
 
     def _nomarl_prefill_att(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alloc_func=torch.empty):
-        from ...triton_kernel.att.prefill_att.context_flashattention_nopad import context_attention_fwd 
+        from ...triton_kernel.att.prefill_att.context_flashattention_nopad import context_attention_fwd
 
         out = alloc_func(q.shape, q.dtype, device=q.device)
         if is_npu():

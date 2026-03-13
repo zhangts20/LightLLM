@@ -158,9 +158,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         up_gate_out = layer_weight.gate_up_proj.mm(input)
         ffn1_out = self.alloc_tensor((input.size(0), up_gate_out.size(1) // 2), input.dtype, device=input.device)
         if is_npu():
-            from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import torch_silu_and_mul_fwd
+            from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import npu_silu_and_mul_fwd
 
-            forward_call = torch_silu_and_mul_fwd
+            forward_call = npu_silu_and_mul_fwd
         else:
             forward_call = silu_and_mul_fwd
         forward_call(up_gate_out, ffn1_out)

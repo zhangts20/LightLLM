@@ -520,7 +520,7 @@ def torch_context_attention_fwd(q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b
         cur_q = q[start_loc : start_loc + seq_len - prompt_cache_len, :, :]
         cur_q = cur_q.clone().to(torch.float32)
         print(cur_q.shape)
-    
+
         kv_loc = req_to_token_indexs[req_idx, :seq_len]
         cur_k = k[kv_loc, :, :]
         cur_k = cur_k.clone().to(torch.float32)

@@ -159,7 +159,7 @@ def silu_and_mul_fwd(
     return
 
 
-def torch_silu_and_mul_fwd(
+def npu_silu_and_mul_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
     layout="blocked",
