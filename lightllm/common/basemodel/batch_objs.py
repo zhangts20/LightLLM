@@ -70,6 +70,29 @@ class ModelInput:
             else:
                 self.b_shared_seq_len = self.b_shared_seq_len.cuda(non_blocking=True)
 
+    def to_device(self, device: str):
+        if self.input_ids is not None:
+            self.input_ids = self.input_ids.to(device=device, non_blocking=True)
+        if self.mem_indexes is None:
+            self.mem_indexes = self.mem_indexes_cpu.to(device=device, non_blocking=True)
+        self.b_req_idx = self.b_req_idx.to(device=device, non_blocking=True)
+        self.b_seq_len = self.b_seq_len.to(device=device, non_blocking=True)
+        self.b_mtp_index = self.b_mtp_index.to(device=device, non_blocking=True)
+        if self.b_ready_cache_len is not None:
+            self.b_ready_cache_len = self.b_ready_cache_len.to(device=device, non_blocking=True)
+        if self.b_prefill_start_loc is not None:
+            self.b_prefill_start_loc = self.b_prefill_start_loc.to(device=device, non_blocking=True)
+        if not self.is_prefill and enable_diverse_mode_gqa_decode_fast_kernel():
+            batch_size = len(self.b_req_idx)
+            if self.b_mark_shared_group is None:
+                self.b_mark_shared_group = torch.ones(size=(batch_size,), dtype=torch.int32, device=device)
+            else:
+                self.b_mark_shared_group = self.b_mark_shared_group.to(device=device, non_blocking=True)
+            if self.b_shared_seq_len is None:
+                self.b_shared_seq_len = torch.zeros(size=(batch_size,), dtype=torch.int32, device=device)
+            else:
+                self.b_shared_seq_len = self.b_shared_seq_len.to(device=device, non_blocking=True)
+
     def __post_init__(self):
         self.check_input()
 

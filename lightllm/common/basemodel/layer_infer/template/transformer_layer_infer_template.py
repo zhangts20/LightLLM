@@ -5,6 +5,7 @@ from ..transformer_layer_infer import TransformerLayerInfer
 from ...infer_struct import InferStateInfo
 from lightllm.distributed import all_reduce
 from typing import Tuple
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.tensor_utils import tensor_to_no_ref_tensor
 
 
@@ -149,7 +150,11 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
     def _context_attention_wrapper_run(
         self, q: torch.Tensor, cache_kv: torch.Tensor, infer_state: InferStateInfo, layer_weight
     ) -> torch.Tensor:
-        if torch.cuda.is_current_stream_capturing():
+        if is_npu():
+            flag = torch.npu.is_current_stream_capturing()
+        else:
+            flag = torch.cuda.is_current_stream_capturing()
+        if flag:
             q = q.contiguous()
             cache_kv = cache_kv.contiguous()
             _q, _cache_kv = (

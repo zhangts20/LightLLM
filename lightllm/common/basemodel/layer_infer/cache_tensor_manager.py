@@ -7,6 +7,7 @@ import torch._C
 from typing import Dict, Iterable, Literal, Tuple, Union, List, Set
 from torch.storage import UntypedStorage
 from dataclasses import field
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -45,7 +46,11 @@ if torch.__version__ >= "2.1.0" and (not _disable_gpu_tensor_cache):
             self.free_shape_dtype_to_bufs: Dict[Tuple, List[BufNode]] = collections.defaultdict(list)
             self.calcu_shape_cache: Dict[torch.Size, int] = {}
             self.changed_ptr: Set[int] = set()
-            from torch._C import _storage_Use_Count as use_count
+
+            if is_npu():
+                from torch_npu._C import _storage_Use_Count as use_count
+            else:
+                from torch._C import _storage_Use_Count as use_count
 
             # use_count 函数可以用于获取有多少 tensor 真正引用了这片显存 tensor
             self.use_count = use_count

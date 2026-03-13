@@ -142,7 +142,7 @@ class WhisperAudioModel:
     def forward(self, audio_values, audio_lens_after_cnn):
         audio_values = audio_values.to(self.data_type).to(device=self.device)
         audio_values = audio_values.squeeze(1)
-        audio_lens_after_cnn = torch.tensor(audio_lens_after_cnn).cuda()
+        audio_lens_after_cnn = torch.tensor(audio_lens_after_cnn).to(self.device)
         max_len_in_batch = torch.max(audio_lens_after_cnn).item()
 
         padding_mask = torch.ones([audio_values.size(0), max_len_in_batch]).to(

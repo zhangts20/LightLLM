@@ -18,6 +18,7 @@ from typing import List, Union, final
 from io import BytesIO
 from rpyc.utils.classic import obtain
 from lightllm.common.quantization import Quantcfg
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import get_dp_world_size
 from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_manager
 
@@ -47,6 +48,11 @@ class VisionTransformer:
         self.load_image_func = get_load_image_func(self.weight_dir_)
         self.max_batch_size = kvargs.get("max_batch_size", 1)
 
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
+
         self._init_datatype()
         self._init_config()
         self._padding_hidden_size()
@@ -66,7 +72,7 @@ class VisionTransformer:
         try:
             dummy_images = torch.randn(
                 (self.MAX_PATH_NUM * self.max_batch_size, 3, self.IMAGE_H, self.IMAGE_W), dtype=self.data_type
-            ).cuda()
+            ).to(self.device)
             all_img_embeds = self.forward(dummy_images)
             del all_img_embeds
             logger.info(f"vit check max_len {self.max_batch_size} infer ok")
@@ -191,7 +197,7 @@ class VisionTransformer:
             return None
 
         imgs = torch.cat(img_tensors, dim=0)
-        pixel_values = imgs.cuda().to(dtype=self.data_type)
+        pixel_values = imgs.to(dtype=self.data_type, device=self.device)
         all_img_embeds = self.forward(pixel_values)
         return all_img_embeds.view(-1, all_img_embeds.shape[-1]), uuids, valid_ids
 

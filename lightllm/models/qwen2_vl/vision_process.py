@@ -22,6 +22,7 @@ from transformers.image_utils import (
 )
 from torchvision.transforms.v2 import functional as F
 
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -124,6 +125,10 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
             if longest is not None:
                 self.max_pixels = longest
         self._fused_cache = {}  # key: (do_norm, do_rescale, rescale_factor, device)
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
 
     def _get_fused_mean_std(
         self,
@@ -177,7 +182,7 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
     @torch.inference_mode()
     def preprocess(self, image) -> Tuple[torch.Tensor, torch.Tensor]:
         try:
-            return self._preprocess_bydevice(image, device="cuda")
+            return self._preprocess_bydevice(image, device=self.device)
         except Exception as e:
             logger.warning(f"Exception during image preprocessing on CUDA: {str(e)}")
             torch.cuda.current_stream().synchronize()
@@ -223,7 +228,7 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
         processed_grids = {}
 
         for shape, stacked_images in grouped_images.items():
-            stacked_images = stacked_images.to("cuda", non_blocking=True)
+            stacked_images = stacked_images.to(self.device, non_blocking=True)
 
             resized_height, resized_width = stacked_images.shape[-2:]
 

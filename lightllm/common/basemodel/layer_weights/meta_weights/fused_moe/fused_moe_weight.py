@@ -11,6 +11,7 @@ from lightllm.common.basemodel.layer_weights.meta_weights.mm_weight.mm_slicer im
 from lightllm.common.basemodel.layer_weights.meta_weights.fused_moe.impl import select_fuse_moe_impl
 from lightllm.common.quantization.quantize_method import QuantizationMethod
 from lightllm.utils.envs_utils import get_redundancy_expert_ids, get_redundancy_expert_num, get_env_start_args
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import get_global_world_size, get_global_rank
 from lightllm.utils.log_utils import init_logger
 
@@ -79,8 +80,12 @@ class FusedMoeWeight(BaseWeightTpl):
         self.redundancy_expert_num = get_redundancy_expert_num()
         self.redundancy_expert_ids = get_redundancy_expert_ids(self.layer_num_)
         self.auto_update_redundancy_expert: bool = get_env_start_args().auto_update_redundancy_expert
-        self.redundancy_expert_ids_tensor = torch.tensor(self.redundancy_expert_ids, dtype=torch.int64, device="cuda")
-        self.routed_expert_counter_tensor = torch.zeros((self.n_routed_experts,), dtype=torch.int64, device="cuda")
+        if is_npu():
+            device = "npu"
+        else:
+            device = "cuda"
+        self.redundancy_expert_ids_tensor = torch.tensor(self.redundancy_expert_ids, dtype=torch.int64, device=device)
+        self.routed_expert_counter_tensor = torch.zeros((self.n_routed_experts,), dtype=torch.int64, device=device)
         # TODO: find out the reason of failure of deepep when redundancy_expert_num is 1.
         assert self.redundancy_expert_num != 1, "redundancy_expert_num can not be 1 for some unknown hang of deepep."
 

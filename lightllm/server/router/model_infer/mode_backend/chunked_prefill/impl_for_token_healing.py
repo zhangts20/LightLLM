@@ -1,8 +1,10 @@
 import torch
+
 from .impl import ChunkedPrefillBackend
 from typing import List
 from lightllm.server.router.model_infer.infer_batch import g_infer_context, InferReq
 from lightllm.server.tokenizer import get_tokenizer
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -36,7 +38,11 @@ class TokenHealingBackend(ChunkedPrefillBackend):
         self.sorted_tokens = SortedList(
             [(token_str, token_id) for token_str, token_id in vob_dict.items()], key=lambda x: x[0]
         )
-        self.token_indexes = torch.tensor([e[1] for e in self.sorted_tokens], dtype=torch.int64, device="cuda")
+        if is_npu():
+            device = "npu"
+        else:
+            device = "cuda"
+        self.token_indexes = torch.tensor([e[1] for e in self.sorted_tokens], dtype=torch.int64, device=device)
         return
 
     def _decode_mask_callback(self, run_reqs: List[InferReq], logits: torch.Tensor):

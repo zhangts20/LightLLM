@@ -61,8 +61,13 @@ def autotune(
         Callable: A callable object that wraps the original function and performs autotuning
         as needed before invocation.
     """
+    # torch.npu.get_current_device() cannot be called during autotune, disable it: LIGHTLLM_DISABLE_AUTOTUNE=1
+    disable_autotune = os.getenv("LIGHTLLM_DISABLE_AUTOTUNE", "0") == "1"
 
     def decorator(fn: Callable) -> Callable:
+        if disable_autotune:
+            return fn
+
         return Autotuner(
             fn=fn,
             kernel_name=kernel_name,

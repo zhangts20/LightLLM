@@ -62,8 +62,14 @@ class TritonPrefillAttState(BasePrefillAttState):
     def _nomarl_prefill_att(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alloc_func=torch.empty):
         from ...triton_kernel.att.prefill_att.context_flashattention_nopad import context_attention_fwd
 
-        out = alloc_func(q.shape, q.dtype)
-        context_attention_fwd(
+        out = alloc_func(q.shape, q.dtype, device=q.device)
+        if q.device.type == "npu":
+            from lightllm.common.basemodel.triton_kernel.att.prefill_att.context_flashattention_nopad import npu_context_attention_fwd
+
+            context_attention_call = npu_context_attention_fwd
+        else:
+            context_attention_call = context_attention_fwd 
+        context_attention_call(
             q,
             k,
             v,
@@ -169,7 +175,7 @@ class TritonDecodeAttState(BaseDecodeAttState):
             gqa_token_decode_attention_flash_decoding,
         )
 
-        out = alloc_func(q.shape, q.dtype)
+        out = alloc_func(q.shape, q.dtype, device=q.device)
 
         gqa_token_decode_attention_flash_decoding(
             q=q,

@@ -8,6 +8,7 @@ import pickle
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Any
 from lightllm.common.req_manager import ReqManager
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.infer_utils import mark_start, mark_end
 from lightllm.server.core.objs import Req, SamplingParams, FinishStatus, ShmReqManager
 from lightllm.server.router.dynamic_prompt.radix_cache import RadixCache, TreeNode
@@ -65,12 +66,18 @@ class InferenceContext:
 
     def get_overlap_stream(self) -> torch.cuda.Stream:
         if self.overlap_stream is None:
-            self.overlap_stream = torch.cuda.Stream()
+            if is_npu():
+                self.overlap_stream = torch.npu.Stream()
+            else:
+                self.overlap_stream = torch.cuda.Stream()
         return self.overlap_stream
 
     def get_cpu_kv_cache_stream(self) -> torch.cuda.Stream:
         if self.cpu_kv_cache_stream is None:
-            self.cpu_kv_cache_stream = torch.cuda.Stream()
+            if is_npu():
+                self.cpu_kv_cache_stream = torch.npu.Stream()
+            else:
+                self.cpu_kv_cache_stream = torch.cuda.Stream()
         return self.cpu_kv_cache_stream
 
     def add_reqs(self, requests: List[Tuple[int, int, Any, int]], init_prefix_cache: bool = True) -> List["InferReq"]:

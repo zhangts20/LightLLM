@@ -3,7 +3,13 @@ from typing import List
 from lightllm.common.basemodel.triton_kernel.apply_penalty import apply_penalty
 from lightllm.common.basemodel.triton_kernel.apply_penalty_gpu_cache import apply_penalty_gpu_cache
 from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.envs_utils import get_env_start_args
+
+if is_npu():
+    device = "npu"
+else:
+    device = "cuda"
 
 
 def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
@@ -16,7 +22,7 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
         b_mask_eos_reqs,
         is_all_greedy,
     ) = _get_post_sample_tensors(reqs)
-    eos_ids = torch.tensor(eos_id, dtype=torch.int32, device="cpu", pin_memory=True).cuda(non_blocking=True)
+    eos_ids = torch.tensor(eos_id, dtype=torch.int32, device="cpu", pin_memory=True).to(device=device, non_blocking=True)
 
     sampling_params_manager = g_infer_context.req_manager.req_sampling_params_manager
 
@@ -98,7 +104,7 @@ def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
-    probs_sort[torch.arange(0, probs.shape[-1], device="cuda").view(1, -1) >= top_ks.view(-1, 1)] = 0.0
+    probs_sort[torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1) >= top_ks.view(-1, 1)] = 0.0
 
     return probs_sort, probs_idx
 
@@ -136,11 +142,11 @@ def _get_post_sample_tensors(reqs: List[InferReq]):
     mask_eos_reqs_cpu = torch.tensor(mask_eos_reqs, dtype=torch.bool, device="cpu", pin_memory=True)
 
     return (
-        req_idxes_cpu.cuda(non_blocking=True),
-        temperatures_cpu.cuda(non_blocking=True),
-        top_ps_cpu.cuda(non_blocking=True),
-        top_ks_cpu.cuda(non_blocking=True),
-        length_penalty_param_cpu.cuda(non_blocking=True),
-        mask_eos_reqs_cpu.cuda(non_blocking=True),
+        req_idxes_cpu.to(device=device, non_blocking=True),
+        temperatures_cpu.to(device=device, non_blocking=True),
+        top_ps_cpu.to(device=device, non_blocking=True),
+        top_ks_cpu.to(device=device, non_blocking=True),
+        length_penalty_param_cpu.to(device=device, non_blocking=True),
+        mask_eos_reqs_cpu.to(device=device, non_blocking=True),
         is_all_greedy,
     )

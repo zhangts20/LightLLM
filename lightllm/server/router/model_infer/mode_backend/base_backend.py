@@ -6,6 +6,7 @@ import threading
 import torch.distributed as dist
 from typing import List, Tuple, Callable, Optional
 from transformers.configuration_utils import PretrainedConfig
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.log_utils import init_logger
 from lightllm.models import get_model
@@ -194,24 +195,28 @@ class ModeBackend:
 
         # 初始化 dp 模式使用的通信 tensor, 对于非dp模式，不会使用到
         if self.dp_size > 1:
-            self.dp_reduce_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
-            self.dp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
+            self.dp_reduce_tensor = torch.tensor([0], dtype=torch.int32, device=self.model.device, requires_grad=False)
+            self.dp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device=self.model.device, requires_grad=False)
             self.dp_all_gather_tensor = torch.tensor(
-                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device="cuda", requires_grad=False
+                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device=self.model.device, requires_grad=False
             )
 
         # 用于协同读取 ShmObjsIOBuffer 中的请求信息的通信tensor和通信组对象。
-        self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
-        self.node_nccl_group = create_new_group_for_current_node("nccl")
+        self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device=self.model.device, requires_grad=False)
+        if is_npu():
+            group_type = "hccl"
+        else:
+            group_type = "nccl"
+        self.node_nccl_group = create_new_group_for_current_node(group_type)
 
         # 用于在多节点tp模式下协同读取 ShmObjsIOBuffer 中的请求信息的通信tensor和通信组对象。
         if self.is_multinode_tp:
-            self.multinode_tp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device="cuda")
+            self.multinode_tp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device=self.model.device)
             self.multinode_tp_all_gather_tensor = torch.tensor(
-                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device="cuda", requires_grad=False
+                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device=self.model.device, requires_grad=False
             )
             self.multinode_tp_nccl_group = dist.new_group(
-                [rank for rank in range(self.global_world_size)], backend="nccl"
+                [rank for rank in range(self.global_world_size)], backend=group_type
             )
 
         if (
@@ -779,7 +784,7 @@ class ModeBackend:
         if is_prefill:
             b_has_out = g_pin_mem_manager.gen_from_list(
                 key="b_has_out", data=b_prefill_has_output_cpu, dtype=torch.bool
-            ).cuda(non_blocking=True)
+            ).to(device=logits.device, non_blocking=True)
 
         scatter_token(
             next_token_ids=next_token_ids,

@@ -2,6 +2,7 @@ import torch
 
 import triton
 import triton.language as tl
+from lightllm.utils.device_utils import is_npu
 
 
 @triton.jit
@@ -43,6 +44,9 @@ def destindex_copy_kv(K, DestLoc, Out):
     BLOCK_HEAD = triton.next_power_of_2(head_num)
     grid = (seq_len,)
     num_warps = 1
+
+    if is_npu():
+        K = K.to(torch.float32)
 
     _fwd_kernel_destindex_copy_kv[grid](
         K,

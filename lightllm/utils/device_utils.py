@@ -25,6 +25,10 @@ def is_hopper():
         or "Hopper" in torch.cuda.get_device_name(0)
     )
 
+@lru_cache(maxsize=None)
+def is_npu():
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
 
 @lru_cache(maxsize=None)
 def is_4090():
@@ -98,6 +102,10 @@ def get_current_device_name():
             gpu_name = gpu_name.replace("4090", "4090 D")
 
         gpu_name = gpu_name.replace(" ", "_")
+        return gpu_name
+    elif torch.npu.is_available():
+        device = torch.npu.current_device()
+        gpu_name = torch.npu.get_device_name(device)
         return gpu_name
     else:
         return None
@@ -310,7 +318,7 @@ def get_platform(platform_name: Optional[str] = None) -> Platform:
     Returns:
         Platform: platform enum value
     """
-    assert platform_name in ["cuda", "musa"], f"Only support cuda and musa now, but got {platform_name}"
+    assert platform_name in ["cuda", "ascend", "musa"], f"Only support cuda, ascend and musa now, but got {platform_name}"
     platform_name = platform_name.lower()
     platform_map = {
         "cuda": Platform.CUDA,

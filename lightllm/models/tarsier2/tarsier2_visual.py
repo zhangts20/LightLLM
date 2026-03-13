@@ -273,8 +273,9 @@ class TarsierVisionTransformerPretrainedModel(nn.Module):
         imgs = torch.cat(img_tensors, dim=0)
         grid_thw = torch.cat(img_grids, dim=0)
 
-        pixel_values = imgs.cuda()
-        image_grid_thw = grid_thw.cuda()
+        device = self.vision_tower.device
+        pixel_values = imgs.to(device)
+        image_grid_thw = grid_thw.to(device)
 
         all_img_embeds = self.forward(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
 

@@ -376,7 +376,7 @@ class DPChunkedPrefillBackend(ModeBackend):
                 )
 
             # mtp kv fill
-            draft_next_token_ids_gpu = torch.zeros((model_input.batch_size), dtype=torch.int64, device="cuda")
+            draft_next_token_ids_gpu = torch.zeros((model_input.batch_size), dtype=torch.int64, device=model_input.input_ids.device)
             if req_num > 0:
                 draft_next_token_ids_gpu[0:req_num].copy_(next_token_ids)
             self._draft_prefill_forward(
@@ -524,7 +524,7 @@ class DPChunkedPrefillBackend(ModeBackend):
         # share some inference info with the main model
         draft_model_input = model_input
         draft_model_output = model_output
-        draft_next_token_ids_gpu = torch.zeros((model_input.batch_size), dtype=torch.int64, device="cuda")
+        draft_next_token_ids_gpu = torch.zeros((model_input.batch_size), dtype=torch.int64, device=next_token_ids.device)
         if req_num > 0:
             draft_next_token_ids_gpu[:req_num].copy_(next_token_ids, non_blocking=True)
 
@@ -566,7 +566,7 @@ class DPChunkedPrefillBackend(ModeBackend):
         draft_model_input = model_input
         draft_model_output = model_output
         all_next_token_ids.append(next_token_ids)
-        draft_next_token_ids_gpu = torch.zeros((model_input.batch_size), dtype=torch.int64, device="cuda")
+        draft_next_token_ids_gpu = torch.zeros((model_input.batch_size), dtype=torch.int64, device=next_token_ids.device)
         if req_num > 0:
             draft_next_token_ids_gpu[:req_num].copy_(next_token_ids, non_blocking=True)
 
@@ -655,11 +655,11 @@ class DPChunkedPrefillBackend(ModeBackend):
 
             # spec prefill: MTP
             draft_model_input0, draft_model_input1 = model_input0, model_input1
-            draft_next_token_ids_gpu0 = torch.zeros((model_input0.batch_size), dtype=torch.int64, device="cuda")
+            draft_next_token_ids_gpu0 = torch.zeros((model_input0.batch_size), dtype=torch.int64, device=draft_model_input0.input_ids.device)
             if req_num0 > 0:
                 draft_next_token_ids_gpu0[0:req_num0].copy_(next_token_ids[0:req_num0], non_blocking=True)
 
-            draft_next_token_ids_gpu1 = torch.zeros((model_input1.batch_size), dtype=torch.int64, device="cuda")
+            draft_next_token_ids_gpu1 = torch.zeros((model_input1.batch_size), dtype=torch.int64, device=draft_model_input0.input_ids.device)
             if req_num1 > 0:
                 draft_next_token_ids_gpu1[0:req_num1].copy_(
                     next_token_ids[req_num0 : (req_num0 + req_num1)], non_blocking=True
@@ -861,8 +861,8 @@ class DPChunkedPrefillBackend(ModeBackend):
         draft_model_input0, draft_model_input1 = model_input0, model_input1
         draft_model_output0, draft_model_output1 = model_output0, model_output1
 
-        draft_next_token_ids_gpu0 = torch.zeros((model_input0.batch_size), dtype=torch.int64, device="cuda")
-        draft_next_token_ids_gpu1 = torch.zeros((model_input1.batch_size), dtype=torch.int64, device="cuda")
+        draft_next_token_ids_gpu0 = torch.zeros((model_input0.batch_size), dtype=torch.int64, device=draft_model_input0.input_ids.device)
+        draft_next_token_ids_gpu1 = torch.zeros((model_input1.batch_size), dtype=torch.int64, device=draft_model_input0.input_ids.device)
         if req_num0 > 0:
             draft_next_token_ids_gpu0[0:req_num0].copy_(next_token_ids[0:req_num0], non_blocking=True)
         if req_num1 > 1:
@@ -919,8 +919,8 @@ class DPChunkedPrefillBackend(ModeBackend):
         draft_model_input0, draft_model_input1 = model_input0, model_input1
         draft_model_output0, draft_model_output1 = model_output0, model_output1
 
-        draft_next_token_ids_gpu0 = torch.zeros((model_input0.batch_size), dtype=torch.int64, device="cuda")
-        draft_next_token_ids_gpu1 = torch.zeros((model_input1.batch_size), dtype=torch.int64, device="cuda")
+        draft_next_token_ids_gpu0 = torch.zeros((model_input0.batch_size), dtype=torch.int64, device=model_input0.input_ids.device)
+        draft_next_token_ids_gpu1 = torch.zeros((model_input1.batch_size), dtype=torch.int64, device=model_input0.input_ids.device)
         if req_num0 > 0:
             draft_next_token_ids_gpu0[0:req_num0].copy_(next_token_ids[0:req_num0], non_blocking=True)
         if req_num1 > 1:

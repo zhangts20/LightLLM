@@ -9,6 +9,7 @@ from lightllm.common.quantization.quantize_method import QuantizationMethod, Wei
 from lightllm.common.basemodel.layer_weights.meta_weights.base_weight import BaseWeightTpl
 from lightllm.common.quantization import Quantcfg
 from lightllm.common.quantization.no_quant import NoQuantization
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.utils.log_utils import init_logger
 from .mm_slicer import SliceMixinTpl
@@ -50,6 +51,10 @@ class MMWeightTpl(BaseWeightTpl):
         self.bias_names = bias_names
         self.quant_method: QuantizationMethod = NoQuantization() if quant_method is None else quant_method
         self.param_slicer: SliceMixinTpl = None
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
         self._create_weight()
         self.gen_weight_quant_param_names()
 
@@ -92,7 +97,8 @@ class MMWeightTpl(BaseWeightTpl):
     def _create_weight(self):
         self.bias = None
         if self.bias_names is not None:
-            self.bias = torch.empty(sum(self.out_dims), dtype=self.data_type_).cuda(get_current_device_id())
+            device = f"{self.device}:{get_current_device_id()}"
+            self.bias = torch.empty(sum(self.out_dims), dtype=self.data_type_, device=device)
             # bias_list shares storage with bias for each output shard
             self.bias_list = torch.split(self.bias, self.out_dims, dim=0)
             for sub_bias in self.bias_list:
@@ -182,11 +188,16 @@ class BMMWeightTpl(BaseWeightTpl):
         self.dim0 = dim0
         self.dim1 = dim1
         self.dim2 = dim2
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
         self._create_weight()
         return
 
     def _create_weight(self):
-        self.weight = torch.empty(self.dim0, self.dim1, self.dim2, dtype=self.data_type_).cuda(get_current_device_id())
+        device = f"{self.device}:{get_current_device_id()}"
+        self.weight = torch.empty(self.dim0, self.dim1, self.dim2, dtype=self.data_type_, device=device)
         self.weight.load_ok = False
         return
 

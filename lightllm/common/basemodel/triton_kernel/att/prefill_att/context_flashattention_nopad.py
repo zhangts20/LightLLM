@@ -548,6 +548,67 @@ def torch_context_attention_fwd(q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b
         o[start_loc : start_loc + seq_len - prompt_cache_len, :, :] = torch.matmul(s, cur_v).transpose(0, 1)
 
 
+@torch.no_grad()
+def npu_context_attention_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    b_prompt_cache_len: torch.Tensor,
+    max_len_in_batch: int,
+    req_to_token_indexs: torch.Tensor,
+) -> None:
+    import torch_npu
+
+    batch = b_start_loc.shape[0]
+    H = q.shape[1]
+    D = q.shape[-1]  
+
+    max_k_len = b_seq_len.max().item()
+    # (batch_size, max_q, H, D)
+    q_padded = torch.zeros((batch, max_len_in_batch, H, D), dtype=q.dtype, device=q.device)
+    q_lens = b_seq_len - b_prompt_cache_len
+    # get q
+    row_idx = torch.arange(max_len_in_batch, device=q.device).unsqueeze(0)
+    q_mask = row_idx < q_lens.unsqueeze(1)
+    q_padded[q_mask] = q
+    # get kv
+    req_indices = req_to_token_indexs[b_req_idx][:, :max_k_len]
+    k_padded = k[req_indices]
+    v_padded = v[req_indices]
+    # generate mask
+    q_idx = torch.arange(max_len_in_batch, device=q.device)[None, :, None]
+    k_idx = torch.arange(max_k_len, device=q.device)[None, None, :]
+    prompt_len_expanded = b_prompt_cache_len[:, None, None]
+    mask_causal = (q_idx + prompt_len_expanded) < k_idx
+    seq_len_expanded = b_seq_len[:, None, None]
+    mask_padding = k_idx >= seq_len_expanded
+
+    final_mask = mask_causal | mask_padding
+    final_mask = final_mask.unsqueeze(1)
+
+    # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_fusion_attention.md
+    attn_out, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+        query=q_padded,
+        key=k_padded,
+        value=v_padded,
+        head_num=H,
+        # (batch_size, seq, head, dim)
+        input_layout="BSND",
+        atten_mask=final_mask,
+        scale=1.0 / math.sqrt(D),
+        inner_precise=0,
+        # different type of mask
+        sparse_mode=0,
+        gen_mask_parallel=True,
+        sync=False
+    )
+    o.copy_(attn_out[q_mask].view(-1, H, D))
+
+
 def test():
     import torch
     import numpy as np

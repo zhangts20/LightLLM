@@ -423,7 +423,7 @@ def torch_att(q, q_rope, kv, kv_rope, bs, seqlen, num_head, q_head_dim, rope_hea
     xk = torch.cat([kv, kv_rope], dim=2).view(bs, seqlen, 1, -1)
     xv = kv.view(bs, seqlen, 1, -1)
 
-    mask = torch.tril(torch.ones(seqlen, seqlen), diagonal=0).unsqueeze(0).unsqueeze(0).cuda()
+    mask = torch.tril(torch.ones(seqlen, seqlen), diagonal=0).unsqueeze(0).unsqueeze(0).to(q.device)
     mask[mask == 0.0] = -100000000.0
     mask = mask.repeat(bs, num_head, 1, 1)
     keys = xk

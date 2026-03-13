@@ -24,7 +24,7 @@ import torch.distributed as dist
 from torch.distributed import ReduceOp, ProcessGroup
 from typing import List, Dict, Optional, Union
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.device_utils import has_nvlink
+from lightllm.utils.device_utils import has_nvlink, is_npu
 from lightllm.utils.envs_utils import (
     get_env_start_args,
     get_deepep_num_max_dispatch_tokens_per_rank,
@@ -62,9 +62,13 @@ class CustomProcessGroup:
         self.custom_reduce = None
         self.custom_gather = None
         self.dp_world_size = get_dp_world_size()
-        self.device_group = create_new_group_for_current_dp("nccl")
+        if is_npu():
+            group_type = "hccl"
+        else:
+            group_type = "nccl"
+        self.device_group = create_new_group_for_current_dp(group_type)
         if get_env_start_args().enable_dp_prefill_balance:
-            self.dp_prefill_balance_group = create_dp_special_inter_group("nccl")
+            self.dp_prefill_balance_group = create_dp_special_inter_group(group_type)
         else:
             self.dp_prefill_balance_group = None
 

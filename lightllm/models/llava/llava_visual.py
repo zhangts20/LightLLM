@@ -101,7 +101,7 @@ class LlavaVisionModel:
 
     # batch images infer
     def forward(self, x):
-        x = x.half().cuda()
+        x = x.half()
         x = self.vision_tower(x, output_hidden_states=True)
         x = x.hidden_states[self.select_layer]
         if self.select_feature == "patch" or self.select_feature == "default":

@@ -3,7 +3,7 @@ import numpy as np
 from typing import Dict, Optional
 from .base_weight import BaseWeightTpl
 from .platform_op import PlatformAwareOp
-from lightllm.common.basemodel.triton_kernel.embedding import embedding as embedding_kernel
+from lightllm.common.basemodel.triton_kernel.embedding import embedding as embedding_kernel, embedding_old
 from lightllm.utils.dist_utils import get_dp_world_size, get_current_rank_in_dp
 
 
@@ -71,6 +71,18 @@ class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
     ) -> torch.Tensor:
         return self._triton_forward(input_ids=input_ids, out=out, alloc_func=alloc_func)
+
+    def _ascend_forward(
+        self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty 
+    ) -> torch.Tensor:
+        if out is None:
+            out = alloc_func(
+                (input_ids.shape[0], self.weight.shape[1]), dtype=self.weight.dtype, device=self.weight.device
+            ) 
+        _out = embedding_old(input_ids, self.weight, self.tp_vocab_start_id, self.tp_vocab_end_id)
+        out.copy_(_out)
+
+        return out
 
     def _musa_forward(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
@@ -141,6 +153,9 @@ class LMHeadWeight(EmbeddingWeight):
             )
         torch.mm(self.weight, input, out=out)
         return out
+
+    def _ascend_forward(self, input, out = None, alloc_func=torch.empty) -> torch.Tensor:
+        return self._cuda_forward(input=input, out=out, alloc_func=alloc_func)
 
     def __call__(self, input: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty) -> torch.Tensor:
         return self._forward(input=input, out=out, alloc_func=alloc_func)

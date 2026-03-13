@@ -21,6 +21,7 @@ from lightllm.common.basemodel.triton_kernel.gather_token_id import scatter_toke
 from lightllm.common.basemodel.triton_kernel.mtp_utils import (
     mtp_scatter_next_token_ids,
 )
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.utils.envs_utils import get_env_start_args
@@ -51,7 +52,10 @@ class ChunkedPrefillBackend(ModeBackend):
         return
 
     def infer_loop(self):
-        torch.cuda.set_device(get_current_device_id())
+        if is_npu():
+            torch.npu.set_device(get_current_device_id())
+        else:
+            torch.cuda.set_device(get_current_device_id())
         try:
             while True:
                 event_pack = self.overlap_event_manager.get_overlap_event_pack()
@@ -74,7 +78,11 @@ class ChunkedPrefillBackend(ModeBackend):
                 if run_way.is_prefill():
                     # 进行一次流同步，保证 _try_read_new_reqs 中的一些算子操作，必然已经完成。
                     # 防止后续的推理流程读取到显存中可能存在错误的数据。
-                    g_infer_context.get_overlap_stream().wait_stream(torch.cuda.current_stream())
+                    if is_npu():
+                        stream = torch.npu.current_stream()
+                    else:
+                        stream = torch.cuda.current_stream()
+                    g_infer_context.get_overlap_stream().wait_stream(stream)
                     self.prefill(
                         event_pack=event_pack,
                         prefill_reqs=prefill_reqs,
@@ -83,7 +91,11 @@ class ChunkedPrefillBackend(ModeBackend):
                 elif run_way.is_decode():
                     # 进行一次流同步，保证 _try_read_new_reqs 中的一些算子操作，必然已经完成。
                     # 防止后续的推理流程读取到显存中可能存在错误的数据。
-                    g_infer_context.get_overlap_stream().wait_stream(torch.cuda.current_stream())
+                    if is_npu():
+                        stream = torch.npu.current_stream()
+                    else:
+                        stream = torch.cuda.current_stream()
+                    g_infer_context.get_overlap_stream().wait_stream(stream)
                     self.decode(
                         event_pack=event_pack,
                         decode_reqs=decode_reqs,
@@ -107,7 +119,11 @@ class ChunkedPrefillBackend(ModeBackend):
     ):
         # 第一阶段: 模型推理
         model_input, run_reqs = prepare_prefill_inputs(prefill_reqs, is_chuncked_mode=not self.disable_chunked_prefill)
-        with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+        if is_npu():
+            stream_call = torch.npu.stream
+        else:
+            stream_call = torch.cuda.stream
+        with stream_call(g_infer_context.get_overlap_stream()):
             model_output = self.model.forward(model_input)
             _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
                 logits=model_output.logits,
@@ -118,7 +134,10 @@ class ChunkedPrefillBackend(ModeBackend):
                 b_prefill_has_output_cpu=model_input.b_prefill_has_output_cpu,
                 mask_func=self.prefill_mask_func,
             )
-            sync_event = torch.cuda.Event()
+            if is_npu():
+                sync_event = torch.npu.Event()
+            else:
+                sync_event = torch.cuda.Event()
             sync_event.record()
 
         # 第二阶段
@@ -146,7 +165,11 @@ class ChunkedPrefillBackend(ModeBackend):
         decode_reqs: List[InferReq],
     ):
         model_input, run_reqs = prepare_decode_inputs(decode_reqs)
-        with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+        if is_npu():
+            stream_call = torch.npu.stream
+        else:
+            stream_call = torch.cuda.stream
+        with stream_call(g_infer_context.get_overlap_stream()):
             model_output = self.model.forward(model_input)
             _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
                 logits=model_output.logits,
@@ -156,7 +179,10 @@ class ChunkedPrefillBackend(ModeBackend):
                 is_prefill=False,
                 mask_func=self.decode_mask_func,
             )
-            sync_event = torch.cuda.Event()
+            if is_npu():
+                sync_event = torch.npu.Event()
+            else:
+                sync_event = torch.cuda.Event()
             sync_event.record()
 
         # 第二阶段

@@ -68,7 +68,7 @@ def embedding(input_ids, weight: torch.Tensor, vob_start_id, vob_end_id, out: to
 @torch.no_grad()
 def embedding_new(input_ids, weight, vob_start_id, vob_end_id):
     # out = self.alloc_tensor((N_CTX, DIM), dtype=torch.float32)
-    out = torch.empty((N_CTX, DIM), device="cuda", requires_grad=False)
+    out = torch.empty((N_CTX, DIM), device=input_ids.device, requires_grad=False)
 
     embedding(input_ids, weight, vob_start_id, vob_end_id, out)
     return out
@@ -76,7 +76,7 @@ def embedding_new(input_ids, weight, vob_start_id, vob_end_id):
 
 @torch.no_grad()
 def embedding_old(input_ids, wte_weight, vob_start_id, vob_end_id):
-    input_mask = torch.empty(input_ids.shape, dtype=torch.bool, device="cuda")
+    input_mask = torch.empty(input_ids.shape, dtype=torch.bool, device=input_ids.device)
     torch.logical_or(vob_start_id > input_ids, input_ids >= vob_end_id, out=input_mask)
     tmp_input_ids = torch.zeros_like(input_ids)
     torch.sub(input_ids, vob_start_id, out=tmp_input_ids)

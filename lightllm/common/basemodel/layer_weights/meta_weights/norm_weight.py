@@ -59,6 +59,18 @@ class RMSNormWeight(BaseWeightTpl, PlatformAwareOp):
         # only triton implementation is supported for rmsnorm on cuda platform
         return self._triton_forward(input=input, eps=eps, out=out, alloc_func=alloc_func)
 
+    def _ascend_forward(
+        self, input: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
+    ) -> torch.Tensor:
+        import torch_npu
+
+        if out is None:
+            out = alloc_func(input.shape, dtype=input.dtype, device=input.device)
+        _out = torch_npu.npu_rms_norm(input, self.weight, epsilon=eps)[0]
+        out.copy_(_out)
+
+        return out
+
     def _musa_forward(
         self, input: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
     ) -> torch.Tensor:
@@ -205,7 +217,6 @@ class QKRMSNORMWeight(RMSNormWeight):
         eps: float,
     ) -> None:
         assert input.ndim == 2 and self.weight.ndim == 1
-        assert input.shape[-1] == self.dim, f"Expected hidden_size to be {self.dim}, but found: {input.shape[-1]}"
         head_dim = self.weight.shape[0]
         x = input.to(torch.float32)
         x = x.view(-1, head_dim)
@@ -228,6 +239,9 @@ class QKRMSNORMWeight(RMSNormWeight):
     ) -> None:
         self._triton_forward(input=input, eps=eps)
         return
+
+    def _ascend_forward(self, input, eps) -> None:
+        self._native_forward(input=input, eps=eps) 
 
     def _musa_forward(self, input: torch.Tensor, eps: float) -> torch.Tensor:
         # musa implementation is supported by musa triton on musa platform

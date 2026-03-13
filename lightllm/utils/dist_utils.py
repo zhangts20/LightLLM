@@ -2,6 +2,7 @@ import torch.distributed as dist
 import os
 import torch
 import requests
+from lightllm.utils.device_utils import is_npu
 
 # 规范 rank 的含义，在 llm 推理的相关代码中下述的 rank 的含义如下：
 # global_rank 全局 rank 序列id， 如两节点 8卡，会存在 0 - 15 16个global_rank
@@ -98,16 +99,26 @@ def init_distributed_env(kvargs):
     _init_nccl_env()
     device_id = kvargs["rank_id"] % get_node_world_size()
     set_current_device_id(device_id)
-    torch.cuda.set_device(device_id)
-    dist.init_process_group(
-        "nccl",
-        init_method=f'tcp://{kvargs["nccl_host"]}:{kvargs["nccl_port"]}',
-        rank=kvargs["rank_id"],
-        world_size=kvargs["world_size"],
-        device_id=torch.device(f"cuda:{device_id}"),
-    )
-    # warmup nccl communicator
-    _a = torch.zeros([1]).to(f"cuda:{device_id}")
+    if is_npu():
+        device = f"npu:{device_id}"
+        torch.npu.set_device(device_id)
+        dist.init_process_group(
+            "cpu:gloo,npu:hccl",
+            init_method=f'tcp://{kvargs["nccl_host"]}:{kvargs["nccl_port"]}',
+            rank=kvargs["rank_id"],
+            world_size=kvargs["world_size"],
+        )
+    else:
+        device = f"cuda:{device_id}"
+        torch.cuda.set_device(device_id)
+        dist.init_process_group(
+            "nccl",
+            init_method=f'tcp://{kvargs["nccl_host"]}:{kvargs["nccl_port"]}',
+            rank=kvargs["rank_id"],
+            world_size=kvargs["world_size"],
+            device_id=torch.device(device),
+        )
+    _a = torch.zeros([1]).to(device)
     dist.all_reduce(_a)
     del _a
 

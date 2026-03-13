@@ -209,7 +209,7 @@ class Qwen2VisionTransformerPretrainedModel(nn.Module):
         )
 
         head_dim = self.embed_dim // self.num_heads
-        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2).cuda()
+        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2).to(self.patch_embed.device)
 
         self.blocks = nn.ModuleList(
             [
@@ -279,17 +279,18 @@ class Qwen2VisionTransformerPretrainedModel(nn.Module):
         return cos, sin
 
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        device = hidden_states.device
         hidden_states = self.patch_embed(hidden_states)
         rotary_cos, rotary_sin = self.rot_pos_emb(grid_thw)
-        rotary_cos = rotary_cos.to("cuda", non_blocking=True)
-        rotary_sin = rotary_sin.to("cuda", non_blocking=True)
+        rotary_cos = rotary_cos.to(device, non_blocking=True)
+        rotary_sin = rotary_sin.to(device, non_blocking=True)
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0, dtype=torch.int32
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-        cu_seqlens = cu_seqlens.to("cuda", non_blocking=True)
+        cu_seqlens = cu_seqlens.to(device, non_blocking=True)
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
@@ -329,8 +330,9 @@ class Qwen2VisionTransformerPretrainedModel(nn.Module):
         imgs = torch.cat(img_tensors, dim=0)
         grid_thw = torch.cat(img_grids, dim=0)
 
-        pixel_values = imgs.to("cuda", dtype=self.data_type, non_blocking=True)
-        image_grid_thw = grid_thw.to("cuda", non_blocking=True)
+        device = self.patch_embed.device
+        pixel_values = imgs.to(device, dtype=self.data_type, non_blocking=True)
+        image_grid_thw = grid_thw.to(device, non_blocking=True)
 
         all_img_embeds = self.forward(pixel_values, grid_thw=image_grid_thw)
 

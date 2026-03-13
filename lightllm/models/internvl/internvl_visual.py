@@ -13,6 +13,7 @@ from lightllm.server.embed_cache.utils import read_shm, get_shm_name_data
 from io import BytesIO
 from lightllm.models.internvl.img_process import load_image
 from lightllm.models.vit import get_load_image_func
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -38,7 +39,11 @@ class InternVLVisionModel:
         self.model = InternVLChatModel.from_pretrained(
             weight_dir, config=cfg, torch_dtype=self.dtype, language_model="fake_language_model"
         )
-        self.model.eval().cuda()
+        if is_npu():
+            device = "npu"
+        else:
+            device = "cuda"
+        self.model.eval().to(device)
         self.load_image_func = get_load_image_func(weight_dir)
 
     def cuda(self):
@@ -68,7 +73,7 @@ class InternVLVisionModel:
             return None
 
         imgs = torch.cat(img_tensors, dim=0)
-        pixel_values = imgs.cuda().to(dtype=self.dtype)
+        pixel_values = imgs.to(self.model.device).to(dtype=self.dtype)
         all_img_embeds = self.model.extract_feature(pixel_values)
 
         return all_img_embeds, uuids, valid_ids

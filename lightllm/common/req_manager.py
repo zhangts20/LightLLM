@@ -5,6 +5,7 @@ from .kv_cache_mem_manager import MemoryManager
 from typing import List, Optional
 from lightllm.common.basemodel.triton_kernel.gen_sampling_params import token_id_counter
 from lightllm.common.basemodel.triton_kernel.gen_sampling_params import update_req_to_token_id_counter
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.envs_utils import enable_env_vars, get_env_start_args
 from lightllm.utils.config_utils import get_vocab_size
 
@@ -58,9 +59,13 @@ class ReqManager:
         # 的这个请求管理 id， 主要是为了兼容 DP 运行模式下，让各个 DP 能 padding 到 DP 中最大
         # 的那个batch size 进行运行，所有 padding 的请求都会使用预留的这个请求管理 id 进行处理
         # 这样让 DP 的实现更为简化一些。
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
         self.req_list = _ReqLinkedList(max_request_num)
         self.req_to_token_indexs = torch.zeros(
-            (max_request_num + 1, max_sequence_length), dtype=torch.int32, device="cuda"
+            (max_request_num + 1, max_sequence_length), dtype=torch.int32, device=self.device
         )
         self.mem_manager = mem_manager
         self.req_sampling_params_manager = ReqSamplingParamsManager(max_request_num)
@@ -102,24 +107,28 @@ class ReqSamplingParamsManager:
     """
 
     def __init__(self, max_request_num):
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
         # mode ["cpu_counter", "pin_mem_counter", "gpu_counter"]
         self.penalty_counter_mode = get_env_start_args().penalty_counter_mode
         self.vocab_size = get_vocab_size(get_env_start_args().model_dir)
-        self.req_to_presence_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device="cuda")
-        self.req_to_frequency_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device="cuda")
-        self.req_to_repetition_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device="cuda")
+        self.req_to_presence_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device=self.device)
+        self.req_to_frequency_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device=self.device)
+        self.req_to_repetition_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device=self.device)
         self.req_to_next_token_ids = torch.zeros(
             (max_request_num + 1, 8),
             dtype=torch.int64,
-            device="cuda",
+            device=self.device,
         )
         self.req_to_exponential_decay_length_penalty = torch.zeros(
-            max_request_num + 1, dtype=torch.float32, device="cuda"
+            max_request_num + 1, dtype=torch.float32, device=self.device
         )
 
         if self.penalty_counter_mode == "gpu_counter":
             self.req_to_out_token_id_counter = torch.zeros(
-                (max_request_num + 1, self.vocab_size), dtype=torch.int32, device="cuda"
+                (max_request_num + 1, self.vocab_size), dtype=torch.int32, device=self.device
             )
         elif self.penalty_counter_mode == "pin_mem_counter":
             self.req_to_out_token_id_counter = torch.zeros(

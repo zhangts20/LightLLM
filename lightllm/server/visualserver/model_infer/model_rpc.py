@@ -1,4 +1,5 @@
 import asyncio
+from lightllm.utils.device_utils import is_npu
 import numpy as np
 import rpyc
 import torch
@@ -84,7 +85,10 @@ class VisualModelRpcServer(rpyc.Service):
                 raise Exception(f"can not support {self.model_type} now")
 
             self.model.load_model(weight_dir)
-            self.model = self.model.cuda()
+            if is_npu():
+                self.model = self.model.npu()
+            else:
+                self.model = self.model.cuda()
             self.cpu_embed_cache_client = CpuEmbedCacheClient(create_meta_data=False, init_shm_data=True)
         except Exception as e:
             print("#" * 16)
