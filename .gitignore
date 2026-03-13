@@ -9,3 +9,5 @@ tmp/
 requirements-musa.txt
 # npu
 kernel_meta
+profile*.json
+run_*.sh

@@ -3,8 +3,6 @@ import triton
 import triton.language as tl
 from lightllm.utils.device_utils import is_npu
 
-from lightllm.utils.envs_utils import is_npu
-
 
 @triton.jit
 def _fwd_kernel_flash_decode_stage1(

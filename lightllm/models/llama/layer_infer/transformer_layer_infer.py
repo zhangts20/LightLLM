@@ -8,6 +8,7 @@ from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import s
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
 from lightllm.common.basemodel import TransformerLayerInferTpl
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -156,7 +157,12 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         input = input.view(-1, self.embed_dim_)
         up_gate_out = layer_weight.gate_up_proj.mm(input)
         ffn1_out = self.alloc_tensor((input.size(0), up_gate_out.size(1) // 2), input.dtype, device=input.device)
-        forward_call = torch_silu_and_mul_fwd if input.device.type == "npu" else silu_and_mul_fwd
+        if is_npu():
+            from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import torch_silu_and_mul_fwd
+
+            forward_call = torch_silu_and_mul_fwd
+        else:
+            forward_call = silu_and_mul_fwd
         forward_call(up_gate_out, ffn1_out)
         input = None
         up_gate_out = None
