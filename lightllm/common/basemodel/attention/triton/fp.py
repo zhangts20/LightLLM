@@ -173,13 +173,22 @@ class TritonDecodeAttState(BaseDecodeAttState):
         v: torch.Tensor,
         alloc_func=torch.empty,
     ):
-        from ...triton_kernel.att.decode_att.gqa.flash_decoding.gqa_flash_decoding import (
-            gqa_token_decode_attention_flash_decoding,
-        )
+        if is_npu():
+            from ...triton_kernel.att.decode_att.gqa.flash_decoding.gqa_flash_decoding import (
+                npu_gqa_token_decode_attention_flash_decoding
+            )
+
+            token_attention_call = npu_gqa_token_decode_attention_flash_decoding
+        else:
+            from ...triton_kernel.att.decode_att.gqa.flash_decoding.gqa_flash_decoding import (
+                gqa_token_decode_attention_flash_decoding,
+            )
+
+            token_attention_call = gqa_token_decode_attention_flash_decoding 
 
         out = alloc_func(q.shape, q.dtype, device=q.device)
 
-        gqa_token_decode_attention_flash_decoding(
+        token_attention_call(
             q=q,
             infer_state=self.infer_state,
             cache_k=k,

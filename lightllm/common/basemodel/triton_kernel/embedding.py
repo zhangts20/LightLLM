@@ -48,14 +48,6 @@ def embedding(input_ids, weight: torch.Tensor, vob_start_id, vob_end_id, out: to
 
     grid = (triton.cdiv(n_ctx, BLOCK_N), 1, 1)
 
-    # Ascend NPU
-    if is_npu():
-        torch_out = torch.nn.functional.embedding(input_ids, weight)
-        if out is not None:
-            out.copy_(torch_out)
-            return
-        return torch_out
-
     embedding_kernel[grid](
         weight,
         input_ids,
@@ -94,6 +86,28 @@ def embedding_old(input_ids, wte_weight, vob_start_id, vob_end_id):
     input_embdings = torch.embedding(wte_weight, tmp_input_ids, padding_idx=-1)
     input_embdings[input_mask] = 0.0
     return input_embdings
+
+
+@torch.no_grad()
+def npu_embedding(
+    input_ids: torch.Tensor,
+    wte_weight: torch.Tensor,
+    vob_start_id: int,
+    vob_end_id: int,
+    out=None,
+):
+    input_mask = (input_ids < vob_start_id) | (input_ids >= vob_end_id)
+    tmp_input_ids = input_ids - vob_start_id
+    tmp_input_ids = tmp_input_ids.masked_fill(input_mask, 0)
+
+    emb = torch.nn.functional.embedding(tmp_input_ids, wte_weight, padding_idx=0)
+    if out is not None:
+        out.copy_(emb)
+        out.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return out
+
+    emb.masked_fill_(input_mask.unsqueeze(-1), 0)
+    return emb
 
 
 if __name__ == "__main__":

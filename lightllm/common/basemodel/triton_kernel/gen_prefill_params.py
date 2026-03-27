@@ -93,19 +93,63 @@ def gen_prefill_params(input_token_num: int, b_ready_cache_len: torch.Tensor, b_
     grid = (batch_size,)
     num_warps = 4
 
-    RANGE_BLOCK = 1024
-    if is_npu():
-        RANGE_BLOCK = 256
-
     _gen_prefill_position[grid](
         b_ready_cache_len,
         b_seq_len,
         b1_cu_q_seq_len,
         position_ids,
-        RANGE_BLOCK=RANGE_BLOCK,
+        RANGE_BLOCK=1024,
         num_warps=num_warps,
         num_stages=1,
     )
 
     b_kv_seq_len = b_seq_len
     return b_q_seq_len, b1_cu_q_seq_len, b_kv_seq_len, b1_cu_kv_seq_len, position_ids
+
+
+@torch.no_grad()
+def npu_gen_prefill_params(
+    input_token_num: int,
+    b_ready_cache_len: torch.Tensor,
+    b_seq_len: torch.Tensor,
+):
+    assert b_ready_cache_len.shape == b_seq_len.shape
+    device = b_ready_cache_len.device
+    dtype = torch.int32
+
+    b_q_seq_len = b_seq_len - b_ready_cache_len
+    b_kv_seq_len = b_seq_len
+
+    b1_cu_q_seq_len = torch.empty(
+        (b_q_seq_len.shape[0] + 1,), dtype=dtype, device=device
+    )
+    b1_cu_q_seq_len[0] = 0
+    b1_cu_q_seq_len[1:] = torch.cumsum(b_q_seq_len.to(dtype), dim=0)
+
+    b1_cu_kv_seq_len = torch.empty(
+        (b_kv_seq_len.shape[0] + 1,), dtype=dtype, device=device
+    )
+    b1_cu_kv_seq_len[0] = 0
+    b1_cu_kv_seq_len[1:] = torch.cumsum(b_kv_seq_len.to(dtype), dim=0)
+
+    total_q = int(b_q_seq_len.sum().item())
+    assert total_q == input_token_num, "input_token_num is incorrect"
+
+    global_idx = torch.arange(total_q, device=device, dtype=dtype)
+
+    cu_q = b1_cu_q_seq_len[1:]
+    batch_id = torch.searchsorted(cu_q, global_idx, right=True)
+
+    batch_start = b1_cu_q_seq_len[:-1]
+
+    local_offset = global_idx - batch_start[batch_id]
+
+    position_ids = b_ready_cache_len[batch_id].to(dtype) + local_offset
+
+    return (
+        b_q_seq_len,
+        b1_cu_q_seq_len,
+        b_kv_seq_len,
+        b1_cu_kv_seq_len,
+        position_ids,
+    )

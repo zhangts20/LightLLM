@@ -5,7 +5,7 @@ from lightllm.common.kv_cache_mem_manager import MemoryManager
 from lightllm.common.req_manager import ReqManager
 from lightllm.distributed import CustomProcessGroup
 from typing import Tuple, Any, Optional, List
-from .triton_kernel.gen_prefill_params import gen_prefill_params
+from .triton_kernel.gen_prefill_params import gen_prefill_params, npu_gen_prefill_params
 from .triton_kernel.gen_decode_params import gen_decode_params
 from .triton_kernel.multimodal_emb import mark_multimodal_obj
 from .batch_objs import ModelInput
@@ -67,6 +67,8 @@ class InferStateInfo:
         self.b_q_seq_len: torch.Tensor = None
         self.b1_cu_q_seq_len: torch.Tensor = None
         self.b_kv_seq_len: torch.Tensor = None
+        # for cudagraph of acl
+        self.b_kv_seq_len_cpu: List[int] = None
         self.b1_cu_kv_seq_len: torch.Tensor = None
         self.position_ids: torch.Tensor = None
         self.max_q_seq_len: int = None
@@ -100,13 +102,14 @@ class InferStateInfo:
 
     def init_some_extra_state(self, model):
         if self.is_prefill:
+            func_call = npu_gen_prefill_params if self.b_seq_len.device.type == "npu" else gen_prefill_params
             (
                 self.b_q_seq_len,
                 self.b1_cu_q_seq_len,
                 self.b_kv_seq_len,
                 self.b1_cu_kv_seq_len,
                 self.position_ids,
-            ) = gen_prefill_params(
+            ) = func_call(
                 input_token_num=self.input_ids.shape[0],
                 b_ready_cache_len=self.b_ready_cache_len,
                 b_seq_len=self.b_seq_len,
@@ -121,6 +124,7 @@ class InferStateInfo:
                 self.position_ids,
             ) = gen_decode_params(self.b_seq_len)
             self.b_kv_start_loc = self.b1_cu_kv_seq_len[0:-1]
+        self.b_kv_seq_len_cpu = self.b_kv_seq_len.cpu().tolist()
 
     def init_att_state(self):
         if self.is_prefill:

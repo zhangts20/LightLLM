@@ -73,7 +73,7 @@ class LlamaPostLayerInfer(PostLayerInferTpl):
         if self.tp_world_size_ == 1:
             gather_data = logic_batch
         else:
-            gather_data = self.alloc_tensor((vocab_size, token_num), dtype=input_embdings_dtype)
+            gather_data = self.alloc_tensor((vocab_size, token_num), dtype=input_embdings_dtype, device=input_embdings_device)
             split_indexes = np.linspace(0, vocab_size, self.tp_world_size_ + 1, dtype=np.int64)
             all_gather(
                 [gather_data[split_indexes[i] : split_indexes[i + 1], :] for i in range(self.tp_world_size_)],

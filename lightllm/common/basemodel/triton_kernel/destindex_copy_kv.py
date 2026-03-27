@@ -62,8 +62,3 @@ def destindex_copy_kv(K, DestLoc, Out):
         num_stages=1,
     )
     return
-
-
-@torch.no_grad()
-def npu_destindex_copy_kv(K, DestLoc, Out):
-    Out.index_copy_(0, DestLoc, K)

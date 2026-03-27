@@ -7,7 +7,7 @@ import triton.language as tl
 import math
 import torch.nn.functional as F
 
-from lightllm.utils.device_utils import is_tesla
+from lightllm.utils.device_utils import is_npu, is_tesla
 
 
 @triton.jit
@@ -123,7 +123,12 @@ def _fwd_kernel(
 def context_attention_fwd(
     q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, max_kv_len, req_to_token_indexs
 ):
-    BLOCK_M = 128 if not is_tesla() else 64
+    if is_npu():
+        BLOCK_M = 32
+    elif is_tesla():
+        BLOCK_M = 64
+    else:
+        BLOCK_M = 128
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -564,7 +569,7 @@ def npu_context_attention_fwd(
 ) -> None:
     import torch_npu
 
-    batch = b_start_loc.shape[0]
+    batch = b_req_idx.shape[0]
     H = q.shape[1]
     D = q.shape[-1]  
 
@@ -586,24 +591,20 @@ def npu_context_attention_fwd(
     mask_padding = k_idx[None, None, :] >= b_seq_len[:, None, None]
 
     final_mask = (mask_causal | mask_padding).unsqueeze(1)
-    # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_fusion_attention.md
-    attn_out, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+    # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_prompt_flash_attention.md
+    scale_value = 1.0 / (q.shape[-1] ** 0.5)
+    attn_out = torch_npu.npu_prompt_flash_attention(
         query=q_padded,
         key=k_padded,
         value=v_padded,
-        head_num=H,
-        # (batch_size, seq, head, dim)
-        input_layout="BSND",
         atten_mask=final_mask,
-        scale=1.0 / math.sqrt(D),
-        inner_precise=0,
-        # different type of mask
-        sparse_mode=0,
-        gen_mask_parallel=True,
-        sync=False
+        num_heads=q.shape[-2],
+        num_key_value_heads=k.shape[-2],
+        scale_value=scale_value,
+        input_layout="BSND",
+        actual_seq_lengths=q_lens.cpu().to(torch.int64).tolist(),
     )
-    o.copy_(attn_out[q_mask].view(-1, H, D))
-
+    o.copy_(attn_out[q_mask])
 
 def test():
     import torch

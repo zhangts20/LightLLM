@@ -3,7 +3,7 @@ import numpy as np
 from typing import Dict, Optional
 from .base_weight import BaseWeightTpl
 from .platform_op import PlatformAwareOp
-from lightllm.common.basemodel.triton_kernel.embedding import embedding as embedding_kernel, embedding_old
+from lightllm.common.basemodel.triton_kernel.embedding import embedding as embedding_kernel, npu_embedding
 from lightllm.utils.dist_utils import get_dp_world_size, get_current_rank_in_dp
 
 
@@ -79,7 +79,7 @@ class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
             out = alloc_func(
                 (input_ids.shape[0], self.weight.shape[1]), dtype=self.weight.dtype, device=self.weight.device
             ) 
-        _out = embedding_old(input_ids, self.weight, self.tp_vocab_start_id, self.tp_vocab_end_id)
+        _out = npu_embedding(input_ids, self.weight, self.tp_vocab_start_id, self.tp_vocab_end_id)
         out.copy_(_out)
 
         return out

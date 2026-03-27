@@ -262,6 +262,12 @@ class TpPartBaseModel:
             self.graph = None
         else:
             if self.device == "npu":
+                # TODO: bad accuracy of aclgraph now
+                logger.warning("Graph of Ascend is not ready!")
+                self.graph = None
+
+                return
+
                 from lightllm.common.basemodel.acl_graph import AclGraph
 
                 self.graph = AclGraph(self.graph_max_batch_size, self.graph_max_batch_size)

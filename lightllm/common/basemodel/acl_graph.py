@@ -64,7 +64,7 @@ class AclGraph:
 
     def _capture_decode(self, decode_func, infer_state: InferStateInfo) -> ModelOutput:
         dist_group: CustomProcessGroup = infer_state.dist_group
-        graph_obj = torch_npu.npu.NPUGraph()
+        graph_obj = torch.npu.NPUGraph()
         batch_size = infer_state.input_ids.shape[0]
         infer_state.max_kv_seq_len = self.graph_max_len_in_batch
         infer_state.total_token_num = self.graph_max_len_in_batch * batch_size
@@ -94,7 +94,7 @@ class AclGraph:
     ):
         dist_group: CustomProcessGroup = infer_state.dist_group
         dist_group1 = infer_state1.dist_group
-        graph_obj = torch_npu.npu.NPUGraph()
+        graph_obj = torch.npu.NPUGraph()
         batch_size = infer_state.input_ids.shape[0]
         infer_state.max_kv_seq_len = self.graph_max_len_in_batch
         infer_state.total_token_num = self.graph_max_len_in_batch * batch_size
@@ -144,8 +144,7 @@ class AclGraph:
 
     def _replay(self, infer_state: InferStateInfo):
         batch_size = infer_state.input_ids.shape[0]
-        graph_obj, graph_input_ids, graph_infer_state, graph_output = self.graph[batch_size]
-        graph_input_ids.copy_(infer_state.input_ids)
+        graph_obj, graph_infer_state, graph_output = self.graph[batch_size]
         graph_infer_state.copy_for_cuda_graph(infer_state)
         graph_obj.replay()
 
@@ -175,7 +174,7 @@ class AclGraph:
             return self._replay_overlap(infer_state, infer_state1)
         else:
             assert infer_state1 is None
-            return self._replay(infer_state.input_ids, infer_state)
+            return self._replay(infer_state)
 
     @torch.no_grad()
     def warmup(self, model):

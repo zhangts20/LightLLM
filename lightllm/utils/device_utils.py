@@ -13,8 +13,7 @@ logger = init_logger(__name__)
 
 @lru_cache(maxsize=None)
 def is_tesla():
-    return "Tesla" in torch.cuda.get_device_name(0)
-
+    return hasattr(torch, "cuda") and "Tesla" in torch.cuda.get_device_name(0)
 
 @lru_cache(maxsize=None)
 def is_hopper():
