@@ -67,27 +67,26 @@ def init_vision_distributed_env(kvargs):
     set_current_device_id(device_id)
 
     if is_npu():
+        device = f"npu:{device_id}"
         torch.npu.set_device(device_id)
         dist.init_process_group(
             "hccl",
             init_method=f'tcp://127.0.0.1:{kvargs["visual_nccl_port"]}',
             rank=kvargs["tp_rank_id"],
             world_size=tp_world_size,
-            device_id=torch.device(f"npu:{device_id}"),
         )
-        # warmup nccl communicator
-        _a = torch.zeros([1]).to(f"npu:{device_id}")
     else:
+        device = f"cuda:{device_id}"
         torch.cuda.set_device(device_id)
         dist.init_process_group(
             "nccl",
             init_method=f'tcp://127.0.0.1:{kvargs["visual_nccl_port"]}',
             rank=kvargs["tp_rank_id"],
             world_size=tp_world_size,
-            device_id=torch.device(f"cuda:{device_id}"),
+            device_id=torch.device(device),
         )
-        # warmup nccl communicator
-        _a = torch.zeros([1]).to(f"cuda:{device_id}")
+    # warmup nccl communicator
+    _a = torch.zeros([1]).to(device)
     dist.all_reduce(_a)
     del _a
 
