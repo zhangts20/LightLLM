@@ -1,0 +1,102 @@
+# docker pull from https://quay.io/repository/ascend/cann
+ARG TAG="8.3.rc1-910b-ubuntu22.04-py3.11"
+FROM quay.io/ascend/cann:${TAG} AS installer 
+
+WORKDIR /usr/src
+
+RUN git config --global http.proxy http://proxy-sz.sensetime.com:3128 && \
+    git config --global https.proxy http://proxy-sz.sensetime.com:3128
+
+# build llvm and triton
+ENV LLVM_INSTALL="/usr/src/llvm-project/llvm_install"
+RUN git init llvm-project && \
+    cd llvm-project && \
+    git remote add origin https://github.com/llvm/llvm-project.git && \
+    git fetch --depth 1 origin b5cc222d7429fe6f18c787f633d5262fac2e676f && \
+    git checkout FETCH_HEAD
+
+# add source of clang
+RUN apt update && apt install -y software-properties-common && \
+    wget https://apt.llvm.org/llvm-snapshot.gpg.key && \
+    apt-key add llvm-snapshot.gpg.key && \
+    add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-15 main"
+RUN apt update && apt install -y ninja-build clang-15
+RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+WORKDIR /usr/src/llvm-project
+RUN mkdir build && cd build && \
+    cmake ../llvm \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_ENABLE_ASSERTIONS=ON \
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+      -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld" \
+      -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU" \
+      -DCMAKE_INSTALL_PREFIX=${LLVM_INSTALL} \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ && \
+    ninja -j$(nproc) && \
+    ninja install
+
+ENV LLVM_INSTALL_PREFIX=${LLVM_INSTALL}
+ENV PATH=/data/zhangtaoshan/AscendNPU-IR/build/bin:${PATH}
+ENV LLVM_SYSPATH=${LLVM_INSTALL_PREFIX}
+ENV TRITON_PLUGIN_DIRS=./ascend
+ENV TRITON_BUILD_WITH_CCACHE=true
+ENV TRITON_BUILD_WITH_CLANG_LLD=true
+ENV TRITON_BUILD_PROTON=OFF
+ENV TRITON_WHEEL_NAME=triton-ascend
+ENV TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
+
+WORKDIR /usr/src
+
+RUN git clone https://gitcode.com/Ascend/triton-ascend.git && \
+    cd triton-ascend && \
+    git checkout 2f7ac8f6c464ab62c92848ab536fc81246a236bf && \
+    git submodule update --init --recursive
+
+WORKDIR /usr/src/triton-ascend
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN apt install -y ccache zlib1g-dev
+RUN pip install cmake ninja pybind11 wheel && python3 setup.py bdist_wheel
+
+# build ascendnpu-ir
+WORKDIR /usr/src
+
+RUN git init AscendNPU-IR && \
+    cd AscendNPU-IR && \
+    git remote add origin https://gitcode.com/Ascend/AscendNPU-IR.git && \
+    git fetch --depth 1 origin 925c1926317a26729d5ad6f1d23ef194b2540427 && \
+    git checkout FETCH_HEAD && \
+    sed -i '/insertInferTaskTypeFunc(func, taskType);/s/^/\/\//' bishengir/lib/Dialect/HIVM/Transforms/InsertInferTaskTypeFunc.cpp && \
+    git submodule update --init --recursive
+WORKDIR /usr/src/AscendNPU-IR
+RUN ./build-tools/build.sh -o ./build --build-type Release --apply-patches
+
+FROM quay.io/ascend/cann:${TAG} AS builder
+
+WORKDIR /usr/src
+
+COPY ./requirements_ascend.txt requirements_ascend.txt
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install torch==2.5.1 torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple    
+RUN pip install -r requirements_ascend.txt --no-cache-dir
+
+COPY --from=installer /usr/src/triton-ascend/dist/*.whl /tmp/
+RUN pip install /tmp/*.whl --no-cache-dir
+
+FROM quay.io/ascend/cann:${TAG}
+
+ENV ASCENDNPU_IR_PATH=/opt/ascendnpu-ir/bin
+ENV PATH=${ASCENDNPU_IR_PATH}:${PATH}
+COPY --from=installer /usr/src/AscendNPU-IR/build/bin ${ASCENDNPU_IR_PATH}
+
+COPY --from=builder /usr/local/python3.11.13/bin /usr/local/python3.11.13/bin
+COPY --from=builder /usr/local/python3.11.13/lib/python3.11/site-packages /usr/local/python3.11.13/lib/python3.11/site-packages
+
+COPY . /lightllm
+RUN cp /lightllm/requirements_ascend.txt /lightllm/requirements.txt
+RUN cp /lightllm/setup_ascend.py /lightllm/setup.py
+RUN pip install -e /lightllm --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple
