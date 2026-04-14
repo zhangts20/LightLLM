@@ -2,7 +2,6 @@ import torch
 
 import triton
 import triton.language as tl
-from lightllm.utils.device_utils import is_npu
 
 
 @triton.jit

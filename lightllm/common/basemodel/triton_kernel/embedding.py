@@ -1,5 +1,4 @@
 import torch
-from lightllm.utils.device_utils import is_npu
 import triton
 import triton.language as tl
 

@@ -14,6 +14,32 @@ from lightllm.utils.dist_utils import get_global_dp_rank
 from .attention import BasePrefillAttState, BaseDecodeAttState
 
 
+class SeqLenManager:
+    def __init__(self, max_batch: int):
+        self.max_batch = max_batch
+
+        self.b1_cu_q_seq_len_cpu = torch.empty(
+            max_batch, dtype=torch.int32, device='cpu', pin_memory=True)
+        self.b_cu_kv_seq_len_cpu = torch.empty(
+            max_batch, dtype=torch.int32, device='cpu', pin_memory=True)
+
+        self.b_cu_q_seq_len_list = None
+        self.b_cu_kv_seq_len_list = None
+
+    def update(self, b1_cu_q_seq_len: torch.Tensor, b_cu_kv_seq_len: torch.Tensor):
+        n_q = b1_cu_q_seq_len.numel() - 1
+        n_kv = b_cu_kv_seq_len.numel()
+
+        self.b1_cu_q_seq_len_cpu[:n_q].copy_(b1_cu_q_seq_len[1:], non_blocking=False)
+        self.b_cu_kv_seq_len_cpu[:n_kv].copy_(b_cu_kv_seq_len, non_blocking=False)
+
+        self.n_q = n_q
+        self.n_kv = n_kv
+
+    def get_tensor_slices(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.b1_cu_q_seq_len_cpu[:self.n_q], self.b_cu_kv_seq_len_cpu[:self.n_kv]
+
+
 class InferStateInfo:
     """
     推理时用的信息结构体
@@ -66,9 +92,9 @@ class InferStateInfo:
         # b1 开头的tensor变量其shape为[batch_size + 1,]
         self.b_q_seq_len: torch.Tensor = None
         self.b1_cu_q_seq_len: torch.Tensor = None
+        self.b1_cu_q_seq_len_cpu: torch.Tensor = None
         self.b_kv_seq_len: torch.Tensor = None
-        # for cudagraph of acl
-        self.b_kv_seq_len_cpu: List[int] = None
+        self.b_cu_kv_seq_len_cpu: torch.Tensor = None
         self.b1_cu_kv_seq_len: torch.Tensor = None
         self.position_ids: torch.Tensor = None
         self.max_q_seq_len: int = None
@@ -99,6 +125,13 @@ class InferStateInfo:
         # self.dp_input_lens: torch.Tensor = None
         self.dp_output_split_sizes: List[List[int]] = None
         self.dp_input_split_sizes: List[List[int]] = None
+        
+        args = get_env_start_args()
+        if not args.disable_cudagraph:
+            max_seq_len = max(args.running_max_req_size, args.graph_max_batch_size) + 1
+        else:
+            max_seq_len = args.running_max_req_size + 1
+        self.seq_manager = SeqLenManager(max_seq_len)
 
     def init_some_extra_state(self, model):
         if self.is_prefill:
@@ -124,7 +157,8 @@ class InferStateInfo:
                 self.position_ids,
             ) = gen_decode_params(self.b_seq_len)
             self.b_kv_start_loc = self.b1_cu_kv_seq_len[0:-1]
-        self.b_kv_seq_len_cpu = self.b_kv_seq_len.cpu().tolist()
+        self.seq_manager.update(self.b1_cu_q_seq_len, self.b_kv_seq_len)
+        self.b1_cu_q_seq_len_cpu, self.b_cu_kv_seq_len_cpu = self.seq_manager.get_tensor_slices()
 
     def init_att_state(self):
         if self.is_prefill:
@@ -342,3 +376,23 @@ class InferStateInfo:
                 if attr_ is not None and attr_.data_ptr() != attr_value.data_ptr() and attr_.shape == attr_value.shape:
                     attr_.copy_(attr_value, non_blocking=True)
         return
+
+    def __repr__(self):
+        attrs = []
+        for k, v in vars(self).items():
+            if k.startswith("_"):
+                continue
+    
+            if isinstance(v, (int, float, str, bool, list, tuple, dict, torch.Tensor)) or v is None:
+                if isinstance(v, torch.Tensor):
+                    desc = f"Tensor(value={v}, shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device})"
+                else:
+                    desc = repr(v)
+    
+                attrs.append(f"  {k} = {desc}")
+    
+        if not attrs:
+            return f"{self.__class__.__name__}()"
+    
+        return f"{self.__class__.__name__}(\n" + "\n".join(attrs) + "\n)"
+        

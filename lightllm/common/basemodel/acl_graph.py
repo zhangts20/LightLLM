@@ -1,9 +1,10 @@
 import bisect
 import copy
 import torch
-import torch_npu
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
+from lightllm.common.basemodel.attention.paged_fa3.fp import update_attn_params
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
 from lightllm.common.basemodel.infer_struct import InferStateInfo
 from lightllm.distributed.communication_op import CustomProcessGroup, lightllm_capture_graph
@@ -43,6 +44,7 @@ class AclGraph:
         assert batch_sizes[-1] == self.max_batch_size
 
         logger.info(f"acl graph batch_sizes: {self.acl_graph_batch_sizes}")
+        init_attn_params(batch_sizes)
 
     def can_run(self, batch_size: int, max_len_in_batch: int) -> bool:
         return batch_size <= self.max_batch_size and max_len_in_batch <= self.graph_max_len_in_batch
@@ -77,13 +79,11 @@ class AclGraph:
             for param_name in set(vars(infer_state).keys()):
                 if param_name not in pure_para_set:
                     delattr(infer_state, param_name)
-
         with lightllm_capture_graph(dist_group):
             with torch.npu.graph(graph_obj, pool=self.mempool):
                 model_output = decode_func(infer_state)
         self.graph[batch_size] = (graph_obj, infer_state, model_output)
         graph_obj.replay()
-
         return model_output
 
     def _capture_decode_overlap(
@@ -126,7 +126,6 @@ class AclGraph:
             model_output,
             model_output1,
         )
-        graph_obj.replay()
 
         return model_output, model_output1
 
@@ -134,7 +133,7 @@ class AclGraph:
         self,
         decode_func,
         infer_state: InferStateInfo,
-        infer_state1: Optional[torch.Tensor] = None,
+        infer_state1: Optional[InferStateInfo] = None,
     ):
         if self.enable_decode_microbatch_overlap:
             return self._capture_decode_overlap(decode_func, infer_state, infer_state1)
@@ -146,6 +145,9 @@ class AclGraph:
         batch_size = infer_state.input_ids.shape[0]
         graph_obj, graph_infer_state, graph_output = self.graph[batch_size]
         graph_infer_state.copy_for_cuda_graph(infer_state)
+        update_attn_params(
+            batch_size, infer_state.b1_cu_q_seq_len_cpu, infer_state.b_cu_kv_seq_len_cpu
+        )
         graph_obj.replay()
 
         return graph_output
@@ -209,7 +211,10 @@ class AclGraph:
                 b_seq_len=b_seq_len,
                 b_mtp_index=b_mtp_index,
                 is_prefill=False,
-                multimodal_params=[{"images": [], "audios": []} for _ in range(batch_size)],
+                multimodal_params=[{
+                    "images": [],
+                    "audios": []
+                } for _ in range(batch_size)],
                 **model._gen_special_model_input(batch_size),
             )
             model_output: ModelOutput = model.forward(model_input)
@@ -269,7 +274,10 @@ class AclGraph:
                     mem_indexes=mem_indexes,
                     b_req_idx=b_req_idx,
                     b_seq_len=b_seq_len,
-                    multimodal_params=[{"images": [], "audios": []} for _ in range(batch_size)],
+                    multimodal_params=[{
+                        "images": [],
+                        "audios": []
+                    } for _ in range(batch_size)],
                     **model._gen_special_model_input(batch_size),
                 )
                 decode_batches.append(micro_batch)
@@ -296,3 +304,32 @@ class AclGraph:
             f"Capture overlap aclgraph success, batch_size <={self.max_batch_size} "
             f"and max_len_in_batch <= {self.graph_max_len_in_batch} will infer with aclgraph."
         )
+
+
+@dataclass
+class AclGraphParams:
+    handles: dict[int, list[Any]] = field(default_factory=dict)
+    attn_params: dict[int, list[tuple]] = field(default_factory=dict)
+
+
+ATTN_PARAMS: AclGraphParams = None
+
+
+def init_attn_params(batch_sizes: list[int]):
+    global ATTN_PARAMS
+    ATTN_PARAMS = AclGraphParams(
+        handles={bs: []
+                 for bs in batch_sizes}, attn_params={bs: []
+                                                      for bs in batch_sizes}
+    )
+
+
+def get_attn_params():
+    return ATTN_PARAMS
+
+
+def add_attn_params(batch_size: int, handle: Any, attn_params: tuple):
+    global ATTN_PARAMS
+    if ATTN_PARAMS is not None:
+        ATTN_PARAMS.handles[batch_size].append(handle)
+        ATTN_PARAMS.attn_params[batch_size].append(attn_params)

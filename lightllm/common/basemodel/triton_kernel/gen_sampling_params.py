@@ -180,22 +180,3 @@ def update_req_to_token_id_counter(
         num_warps=1,
     )
     return
-
-
-@torch.no_grad()
-def torch_update_req_to_token_id_counter(
-    b_req_idx: torch.Tensor,
-    next_token_ids: torch.Tensor,
-    req_to_out_token_id_counter: torch.Tensor,
-    mask: torch.Tensor = None,
-) -> None:
-    batch = b_req_idx.shape[0]
-
-    for i in range(batch):
-        if mask is not None and not bool(mask[i]):
-            continue
-
-        req = int(b_req_idx[i])
-        tok = int(next_token_ids[i])
-
-        req_to_out_token_id_counter[req, tok] += 1

@@ -213,7 +213,7 @@ class TpPartBaseModel:
 
     def _check_mem_size(self):
         self.max_total_token_num = self.mem_manager.size
-        assert self.max_seq_length <= self.max_total_token_num
+        assert self.max_seq_length <= self.max_total_token_num, f"max_seq_length={self.max_seq_length} > max_total_token_num={self.max_total_token_num}"
         return
 
     def _init_req_manager(self):
@@ -262,15 +262,9 @@ class TpPartBaseModel:
             self.graph = None
         else:
             if self.device == "npu":
-                # TODO: bad accuracy of aclgraph now
-                logger.warning("Graph of Ascend is not ready!")
-                self.graph = None
-
-                return
-
                 from lightllm.common.basemodel.acl_graph import AclGraph
 
-                self.graph = AclGraph(self.graph_max_batch_size, self.graph_max_batch_size)
+                self.graph = AclGraph(self.graph_max_batch_size, self.graph_max_len_in_batch)
             else:
                 self.graph =  CudaGraph(self.graph_max_batch_size, self.graph_max_len_in_batch)
         if self.graph is not None:
