@@ -1,4 +1,5 @@
 from .mem_manager import MemoryManager, ReadOnlyStaticsMemoryManager
+from .npu_mem_manager import NPUMemoryManager
 from .calibration_fp8kv_mem_manager import CalibrationFP8KVMemoryManager
 from .export_calibration_mem_manager import ExportCalibrationMemoryManager
 from .ppl_int8kv_mem_manager import PPLINT8KVMemoryManager
@@ -7,6 +8,7 @@ from .deepseek2_mem_manager import Deepseek2MemoryManager
 
 __all__ = [
     "MemoryManager",
+    "NPUMemoryManager",
     "ReadOnlyStaticsMemoryManager",
     "CalibrationFP8KVMemoryManager",
     "ExportCalibrationMemoryManager",

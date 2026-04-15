@@ -4,6 +4,7 @@ import numpy as np
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
 from lightllm.common.basemodel.infer_struct import InferStateInfo
 from lightllm.models.qwen2_vl.triton_kernel.get_mrope_position_ids import get_mrope_position_triton
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.envs_utils import get_env_start_args
 
 
@@ -63,11 +64,15 @@ class Qwen2VLInferStateInfo(LlamaInferStateInfo):
         # 没有任何图片
         if image_start_num == 0:
             return self.position_ids.unsqueeze(0).expand(3, -1).contiguous()
-        b_image_start_idx = torch.tensor(b_image_start_idx, device="cpu").cuda(non_blocking=True)
-        b_image_thwd = torch.tensor(b_image_thwd, device="cpu").cuda(non_blocking=True)  # image_num x 4
-        b_image_nums = torch.tensor(b_image_nums, device="cpu").cuda(non_blocking=True)
-        b_image_start_num = torch.tensor(b_image_start_num, device="cpu").cuda(non_blocking=True)
-        b_image_len = torch.tensor(b_image_len, device="cpu").cuda(non_blocking=True)
+        if is_npu():
+            device = "npu"
+        else:
+            device = "cuda"
+        b_image_start_idx = torch.tensor(b_image_start_idx, device="cpu").to(device, non_blocking=True)
+        b_image_thwd = torch.tensor(b_image_thwd, device="cpu").to(device, non_blocking=True)  # image_num x 4
+        b_image_nums = torch.tensor(b_image_nums, device="cpu").to(device, non_blocking=True)
+        b_image_start_num = torch.tensor(b_image_start_num, device="cpu").to(device, non_blocking=True)
+        b_image_len = torch.tensor(b_image_len, device="cpu").to(device, non_blocking=True)
         position_ids = self.position_ids.unsqueeze(0).expand(3, -1).contiguous()
         get_mrope_position_triton(
             b_image_start_idx=b_image_start_idx,

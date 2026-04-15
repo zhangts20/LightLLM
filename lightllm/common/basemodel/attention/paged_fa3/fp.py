@@ -135,7 +135,6 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
     page_table: torch.Tensor = None
     b_att_seq_len: torch.Tensor = None
     decode_max_q_seq_len: int = None
-    atten_mask: torch.Tensor = None
 
     def init_state(self):
         args_mtp_step = get_env_start_args().mtp_step
@@ -174,8 +173,6 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 dtype=torch.int32,
                 device=self.infer_state.input_ids.device,
             )
-        if self.atten_mask is None:
-            self.atten_mask = torch.triu(torch.ones([2048, 2048]), diagonal=1).to(dtype=torch.int8, device=self.infer_state.input_ids.device)
 
         if args_mtp_step > 0:
             page_table_copy(
@@ -214,8 +211,8 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             N_Q = q.shape[-2]
             N_KV, HEAD_DIM = k.shape[-2:]
 
-            key = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM).contiguous()
-            value = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM).contiguous()
+            k = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
+            v = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
 
             output = torch.empty_like(q)
             softmax_lse = torch.empty(1, dtype=torch.float16, device=q.device)
@@ -225,8 +222,8 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 torch.npu.graph_task_group_begin(stream)
                 torch_npu.npu_fused_infer_attention_score.out(
                     query=q,
-                    key=key,
-                    value=value,
+                    key=k,
+                    value=v,
                     input_layout="TND",
                     scale=sm_scale,
                     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
@@ -244,13 +241,13 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 add_attn_params(
                     batch_size=self.infer_state.batch_size,
                     handle=handle,
-                    attn_params=(q, key, value, sm_scale, N_Q, N_KV, self.page_table, self.backend.page_size, output, softmax_lse)
+                    attn_params=(q, k, v, sm_scale, N_Q, N_KV, self.page_table, self.backend.page_size, output, softmax_lse)
                 )
             else:
                 torch_npu.npu_fused_infer_attention_score.out(
                     query=q,
-                    key=key,
-                    value=value,
+                    key=k,
+                    value=v,
                     input_layout="TND",
                     scale=sm_scale,
                     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
@@ -294,13 +291,13 @@ def update_attn_params(
     stream = torch.npu.current_stream()
 
     for handle, attn_param in zip(attn_params.handles[batch_size], attn_params.attn_params[batch_size]):
-        (q, key, value, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse) = attn_param
+        (q, k, v, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse) = attn_param
         with torch.npu.stream(stream):
             torch.npu.graph_task_update_begin(stream, handle)
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
-                key,
-                value,
+                k,
+                v,
                 input_layout="TND",
                 scale=sm_scale,
                 actual_seq_lengths=actual_seq_lengths,
