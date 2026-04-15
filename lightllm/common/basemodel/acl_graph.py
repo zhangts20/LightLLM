@@ -306,6 +306,7 @@ class AclGraph:
         )
 
 
+# Adapted from: https://github.com/vllm-project/vllm-ascend/blob/v0.11.0/vllm_ascend/compilation/acl_graph.py
 @dataclass
 class AclGraphParams:
     handles: dict[int, list[Any]] = field(default_factory=dict)
@@ -318,9 +319,8 @@ ATTN_PARAMS: AclGraphParams = None
 def init_attn_params(batch_sizes: list[int]):
     global ATTN_PARAMS
     ATTN_PARAMS = AclGraphParams(
-        handles={bs: []
-                 for bs in batch_sizes}, attn_params={bs: []
-                                                      for bs in batch_sizes}
+        handles={bs: [] for bs in batch_sizes},
+        attn_params={bs: [] for bs in batch_sizes},
     )
 
 

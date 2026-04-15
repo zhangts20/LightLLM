@@ -95,18 +95,18 @@ def npu_embedding(
     vob_end_id: int,
     out=None,
 ):
-    input_mask = (input_ids < vob_start_id) | (input_ids >= vob_end_id)
-    tmp_input_ids = input_ids - vob_start_id
-    tmp_input_ids = tmp_input_ids.masked_fill(input_mask, 0)
+    token_ids = input_ids - vob_start_id
 
-    emb = torch.nn.functional.embedding(tmp_input_ids, wte_weight, padding_idx=0)
+    mask = (token_ids < 0) | (token_ids >= vob_end_id - vob_start_id)
+    token_ids = token_ids.masked_fill(mask, 0)
+
+    emb = torch.nn.functional.embedding(token_ids, wte_weight)
+    res = emb.masked_fill_(mask.unsqueeze(-1), 0)
+
     if out is not None:
-        out.copy_(emb)
-        out.masked_fill_(input_mask.unsqueeze(-1), 0)
+        out.copy_(res)
         return out
-
-    emb.masked_fill_(input_mask.unsqueeze(-1), 0)
-    return emb
+    return res
 
 
 if __name__ == "__main__":

@@ -40,9 +40,15 @@ class BaseAttBackend:
     def _find_layer_index(
         self, k: torch.Tensor, v: torch.Tensor, att_state: Union["BasePrefillAttState", "BaseDecodeAttState"]
     ) -> int:
-        kv_buffer = att_state.infer_state.mem_manager.kv_buffer
-        layer_count = len(kv_buffer)
-        find_dict = {kv_buffer[i].data_ptr(): i for i in range(layer_count)}
+        mm = att_state.infer_state.mem_manager
+        if hasattr(mm, "k_buffer") and hasattr(mm, "v_buffer"):
+            layer_count = mm.k_buffer.shape[0]
+            find_dict = {mm.k_buffer[i].data_ptr(): i for i in range(layer_count)}
+            find_dict.update({mm.v_buffer[i].data_ptr(): i for i in range(layer_count)})
+        else:
+            kv_buffer = mm.kv_buffer
+            layer_count = len(kv_buffer)
+            find_dict = {kv_buffer[i].data_ptr(): i for i in range(layer_count)}
         key = min(k.data_ptr(), v.data_ptr())
         assert key in find_dict
         return find_dict[key]
