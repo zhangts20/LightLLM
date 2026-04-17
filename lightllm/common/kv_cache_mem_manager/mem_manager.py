@@ -8,7 +8,7 @@ from lightllm.common.kv_trans_kernel.kv_trans_v2 import kv_trans_for_dp
 from lightllm.server.pd_io_struct import KVMoveTask
 from lightllm.utils.log_utils import init_logger
 from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
-from lightllm.utils.profile_max_tokens import get_available_gpu_memory, get_total_gpu_memory
+from lightllm.utils.profile_max_tokens import get_available_gpu_memory, get_available_npu_memory, get_total_gpu_memory, get_total_npu_memory
 from lightllm.common.kv_trans_kernel.kv_trans import kv_trans
 from lightllm.utils.dist_utils import get_current_rank_in_node, get_node_world_size
 from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args, get_page_size
@@ -95,12 +95,17 @@ class MemoryManager:
             return
 
         world_size = dist.get_world_size()
-        total_memory = get_total_gpu_memory()
-        available_memory = get_available_gpu_memory(world_size) - total_memory * (1 - mem_fraction)
+        if is_npu():
+            total_memory = get_total_npu_memory()
+            available_memory = get_available_npu_memory(world_size) - total_memory * (1 - mem_fraction)
+        else:
+            total_memory = get_total_gpu_memory()
+            available_memory = get_available_gpu_memory(world_size) - total_memory * (1 - mem_fraction)
         cell_size = self.get_cell_size()
         self.size = int(available_memory * 1024 ** 3 / cell_size)
         if world_size > 1:
-            tensor = torch.tensor(self.size, dtype=torch.int64, device=f"cuda:{get_current_device_id()}")
+            device = f"npu:{get_current_device_id()}" if is_npu() else f"cuda:{get_current_device_id()}"
+            tensor = torch.tensor(self.size, dtype=torch.int64, device=device)
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
             self.size = tensor.item()
         logger.info(
@@ -117,6 +122,7 @@ class MemoryManager:
         # 成员变量中，其与 req_manager 中的HOLD_REQUEST_ID具有类似的作用和意义。
         page_size = get_page_size()
         alloc_size = ((size // page_size) + 1) * page_size if page_size > 1 else size + 1
+        logger.info(f"Total page blocks allocated: {alloc_size // page_size} for page_size: {page_size}")
         self.kv_buffer = torch.empty((layer_num, alloc_size, 2 * head_num, head_dim), dtype=dtype, device=self.device)
 
     def alloc_kv_move_buffer(self, max_req_total_len):

@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
 from typing import Dict, Optional
 from .base_weight import BaseWeightTpl
 from .platform_op import PlatformAwareOp
@@ -155,7 +156,7 @@ class LMHeadWeight(EmbeddingWeight):
         return out
 
     def _ascend_forward(self, input, out = None, alloc_func=torch.empty) -> torch.Tensor:
-        return self._cuda_forward(input=input, out=out, alloc_func=alloc_func)
+        return F.linear(self.weight, input.t())
 
     def __call__(self, input: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty) -> torch.Tensor:
         return self._forward(input=input, out=out, alloc_func=alloc_func)

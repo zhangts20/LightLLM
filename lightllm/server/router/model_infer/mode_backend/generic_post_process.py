@@ -66,8 +66,17 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
             sampling_params_manager=sampling_params_manager,
         )
     logits.div_(b_temperatures.view((-1, 1)))
-    probs = torch.softmax(logits, dim=-1)
+    if get_env_start_args().sampling_backend == "ascend":
+        import torch_npu
 
+        filtered_logits = torch_npu.npu_top_k_top_p(logits, b_top_ps, b_top_ks)
+        probs = torch.softmax(filtered_logits, dim=-1)
+        sampled_index = torch.multinomial(probs, num_samples=1, replacement=True)
+        next_token_ids = sampled_index.view(-1).to(torch.int64)
+        next_token_logprobs = torch.log(torch.gather(probs, dim=1, index=sampled_index).squeeze(-1))
+
+        return next_token_ids, next_token_logprobs
+    probs = torch.softmax(logits, dim=-1)
     if is_all_greedy:
         batch_next_token_ids = torch.argmax(logits, -1)
         batch_next_token_probs = torch.gather(probs, dim=1, index=batch_next_token_ids.view(-1, 1))

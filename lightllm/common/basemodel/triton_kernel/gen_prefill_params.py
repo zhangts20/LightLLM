@@ -116,33 +116,30 @@ def npu_gen_prefill_params(
     device = b_ready_cache_len.device
     dtype = torch.int32
 
+    # qkv length
     b_q_seq_len = b_seq_len - b_ready_cache_len
     b_kv_seq_len = b_seq_len
 
+    # batch cumsum q length
     b1_cu_q_seq_len = torch.empty(
         (b_q_seq_len.shape[0] + 1,), dtype=dtype, device=device
     )
     b1_cu_q_seq_len[0] = 0
     b1_cu_q_seq_len[1:] = torch.cumsum(b_q_seq_len.to(dtype), dim=0)
 
+    # batch cumsum kv length
     b1_cu_kv_seq_len = torch.empty(
         (b_kv_seq_len.shape[0] + 1,), dtype=dtype, device=device
     )
     b1_cu_kv_seq_len[0] = 0
     b1_cu_kv_seq_len[1:] = torch.cumsum(b_kv_seq_len.to(dtype), dim=0)
 
-    total_q = int(b_q_seq_len.sum().item())
-    assert total_q == input_token_num, "input_token_num is incorrect"
-
-    global_idx = torch.arange(total_q, device=device, dtype=dtype)
-
+    # get position ids
+    global_idx = torch.arange(input_token_num, device=device, dtype=dtype)
     cu_q = b1_cu_q_seq_len[1:]
     batch_id = torch.searchsorted(cu_q, global_idx, right=True)
-
     batch_start = b1_cu_q_seq_len[:-1]
-
     local_offset = global_idx - batch_start[batch_id]
-
     position_ids = b_ready_cache_len[batch_id].to(dtype) + local_offset
 
     return (

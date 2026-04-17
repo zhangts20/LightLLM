@@ -1,5 +1,6 @@
 import torch
 import triton
+import torch.nn.functional as F
 import torch.distributed as dist
 from functools import partial
 from lightllm.models.llama.layer_weights.transformer_layer_weight import LlamaTransformerLayerWeight
@@ -12,6 +13,11 @@ from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+if is_npu():
+    import torch_npu
+    from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import npu_silu_and_mul_fwd
 
 
 class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
@@ -153,17 +159,47 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
 
         return o_tensor
 
+    @torch.no_grad()
+    def _npu_ffn(self, input, layer_weight: LlamaTransformerLayerWeight) -> torch.Tensor:
+        input = input.view(-1, self.embed_dim_)
+        # up
+        gate_up_proj_bias = [layer_weight.gate_up_proj.bias] if layer_weight.gate_up_proj.bias is not None else None
+        weight = layer_weight.gate_up_proj.mm_param.weight
+        # up_gate_out = torch_npu.npu_grouped_matmul(
+        #     x=[input],
+        #     weight=[weight],
+        #     bias=gate_up_proj_bias,
+        #     split_item=0,
+        #     group_type=-1,
+        #     group_list=None,
+        # )[0]
+        up_gate_out = F.linear(input, weight, bias=gate_up_proj_bias)
+        
+        # activation
+        ffn1_out = npu_silu_and_mul_fwd(up_gate_out)
+
+        # down
+        down_proj_bias = [layer_weight.down_proj.bias] if layer_weight.down_proj.bias is not None else None
+        weight = layer_weight.down_proj.mm_param.weight
+        # ffn2_out = torch_npu.npu_grouped_matmul(
+        #     x=[ffn1_out],
+        #     weight=[weight],
+        #     bias=down_proj_bias,
+        #     split_item=0,
+        #     group_type=-1,
+        #     group_list=None,
+        # )[0]
+        ffn2_out = F.linear(ffn1_out, weight, bias=down_proj_bias)
+
+        return ffn2_out
+
     def _ffn(self, input, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeight) -> torch.Tensor:
+        if is_npu():
+            return self._npu_ffn(input, layer_weight)
         input = input.view(-1, self.embed_dim_)
         up_gate_out = layer_weight.gate_up_proj.mm(input)
         ffn1_out = self.alloc_tensor((input.size(0), up_gate_out.size(1) // 2), input.dtype, device=input.device)
-        if is_npu():
-            from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import npu_silu_and_mul_fwd
-
-            forward_call = npu_silu_and_mul_fwd
-        else:
-            forward_call = silu_and_mul_fwd
-        forward_call(up_gate_out, ffn1_out)
+        silu_and_mul_fwd(up_gate_out, ffn1_out)
         input = None
         up_gate_out = None
         ffn2_out = layer_weight.down_proj.mm(ffn1_out)

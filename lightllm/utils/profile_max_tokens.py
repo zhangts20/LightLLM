@@ -31,6 +31,21 @@ def get_total_gpu_memory():
     return total_memory / (1024 ** 3)  # Convert to GB
 
 
+def get_available_npu_memory(world_size):
+    torch.npu.empty_cache()
+    free_npu_memory, _ = torch.npu.mem_get_info(get_current_device_id())
+    if world_size > 1:
+        tensor = torch.tensor(free_npu_memory, dtype=torch.float32).to(f"npu:{get_current_device_id()}")
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
+        free_npu_memory = tensor.item()
+    return free_npu_memory / (1024 ** 3)
+
+
+def get_total_npu_memory():
+    total_memory = torch.npu.get_device_properties(0).total_memory
+    return total_memory / (1024 ** 3)  # Convert to GB
+
+
 def load_config(weight_dir_):
     """
     Load model configuration from the specified directory

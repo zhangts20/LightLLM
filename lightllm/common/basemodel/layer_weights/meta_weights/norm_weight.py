@@ -64,12 +64,11 @@ class RMSNormWeight(BaseWeightTpl, PlatformAwareOp):
     ) -> torch.Tensor:
         import torch_npu
 
-        if out is None:
-            out = alloc_func(input.shape, dtype=input.dtype, device=input.device)
         _out = torch_npu.npu_rms_norm(input, self.weight, epsilon=eps)[0]
-        out.copy_(_out)
+        if out is None:
+            return _out
 
-        return out
+        out.copy_(_out)
 
     def _musa_forward(
         self, input: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None, alloc_func=torch.empty

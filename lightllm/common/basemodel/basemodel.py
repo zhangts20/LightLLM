@@ -4,7 +4,6 @@ import os
 import gc
 import copy
 import json
-from lightllm.utils.device_utils import is_npu
 import torch
 import torch.nn.functional as F
 from typing import final, List
@@ -26,7 +25,7 @@ from lightllm.common.basemodel.triton_kernel.gather_token_id import gather_token
 from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_dp_world_size
-from lightllm.utils.envs_utils import get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num
+from lightllm.utils.envs_utils import enable_npu_profiler, get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num, npu_profiler_save_dir
 from lightllm.distributed.communication_op import dist_group_manager
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
 from lightllm.common.triton_utils.autotuner import AutotuneLevel
@@ -538,12 +537,45 @@ class TpPartBaseModel:
             infer_state.init_some_extra_state(self)
             infer_state.init_att_state()
 
-            if self.graph.need_capture(find_graph_batch_size):
-                infer_state.is_cuda_graph = True
-                model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
-            else:
-                model_output: ModelOutput = self.graph.replay(infer_state)
+            if enable_npu_profiler():
+                import torch_npu
 
+                save_dir = npu_profiler_save_dir()
+                experimental_config = torch_npu.profiler._ExperimentalConfig(
+                    export_type=[torch_npu.profiler.ExportType.Text],
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                    msprof_tx=False,
+                    aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                    l2_cache=False,
+                    op_attr=False,
+                    data_simplification=False,
+                    record_op_args=False,
+                    gc_detect_threshold=None
+                )
+                schedule = torch_npu.profiler.schedule(wait=0, warmup=5, active=5, repeat=1, skip_first=1)
+                steps = 11
+                with torch_npu.profiler.profile(experimental_config=experimental_config,
+                    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(save_dir),
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                    with_modules=False,
+                    with_flops=False,
+                    schedule=schedule,
+                ) as prof:
+                    for _ in range(steps):
+                        if self.graph.need_capture(find_graph_batch_size):
+                            infer_state.is_cuda_graph = True
+                            model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
+                        else:
+                            model_output: ModelOutput = self.graph.replay(infer_state)
+                        prof.step()
+            else:
+                if self.graph.need_capture(find_graph_batch_size):
+                    infer_state.is_cuda_graph = True
+                    model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
+                else:
+                    model_output: ModelOutput = self.graph.replay(infer_state)
             model_output = self._create_unpad_decode_model_output(
                 model_output, origin_batch_size=model_input.batch_size
             )

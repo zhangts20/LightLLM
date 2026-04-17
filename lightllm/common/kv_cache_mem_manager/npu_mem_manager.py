@@ -4,17 +4,24 @@ from typing import Any, List, Tuple
 
 from lightllm.server.pd_io_struct import KVMoveTask
 from lightllm.utils.envs_utils import get_page_size
+from lightllm.utils.log_utils import init_logger
 
 from .mem_manager import MemoryManager
+
+
+logger = init_logger(__name__)
 
 
 class NPUMemoryManager(MemoryManager):
 
     def copy_kv_to_mem_manager(self, layer_index: int, mem_index: torch.Tensor, kv: torch.Tensor):
-        from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_copy_kv
-
-        destindex_copy_kv(kv[:, : self.head_num, :], mem_index, self.k_buffer[layer_index])
-        destindex_copy_kv(kv[:, self.head_num :, :], mem_index, self.v_buffer[layer_index])
+        kb, vb = self.k_buffer[layer_index], self.v_buffer[layer_index]
+        k_src, v_src = kv[:, : self.head_num, :], kv[:, self.head_num :, :]
+        assert kv.shape[0] == mem_index.shape[0], (kv.shape, mem_index.shape)
+        assert k_src.shape[1] == kb.shape[1] and k_src.shape[2] == kb.shape[2], (k_src.shape, kb.shape)
+        assert v_src.shape[1] == vb.shape[1] and v_src.shape[2] == vb.shape[2], (v_src.shape, vb.shape)
+        self.k_buffer[layer_index].index_copy_(0, mem_index, k_src)
+        self.v_buffer[layer_index].index_copy_(0, mem_index, v_src)
 
     def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:
         return self.k_buffer[layer_index], self.v_buffer[layer_index]
@@ -22,6 +29,7 @@ class NPUMemoryManager(MemoryManager):
     def _init_buffers(self, size, dtype, head_num, head_dim, layer_num):
         page_size = get_page_size()
         alloc_size = ((size // page_size) + 1) * page_size if page_size > 1 else size + 1
+        logger.info(f"Total page blocks allocated: {alloc_size // page_size} for page_size: {page_size}")
         self.k_buffer = torch.empty((layer_num, alloc_size, head_num, head_dim), dtype=dtype, device=self.device)
         self.v_buffer = torch.empty((layer_num, alloc_size, head_num, head_dim), dtype=dtype, device=self.device)
         self.kv_buffer = self.k_buffer

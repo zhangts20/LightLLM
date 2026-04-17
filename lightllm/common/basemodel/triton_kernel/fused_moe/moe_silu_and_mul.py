@@ -161,20 +161,14 @@ def silu_and_mul_fwd(
 
 def npu_silu_and_mul_fwd(
     input: torch.Tensor,
-    output: torch.Tensor,
     layout="blocked",
     limit=None,
     alpha=None,
-) -> None:
+) -> torch.Tensor:
     assert input.is_contiguous()
-    assert output.is_contiguous()
     assert input.dim() == 2
-    assert output.dim() == 2
     assert (limit is None and alpha is None) or (limit is not None and alpha is not None)
-
-    M = input.shape[0]
     N = input.shape[1] // 2
-    assert output.shape == (M, N)
 
     if layout == "blocked":
         gate = input[:, :N]
@@ -201,4 +195,4 @@ def npu_silu_and_mul_fwd(
 
         out = torch_npu.npu_swiglu(input, dim=-1)
 
-    output.copy_(out)
+    return out 

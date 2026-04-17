@@ -241,3 +241,11 @@ def get_added_mtp_kv_layer_num() -> int:
         added_mtp_layer_num += get_env_start_args().mtp_step
 
     return added_mtp_layer_num
+
+
+def enable_npu_profiler() -> bool:
+    return enable_env_vars("LIGHTLLM_ENABLE_NPU_PROFILER")
+
+
+def npu_profiler_save_dir() -> str:
+    return os.getenv("LIGHTLLM_NPU_PROFILER_SAVE_DIR", "./result")

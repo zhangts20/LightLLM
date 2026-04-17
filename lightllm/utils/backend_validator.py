@@ -20,8 +20,11 @@ def _compute_ground_truth(q, k, v, is_causal=True):
 
 def _validate_fa3():
     """Validate FA3 with ground truth."""
-    from lightllm.utils.device_utils import is_hopper
+    from lightllm.utils.device_utils import is_hopper, is_npu
     from lightllm.utils.sgl_utils import flash_attn_varlen_func
+
+    if is_npu():
+        return True, None
 
     if not is_hopper():
         return False, "Not a Hopper GPU"
