@@ -1,15 +1,27 @@
 import torch
 from typing import List
 from lightllm.common.basemodel.triton_kernel.apply_penalty import apply_penalty
-from lightllm.common.basemodel.triton_kernel.apply_penalty_gpu_cache import apply_penalty_gpu_cache
+from lightllm.common.basemodel.triton_kernel.apply_penalty_gpu_cache import apply_penalty_gpu_cache 
 from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
 from lightllm.utils.device_utils import is_npu
 from lightllm.utils.envs_utils import get_env_start_args
 
 if is_npu():
     device = "npu"
+
+    import torch_npu
+    from lightllm.common.basemodel.triton_kernel.apply_penalty_gpu_cache import apply_penalty_npu_cache
 else:
     device = "cuda"
+
+
+def _categorical_sample_one_gumbel_from_log_p(log_p: torch.Tensor) -> torch.Tensor:
+    eps = 1e-12
+    u = torch.rand_like(log_p)
+    u.clamp_(eps, 1.0 - eps)
+    gumbel = -torch.log(-torch.log(u))
+    torch.add(log_p, gumbel, out=gumbel)
+    return gumbel.argmax(dim=-1, keepdim=True)
 
 
 def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
@@ -38,6 +50,7 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
     # 使用int32类型进行计数大概需要600M的空间，这也不是一笔不菲的开销。
     # 所以需要根据具体的显卡，使用场景，来判断使用那种方式，默认情况下 为gpu模式，可以调整args.penalty_counter_mode
     # 参数来控制使用方式。
+    sampling_backend = get_env_start_args().sampling_backend
     if sampling_params_manager.penalty_counter_mode == "cpu_counter":
         (
             p_token_ids,
@@ -57,39 +70,51 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
             sampling_params_manager=sampling_params_manager,
         )
     else:
-        apply_penalty_gpu_cache(
-            Logits=logits,
-            b_req_idx=b_req_idx,
-            b_length_penalty_param=b_length_penalty_param,
-            b_mask_eos_reqs=b_mask_eos_reqs,
-            eos_ids=eos_ids,
-            sampling_params_manager=sampling_params_manager,
-        )
+        if sampling_backend == "ascend":
+            apply_penalty_npu_cache(
+                Logits=logits,
+                b_req_idx=b_req_idx,
+                b_length_penalty_param=b_length_penalty_param,
+                b_mask_eos_reqs=b_mask_eos_reqs,
+                eos_ids=eos_ids,
+                sampling_params_manager=sampling_params_manager,
+            )
+        else:
+            apply_penalty_gpu_cache(
+                Logits=logits,
+                b_req_idx=b_req_idx,
+                b_length_penalty_param=b_length_penalty_param,
+                b_mask_eos_reqs=b_mask_eos_reqs,
+                eos_ids=eos_ids,
+                sampling_params_manager=sampling_params_manager,
+            )
     logits.div_(b_temperatures.view((-1, 1)))
-    if get_env_start_args().sampling_backend == "ascend":
-        import torch_npu
+    if is_all_greedy:
+        batch_next_token_ids = torch.argmax(logits, dim=-1)
+        logsumexp = torch.logsumexp(logits, dim=-1)
+        selected_logits = torch.gather(logits, 1, batch_next_token_ids.view(-1, 1)).squeeze(-1)
+        next_token_logprobs = selected_logits - logsumexp
 
+        return batch_next_token_ids.view(-1), next_token_logprobs.view(-1)
+
+    if sampling_backend == "ascend":
         filtered_logits = torch_npu.npu_top_k_top_p(logits, b_top_ps, b_top_ks)
-        probs = torch.softmax(filtered_logits, dim=-1)
-        sampled_index = torch.multinomial(probs, num_samples=1, replacement=True)
-        next_token_ids = sampled_index.view(-1).to(torch.int64)
-        next_token_logprobs = torch.log(torch.gather(probs, dim=1, index=sampled_index).squeeze(-1))
+        log_p = torch.log_softmax(filtered_logits, dim=-1, dtype=torch.float32)
+        sampled_index = _categorical_sample_one_gumbel_from_log_p(log_p)
+        next_token_ids = sampled_index.view(-1)
+        next_token_logprobs = log_p.gather(dim=1, index=sampled_index).squeeze(-1)
 
         return next_token_ids, next_token_logprobs
-    probs = torch.softmax(logits, dim=-1)
-    if is_all_greedy:
-        batch_next_token_ids = torch.argmax(logits, -1)
-        batch_next_token_probs = torch.gather(probs, dim=1, index=batch_next_token_ids.view(-1, 1))
-        return batch_next_token_ids.view(-1), torch.log(batch_next_token_probs).view(-1)
 
-    elif get_env_start_args().sampling_backend == "triton":
+    probs = torch.softmax(logits, dim=-1)
+    if sampling_backend == "triton":
         probs_sort, probs_idx = _top_p_top_k(probs, b_top_ps, b_top_ks)
         sampled_index = torch.multinomial(probs_sort, num_samples=1, replacement=True)
         next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
         next_token_logprobs = torch.log(torch.gather(probs_sort, dim=1, index=sampled_index))
         return next_token_ids.view(-1), next_token_logprobs.view(-1)
 
-    elif get_env_start_args().sampling_backend == "sglang_kernel":
+    elif sampling_backend == "sglang_kernel":
         from sgl_kernel import top_k_top_p_sampling_from_probs
 
         batch_next_token_ids = top_k_top_p_sampling_from_probs(
