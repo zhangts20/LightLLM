@@ -7,7 +7,14 @@ dist
 .vscode
 tmp/
 requirements-musa.txt
-# npu
+
+# npu generated files
 kernel_meta
 profile*.json
 run_*.sh
+extra-info
+scripts
+fusion_result.json
+
+# vscode extensions
+.history

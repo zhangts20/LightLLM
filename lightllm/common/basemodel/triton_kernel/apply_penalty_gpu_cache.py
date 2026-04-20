@@ -128,3 +128,50 @@ def apply_penalty_gpu_cache(
         num_warps=1,
     )
     return
+
+
+
+@torch.no_grad()
+def apply_penalty_npu_cache(
+    Logits: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_length_penalty_param: torch.Tensor,
+    b_mask_eos_reqs: torch.Tensor,
+    eos_ids: torch.Tensor,
+    sampling_params_manager: ReqSamplingParamsManager,
+):
+    assert Logits.is_contiguous()
+    # smaller block size for npu and remove num_warps
+    BLOCK_P = 256
+    vocab_size = sampling_params_manager.vocab_size
+    req_to_out_token_id_counter = sampling_params_manager.req_to_out_token_id_counter
+    _fwd_kernel_apply_penalty_cache[(Logits.shape[0], triton.cdiv(vocab_size, BLOCK_P))](
+        Logits=Logits,
+        stride_logit_b=Logits.stride(0),
+        stride_logit_s=Logits.stride(1),
+        b_req_idx=b_req_idx,
+        req_to_presence_penalty=sampling_params_manager.req_to_presence_penalty,
+        req_to_frequency_penalty=sampling_params_manager.req_to_frequency_penalty,
+        req_to_repetition_penalty=sampling_params_manager.req_to_repetition_penalty,
+        req_to_out_token_id_counter=req_to_out_token_id_counter,
+        stride_counter_r=req_to_out_token_id_counter.stride(0),
+        stride_counter_s=req_to_out_token_id_counter.stride(1),
+        vocab_size=vocab_size,
+        BLOCK_P=BLOCK_P,
+    )
+
+    BLOCK = 128
+    grid = (triton.cdiv(Logits.shape[0], BLOCK),)
+    _eos_penalty[grid](
+        Logits=Logits,
+        stride_logit_b=Logits.stride(0),
+        stride_logit_s=Logits.stride(1),
+        b_req_idx=b_req_idx,
+        req_to_exponential_decay_length_penalty=sampling_params_manager.req_to_exponential_decay_length_penalty,
+        b_length_penalty_param=b_length_penalty_param,
+        eos_ids=eos_ids,
+        b_mask_eos_reqs=b_mask_eos_reqs,
+        batch_size=Logits.shape[0],
+        BLOCK=BLOCK,
+        EOS_ID_NUM=eos_ids.shape[0],
+    )

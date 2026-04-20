@@ -24,7 +24,13 @@ from lightllm.common.basemodel.triton_kernel.mtp_utils import (
 from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_current_device_id
-from lightllm.utils.envs_utils import get_env_start_args
+from lightllm.utils.envs_utils import (
+    get_env_start_args,
+    enable_npu_profiler,
+    npu_profiler_min_batch_threshold,
+    npu_profiler_save_dir,
+    profile_all_or_decode,
+)
 from .control_state import ControlState
 
 logger = init_logger(__name__)
@@ -169,21 +175,59 @@ class ChunkedPrefillBackend(ModeBackend):
             stream_call = torch.npu.stream
         else:
             stream_call = torch.cuda.stream
-        with stream_call(g_infer_context.get_overlap_stream()):
-            model_output = self.model.forward(model_input)
-            _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
-                logits=model_output.logits,
-                b_req_idx=model_input.b_req_idx,
-                b_mtp_index=model_input.b_mtp_index,
-                run_reqs=run_reqs,
-                is_prefill=False,
-                mask_func=self.decode_mask_func,
+
+        def _forward_sample_and_record_event():
+            with stream_call(g_infer_context.get_overlap_stream()):
+                model_output = self.model.forward(model_input)
+                _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
+                    logits=model_output.logits,
+                    b_req_idx=model_input.b_req_idx,
+                    b_mtp_index=model_input.b_mtp_index,
+                    run_reqs=run_reqs,
+                    is_prefill=False,
+                    mask_func=self.decode_mask_func,
+                )
+                if is_npu():
+                    sync_event = torch.npu.Event()
+                else:
+                    sync_event = torch.cuda.Event()
+                sync_event.record()
+            return next_token_ids_cpu, next_token_logprobs_cpu, sync_event
+
+        if enable_npu_profiler() and profile_all_or_decode() == "all" and model_input.batch_size > npu_profiler_min_batch_threshold():
+            import torch_npu
+
+            save_dir = npu_profiler_save_dir()
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                export_type=[torch_npu.profiler.ExportType.Text],
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                msprof_tx=False,
+                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                l2_cache=False,
+                op_attr=False,
+                data_simplification=False,
+                record_op_args=False,
+                gc_detect_threshold=None,
             )
-            if is_npu():
-                sync_event = torch.npu.Event()
-            else:
-                sync_event = torch.cuda.Event()
-            sync_event.record()
+            schedule = torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0)
+            with torch_npu.profiler.profile(
+                experimental_config=experimental_config,
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(save_dir),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                with_modules=False,
+                with_flops=False,
+                schedule=schedule,
+            ) as prof:
+                next_token_ids_cpu, next_token_logprobs_cpu, sync_event = (
+                    _forward_sample_and_record_event()
+                )
+                prof.step()
+        else:
+            next_token_ids_cpu, next_token_logprobs_cpu, sync_event = (
+                _forward_sample_and_record_event()
+            )
 
         # 第二阶段
         event_pack.notify_post_handle_and_wait_pre_post_handle()

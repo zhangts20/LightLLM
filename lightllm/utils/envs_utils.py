@@ -243,9 +243,21 @@ def get_added_mtp_kv_layer_num() -> int:
     return added_mtp_layer_num
 
 
+@lru_cache(maxsize=None)
 def enable_npu_profiler() -> bool:
     return enable_env_vars("LIGHTLLM_ENABLE_NPU_PROFILER")
 
 
+@lru_cache(maxsize=None)
 def npu_profiler_save_dir() -> str:
     return os.getenv("LIGHTLLM_NPU_PROFILER_SAVE_DIR", "./result")
+
+
+@lru_cache(maxsize=None)
+def npu_profiler_min_batch_threshold() -> int:
+    return int(os.getenv("LIGHTLLM_NPU_PROFILER_MIN_BATCH_THRESHOLD", 0))
+
+
+@lru_cache(maxsize=None)
+def profile_all_or_decode() -> str:
+    return os.getenv("LIGHTLLM_PROFILE_ALL_OR_DECODE", "decode")

@@ -25,7 +25,15 @@ from lightllm.common.basemodel.triton_kernel.gather_token_id import gather_token
 from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_dp_world_size
-from lightllm.utils.envs_utils import enable_npu_profiler, get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num, npu_profiler_save_dir
+from lightllm.utils.envs_utils import (
+    enable_npu_profiler,
+    get_env_start_args,
+    get_llm_data_type,
+    get_added_mtp_kv_layer_num,
+    npu_profiler_min_batch_threshold,
+    npu_profiler_save_dir,
+    profile_all_or_decode,
+)
 from lightllm.distributed.communication_op import dist_group_manager
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
 from lightllm.common.triton_utils.autotuner import AutotuneLevel
@@ -537,7 +545,7 @@ class TpPartBaseModel:
             infer_state.init_some_extra_state(self)
             infer_state.init_att_state()
 
-            if enable_npu_profiler():
+            if enable_npu_profiler() and profile_all_or_decode() == "decode" and infer_state.batch_size > npu_profiler_min_batch_threshold():
                 import torch_npu
 
                 save_dir = npu_profiler_save_dir()
