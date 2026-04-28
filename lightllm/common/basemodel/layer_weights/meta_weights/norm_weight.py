@@ -241,7 +241,12 @@ class QKRMSNORMWeight(RMSNormWeight):
         return
 
     def _ascend_forward(self, input, eps) -> None:
-        self._native_forward(input=input, eps=eps) 
+        import torch_npu
+
+        head_dim = self.weight.shape[0]
+        flat = input.reshape(-1, head_dim)
+        _out = torch_npu.npu_rms_norm(flat, self.weight, epsilon=eps)[0]
+        input.copy_(_out.view(input.shape))
 
     def _musa_forward(self, input: torch.Tensor, eps: float) -> torch.Tensor:
         # musa implementation is supported by musa triton on musa platform

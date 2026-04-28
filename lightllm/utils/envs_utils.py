@@ -261,3 +261,13 @@ def npu_profiler_min_batch_threshold() -> int:
 @lru_cache(maxsize=None)
 def profile_all_or_decode() -> str:
     return os.getenv("LIGHTLLM_PROFILE_ALL_OR_DECODE", "decode")
+
+
+@lru_cache(maxsize=None)
+def get_npu_device_name() -> str:
+    return os.getenv("LIGHTLLM_NPU_DEVICE_NAME", "Ascend910B2C")
+
+
+@lru_cache(maxsize=None)
+def enable_backend_overlap() -> bool:
+    return enable_env_vars("LIGHTLLM_ENABLE_BACKEND_OVERLAP")

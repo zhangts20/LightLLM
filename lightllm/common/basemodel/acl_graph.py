@@ -56,7 +56,7 @@ class AclGraph:
         else:
             assert False, "dead code"
 
-    def find_closest_graph_batch_size(self, batch_size: int) -> int:
+    def find_closest_graph_batch_size(self, batch_size: int) -> Optional[int]:
         index = bisect.bisect_left(self.acl_graph_batch_sizes, batch_size)
         if index < len(self.acl_graph_batch_sizes):
             find_batch_size = self.acl_graph_batch_sizes[index]
@@ -186,7 +186,7 @@ class AclGraph:
         model: TpPartBaseModel = model
         device = model.device
         for batch_size in self.acl_graph_batch_sizes[::-1]:
-            seq_len = 2
+            seq_len = self.graph_max_len_in_batch
             total_token_num = batch_size * seq_len
             max_len_in_batch = self.graph_max_len_in_batch
             input_ids = torch.tensor([1 for _ in range(batch_size)],
@@ -247,7 +247,7 @@ class AclGraph:
         for batch_size in self.acl_graph_batch_sizes[::-1]:
             decode_batches = []
             for micro_batch_index in [0, 1]:
-                seq_len = 2
+                seq_len = self.graph_max_len_in_batch
                 total_token_num = batch_size * seq_len
                 max_len_in_batch = self.graph_max_len_in_batch
                 input_ids = torch.tensor([1 for _ in range(batch_size)],
@@ -310,16 +310,18 @@ class AclGraph:
 @dataclass
 class AclGraphParams:
     handles: dict[int, list[Any]] = field(default_factory=dict)
+    workspaces: dict[int, Any] = field(default_factory=dict)
     attn_params: dict[int, list[tuple]] = field(default_factory=dict)
 
 
-ATTN_PARAMS: AclGraphParams = None
+ATTN_PARAMS: Optional[AclGraphParams] = None
 
 
 def init_attn_params(batch_sizes: list[int]):
     global ATTN_PARAMS
     ATTN_PARAMS = AclGraphParams(
         handles={bs: [] for bs in batch_sizes},
+        workspaces={bs: None for bs in batch_sizes},
         attn_params={bs: [] for bs in batch_sizes},
     )
 

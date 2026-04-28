@@ -219,20 +219,27 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             if torch.npu.is_current_stream_capturing():
                 stream = torch.npu.current_stream()
 
-                # OOM, so we don't use it now
-                # workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                #     query=q,
-                #     key=k,
-                #     value=v,
-                #     input_layout="TND",
-                #     scale=sm_scale,
-                #     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
-                #     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
-                #     num_heads=N_Q,
-                #     num_key_value_heads=N_KV,
-                #     block_table=self.page_table,
-                #     block_size=self.backend.page_size,
-                # )
+                from lightllm.common.basemodel.acl_graph import get_attn_params
+
+                batch_size = self.infer_state.batch_size
+                attn_params = get_attn_params()
+
+                workspace = attn_params.workspaces.get(batch_size, None)
+                if workspace is None:
+                    workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                        query=q,
+                        key=k,
+                        value=v,
+                        input_layout="TND",
+                        scale=sm_scale,
+                        actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
+                        actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
+                        num_heads=N_Q,
+                        num_key_value_heads=N_KV,
+                        block_table=self.page_table,
+                        block_size=self.backend.page_size,
+                    )
+                    attn_params.workspaces[batch_size] = workspace
 
                 torch.npu.graph_task_group_begin(stream)
                 torch_npu.npu_fused_infer_attention_score.out(
@@ -247,6 +254,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     num_key_value_heads=N_KV,
                     block_table=self.page_table,
                     block_size=self.backend.page_size,
+                    workspace=workspace,
                     out=[output, softmax_lse],
                 )
                 handle = torch.npu.graph_task_group_end(stream)
@@ -295,6 +303,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 sinks=sink_weight,
             )
 
+
 def update_attn_params(
     batch_size: int,
     actual_seq_lengths: list[int],
@@ -303,14 +312,14 @@ def update_attn_params(
     from lightllm.common.basemodel.acl_graph import get_attn_params
 
     attn_params = get_attn_params()
-    stream = torch.npu.current_stream()
 
-    for handle, attn_param in zip(
-        attn_params.handles[batch_size],
-        attn_params.attn_params[batch_size],
-    ):
-        (q, k, v, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse) = attn_param
-        with torch.npu.stream(stream):
+    stream = torch.npu.current_stream()
+    handles = attn_params.handles[batch_size]
+    workspace = attn_params.workspaces[batch_size]
+    params_list = attn_params.attn_params[batch_size]
+    with torch.npu.stream(stream):
+        for handle, attn_param in zip(handles, params_list):
+            (q, k, v, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse) = attn_param
             torch.npu.graph_task_update_begin(stream, handle)
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
@@ -324,6 +333,7 @@ def update_attn_params(
                 num_key_value_heads=N_KV,
                 block_table=page_table,
                 block_size=block_size,
+                workspace=workspace,
                 out=[output, softmax_lse],
             )
             torch.npu.graph_task_update_end(stream)

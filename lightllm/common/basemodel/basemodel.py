@@ -265,6 +265,7 @@ class TpPartBaseModel:
         return
 
     def _init_cudagraph(self):
+        self.sampling_graph = None
         if self.disable_cudagraph:
             self.graph = None
         else:
@@ -279,6 +280,17 @@ class TpPartBaseModel:
                 self.graph.warmup_overlap(self)
             else:
                 self.graph.warmup(self)
+        if self.graph is not None and getattr(get_env_start_args(), "enable_sampling_acl_graph", False):
+            from lightllm.common.basemodel.sampling_acl_graph import SamplingAclGraph
+
+            self.sampling_graph = SamplingAclGraph(
+                self.graph.mempool,
+                self.graph.acl_graph_batch_sizes,
+                self.vocab_size,
+                get_llm_data_type(),
+                self.req_manager,
+            )
+            self.sampling_graph.warmup(self.device)
 
     def _init_prefill_cuda_graph(self):
         self.prefill_graph = (
@@ -297,8 +309,10 @@ class TpPartBaseModel:
 
     @torch.no_grad()
     def forward(self, model_input: ModelInput):
+        self.is_use_decode_graph = False
+        self.decode_graph_batch_size = None
+
         model_input.to_device(self.device)
-        assert model_input.mem_indexes.is_cuda
 
         if model_input.is_prefill:
             return self._prefill(model_input)
@@ -587,6 +601,8 @@ class TpPartBaseModel:
             model_output = self._create_unpad_decode_model_output(
                 model_output, origin_batch_size=model_input.batch_size
             )
+            self.is_use_decode_graph = True
+            self.decode_graph_batch_size = find_graph_batch_size
         else:
             infer_state = self._create_inferstate(model_input)
             copy_kv_index_to_req(
@@ -735,6 +751,8 @@ class TpPartBaseModel:
 
     @torch.no_grad()
     def microbatch_overlap_decode(self, model_input0: ModelInput, model_input1: ModelInput):
+        self.is_use_decode_graph = False
+        self.decode_graph_batch_size = None
         model_input0.to_cuda()
         model_input1.to_cuda()
 

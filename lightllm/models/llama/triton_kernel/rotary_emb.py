@@ -158,6 +158,37 @@ def rotary_emb_fwd(q, k, cos, sin, partial_rotary_factor=1.):
     return
 
 
+@torch.no_grad()
+def rotary_emb_fwd_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    partial_rotary_factor: float = 1.0,
+) -> None:
+    if partial_rotary_factor != 1.0:
+        rotary_emb_fwd(q, k, cos, sin, partial_rotary_factor)
+        return
+
+    import torch_npu
+
+    q = q.unsqueeze(0)
+    k = k.unsqueeze(0)
+    head_dim = q.shape[-1]
+    if cos.shape[-1] != head_dim:
+        assert cos.shape[-1] * 2 == head_dim, (cos.shape, q.shape)
+        assert sin.shape[-1] * 2 == head_dim, (sin.shape, q.shape)
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
+
+    cos = cos.unsqueeze(1).unsqueeze(0)
+    sin = sin.unsqueeze(1).unsqueeze(0)
+    q_embed = torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half")
+    k_embed = torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half")
+    q.copy_(q_embed)
+    k.copy_(k_embed)
+
+
 def torch_rotary_emb(x, cos, sin):
     seq_len, h, dim = x.shape
     dim = dim // 4

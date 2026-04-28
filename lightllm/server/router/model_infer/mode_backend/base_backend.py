@@ -19,7 +19,7 @@ from lightllm.common.basemodel.basemodel import TpPartBaseModel
 from lightllm.common.basemodel.batch_objs import ModelOutput, ModelInput
 from lightllm.common.basemodel.triton_kernel.mtp_utils import mtp_verify
 from lightllm.utils.dist_utils import init_distributed_env
-from lightllm.utils.envs_utils import get_unique_server_name
+from lightllm.utils.envs_utils import enable_backend_overlap, get_unique_server_name
 from lightllm.server.core.objs import ShmReqManager, StartArgs
 from lightllm.server.core.objs.io_objs import AbortedReqCmd, StopStrMatchedReqCmd
 from lightllm.server.router.model_infer.infer_batch import g_infer_context
@@ -53,7 +53,7 @@ class ModeBackend:
 
         self.overlap_event_manager = OverlapEventManager()
         # 标识是否支持 overlap 功能，很多子类模式如 xgrammar 和 outlines 当前不支持 overlap 高性能模式
-        self.support_overlap = True
+        self.support_overlap = enable_backend_overlap() 
 
         # prefill_mask_func 和 decode_mask_func 用于控制在采样输出前，通过对logics的调整，改变输出的选择空间，
         # 主要是为约束输出模式进行定制的操作
@@ -787,7 +787,14 @@ class ModeBackend:
             assert len(run_reqs) == logits.shape[0]
             mask_func(run_reqs, logits)
 
-        next_token_ids, next_token_logprobs = sample(logits, run_reqs, self.eos_id)
+        next_token_ids, next_token_logprobs = sample(
+            logits,
+            run_reqs,
+            self.eos_id,
+            model=self.model,
+            is_use_decode_graph=getattr(self.model, "is_use_decode_graph", False),
+            decode_graph_batch_size=getattr(self.model, "decode_graph_batch_size", None),
+        )
         b_has_out = None
         if is_prefill:
             b_has_out = g_pin_mem_manager.gen_from_list(

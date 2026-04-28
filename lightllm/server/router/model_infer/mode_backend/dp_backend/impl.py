@@ -427,7 +427,14 @@ class DPChunkedPrefillBackend(ModeBackend):
                 b_mtp_index_cpu = b_mtp_index_cpu[0:req_num]
                 b_req_idx = model_input.b_req_idx[0:req_num]
 
-                next_token_ids, next_token_logprobs = sample(logits, run_reqs, self.eos_id)
+                next_token_ids, next_token_logprobs = sample(
+                    logits,
+                    run_reqs,
+                    self.eos_id,
+                    model=self.model,
+                    is_use_decode_graph=getattr(self.model, "is_use_decode_graph", False),
+                    decode_graph_batch_size=getattr(self.model, "decode_graph_batch_size", None),
+                )
                 next_token_ids_cpu, next_token_logprobs_cpu = self._async_copy_next_token_infos_to_pin_mem(
                     next_token_ids, next_token_logprobs
                 )
@@ -738,7 +745,14 @@ class DPChunkedPrefillBackend(ModeBackend):
                 )
                 logits[0:req_num0, :].copy_(logits0[0:req_num0, :], non_blocking=True)
                 logits[req_num0 : (req_num0 + req_num1), :].copy_(logits1[0:req_num1, :], non_blocking=True)
-                next_token_ids, next_token_logprobs = sample(logits, run_reqs, self.eos_id)
+                next_token_ids, next_token_logprobs = sample(
+                    logits,
+                    run_reqs,
+                    self.eos_id,
+                    model=self.model,
+                    is_use_decode_graph=getattr(self.model, "is_use_decode_graph", False),
+                    decode_graph_batch_size=getattr(self.model, "decode_graph_batch_size", None),
+                )
                 next_token_ids_cpu, next_token_logprobs_cpu = self._async_copy_next_token_infos_to_pin_mem(
                     next_token_ids, next_token_logprobs
                 )

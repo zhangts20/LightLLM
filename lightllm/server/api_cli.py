@@ -428,6 +428,12 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--disable_cudagraph", action="store_true", help="Disable the cudagraph of the decoding stage")
     parser.add_argument(
+        "--enable_sampling_acl_graph",
+        action="store_true",
+        help="NPU decode only: capture a second NPUGraph for sampling (gpu penalty + ascend topk/topp). "
+        "Requires --sampling_backend ascend and penalty_counter_mode not cpu_counter.",
+    )
+    parser.add_argument(
         "--enable_prefill_cudagraph",
         action="store_true",
         help="Enable the cudagraph of the prefill stage,"

@@ -105,6 +105,13 @@ class StartArgs:
     visual_nccl_ports: List[int] = field(default=None)
     enable_monitor_auth: bool = field(default=False)
     disable_cudagraph: bool = field(default=False)
+    enable_sampling_acl_graph: bool = field(
+        default=False,
+        metadata={
+            "help": "NPU only: second NPUGraph for decode sampling (penalty+topk/topp), "
+            "requires ascend sampling_backend and non-cpu penalty counter."
+        },
+    )
     enable_prefill_cudagraph: bool = field(default=False)
     prefll_cudagraph_max_handle_token: int = field(default=512)
     graph_max_batch_size: int = field(default=256)
@@ -126,7 +133,7 @@ class StartArgs:
     )
     llm_kv_type: str = field(default="None", metadata={"choices": ["None", "int8kv", "int4kv", "fp8kv"]})
     llm_kv_quant_group_size: int = field(default=8)
-    sampling_backend: str = field(default="triton", metadata={"choices": ["triton", "sglang_kernel"]})
+    sampling_backend: str = field(default="triton", metadata={"choices": ["triton", "sglang_kernel", "ascend"]})
     penalty_counter_mode: str = field(
         default="gpu_counter", metadata={"choices": ["cpu_counter", "pin_mem_counter", "gpu_counter"]}
     )

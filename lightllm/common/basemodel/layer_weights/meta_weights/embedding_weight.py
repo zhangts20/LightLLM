@@ -72,7 +72,7 @@ class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
     ) -> torch.Tensor:
         return self._triton_forward(input_ids=input_ids, out=out, alloc_func=alloc_func)
-
+ 
     def _ascend_forward(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty 
     ) -> torch.Tensor:

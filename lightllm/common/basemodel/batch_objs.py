@@ -71,27 +71,33 @@ class ModelInput:
                 self.b_shared_seq_len = self.b_shared_seq_len.cuda(non_blocking=True)
 
     def to_device(self, device: str):
-        if self.input_ids is not None:
-            self.input_ids = self.input_ids.to(device=device, non_blocking=True)
+        target = torch.device(device)
+
+        def _maybe_to(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if x is None or x.device == target:
+                return x
+            return x.to(device=target, non_blocking=True)
+
+        self.input_ids = _maybe_to(self.input_ids)
         if self.mem_indexes is None:
-            self.mem_indexes = self.mem_indexes_cpu.to(device=device, non_blocking=True)
-        self.b_req_idx = self.b_req_idx.to(device=device, non_blocking=True)
-        self.b_seq_len = self.b_seq_len.to(device=device, non_blocking=True)
-        self.b_mtp_index = self.b_mtp_index.to(device=device, non_blocking=True)
-        if self.b_ready_cache_len is not None:
-            self.b_ready_cache_len = self.b_ready_cache_len.to(device=device, non_blocking=True)
-        if self.b_prefill_start_loc is not None:
-            self.b_prefill_start_loc = self.b_prefill_start_loc.to(device=device, non_blocking=True)
+            self.mem_indexes = self.mem_indexes_cpu.to(device=target, non_blocking=True)
+
+        self.b_req_idx = _maybe_to(self.b_req_idx)
+        self.b_seq_len = _maybe_to(self.b_seq_len)
+        self.b_mtp_index = _maybe_to(self.b_mtp_index)
+        self.b_ready_cache_len = _maybe_to(self.b_ready_cache_len)
+        self.b_prefill_start_loc = _maybe_to(self.b_prefill_start_loc)
+
         if not self.is_prefill and enable_diverse_mode_gqa_decode_fast_kernel():
             batch_size = len(self.b_req_idx)
             if self.b_mark_shared_group is None:
-                self.b_mark_shared_group = torch.ones(size=(batch_size,), dtype=torch.int32, device=device)
+                self.b_mark_shared_group = torch.ones(size=(batch_size,), dtype=torch.int32, device=target)
             else:
-                self.b_mark_shared_group = self.b_mark_shared_group.to(device=device, non_blocking=True)
+                self.b_mark_shared_group = _maybe_to(self.b_mark_shared_group)
             if self.b_shared_seq_len is None:
-                self.b_shared_seq_len = torch.zeros(size=(batch_size,), dtype=torch.int32, device=device)
+                self.b_shared_seq_len = torch.zeros(size=(batch_size,), dtype=torch.int32, device=target)
             else:
-                self.b_shared_seq_len = self.b_shared_seq_len.to(device=device, non_blocking=True)
+                self.b_shared_seq_len = _maybe_to(self.b_shared_seq_len)
 
     def __post_init__(self):
         self.check_input()

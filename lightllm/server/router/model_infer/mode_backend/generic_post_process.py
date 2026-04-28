@@ -1,5 +1,5 @@
 import torch
-from typing import List
+from typing import List, Optional, Any
 from lightllm.common.basemodel.triton_kernel.apply_penalty import apply_penalty
 from lightllm.common.basemodel.triton_kernel.apply_penalty_gpu_cache import apply_penalty_gpu_cache 
 from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
@@ -24,7 +24,14 @@ def _categorical_sample_one_gumbel_from_log_p(log_p: torch.Tensor) -> torch.Tens
     return gumbel.argmax(dim=-1, keepdim=True)
 
 
-def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
+def sample(
+    logits: torch.Tensor,
+    reqs: List[InferReq],
+    eos_id: List[int] = [2],
+    model: Optional[Any] = None,
+    is_use_decode_graph: bool = False,
+    decode_graph_batch_size: Optional[int] = None,
+):
     (
         b_req_idx,
         b_temperatures,
@@ -34,6 +41,30 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
         b_mask_eos_reqs,
         is_all_greedy,
     ) = _get_post_sample_tensors(reqs)
+
+    if (
+        model is not None
+        and is_use_decode_graph
+        and decode_graph_batch_size is not None
+    ):
+        mg = getattr(model, "sampling_graph", None)
+        if mg is not None:
+            gr = mg.replay(
+                logits,
+                logits.shape[0],
+                decode_graph_batch_size,
+                eos_id,
+                b_req_idx,
+                b_temperatures,
+                b_top_ps,
+                b_top_ks,
+                b_length_penalty_param,
+                b_mask_eos_reqs,
+                is_all_greedy,
+            )
+            if gr is not None:
+                return gr[0], gr[1]
+
     eos_ids = torch.tensor(eos_id, dtype=torch.int32, device="cpu", pin_memory=True).to(device=device, non_blocking=True)
 
     sampling_params_manager = g_infer_context.req_manager.req_sampling_params_manager

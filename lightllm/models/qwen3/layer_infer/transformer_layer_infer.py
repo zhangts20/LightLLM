@@ -4,6 +4,7 @@ from lightllm.models.qwen3.layer_weights.transformer_layer_weight import Qwen3Tr
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
 from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
+from lightllm.utils.device_utils import is_npu
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -33,12 +34,23 @@ class Qwen3TransformerLayerInfer(LlamaTransformerLayerInfer):
             eps=self.eps_,
         )
         cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_), self.head_dim_)
-        rotary_emb_fwd(
-            q.view(-1, self.tp_q_head_num_, self.head_dim_),
-            cache_kv[:, : self.tp_k_head_num_, :],
-            infer_state.position_cos,
-            infer_state.position_sin,
-        )
+
+        if is_npu():
+            from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd_npu
+
+            rotary_emb_fwd_npu(
+                q.view(-1, self.tp_q_head_num_, self.head_dim_),
+                cache_kv[:, : self.tp_k_head_num_, :],
+                infer_state.position_cos,
+                infer_state.position_sin,
+            )
+        else:
+            rotary_emb_fwd(
+                q.view(-1, self.tp_q_head_num_, self.head_dim_),
+                cache_kv[:, : self.tp_k_head_num_, :],
+                infer_state.position_cos,
+                infer_state.position_sin,
+            )
         return q, cache_kv
 
     def _tpsp_get_qkv(self, input, infer_state, layer_weight) -> Tuple[torch.Tensor, torch.Tensor]:

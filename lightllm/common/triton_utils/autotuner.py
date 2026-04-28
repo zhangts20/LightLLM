@@ -9,10 +9,10 @@ import collections
 from pathlib import Path
 from tqdm import tqdm
 from frozendict import frozendict
-from lightllm.utils.device_utils import get_current_device_name
+from lightllm.utils.device_utils import get_current_device_name, is_npu
 from lightllm.utils.log_utils import init_logger
 from typing import Callable, Optional, Union, List
-from lightllm.utils.envs_utils import get_triton_autotune_level
+from lightllm.utils.envs_utils import get_npu_device_name, get_triton_autotune_level
 from lightllm.common.kernel_config import KernelConfigs
 from lightllm.utils.dist_utils import get_global_world_size, get_global_rank, get_current_rank_in_node
 
@@ -111,11 +111,15 @@ class Autotuner:
 
         self.configs_gen_func = configs_gen_func
         self.kernel_name = kernel_name
+        if is_npu():
+            device_name = get_npu_device_name()
+        else:
+            device_name = get_current_device_name()
         self.cache_dir = os.path.join(
             Path(__file__).parent,
             "autotune_kernel_configs",
             get_triton_version(),
-            get_current_device_name(),
+            device_name,
             self.kernel_name,
         )
         os.makedirs(self.cache_dir, exist_ok=True)
