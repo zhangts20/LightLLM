@@ -8,6 +8,7 @@ from lightllm.utils.sgl_utils import flash_attn_with_kvcache
 from lightllm.utils.envs_utils import get_env_start_args, get_page_size
 from lightllm.common.basemodel.triton_kernel.fa3_utils import page_table_copy
 from lightllm.common.basemodel.triton_kernel.gen_prefill_params import gen_cumsum_pad0_tensor
+from lightllm.common.kv_cache_mem_manager.mem_utils import weak_ref_tensor
 
 if is_npu():
     import torch_npu
@@ -224,6 +225,10 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 batch_size = self.infer_state.batch_size
                 attn_params = get_attn_params()
 
+                event = torch.npu.ExternalEvent()
+                event.wait(stream)
+                event.reset(stream)
+
                 workspace = attn_params.workspaces.get(batch_size, None)
                 if workspace is None:
                     workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
@@ -263,8 +268,20 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
 
                 add_attn_params(
                     batch_size=self.infer_state.batch_size,
+                    event=event,
                     handle=handle,
-                    attn_params=(q, k, v, sm_scale, N_Q, N_KV, self.page_table, self.backend.page_size, output, softmax_lse)
+                    attn_params=(
+                        weak_ref_tensor(q),
+                        weak_ref_tensor(k),
+                        weak_ref_tensor(v),
+                        sm_scale,
+                        N_Q,
+                        N_KV,
+                        weak_ref_tensor(self.page_table),
+                        self.backend.page_size,
+                        weak_ref_tensor(output),
+                        weak_ref_tensor(softmax_lse),
+                    )
                 )
             else:
                 torch_npu.npu_fused_infer_attention_score.out(
@@ -308,19 +325,20 @@ def update_attn_params(
     batch_size: int,
     actual_seq_lengths: list[int],
     actual_seq_lengths_kv: list[int],
+    update_stream: torch.npu.Stream,
 ):
     from lightllm.common.basemodel.acl_graph import get_attn_params
 
     attn_params = get_attn_params()
-
-    stream = torch.npu.current_stream()
     handles = attn_params.handles[batch_size]
+    events = attn_params.events[batch_size]
     workspace = attn_params.workspaces[batch_size]
     params_list = attn_params.attn_params[batch_size]
-    with torch.npu.stream(stream):
-        for handle, attn_param in zip(handles, params_list):
+
+    with torch.npu.stream(update_stream):
+        for handle, event, attn_param in zip(handles, events, params_list):
             (q, k, v, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse) = attn_param
-            torch.npu.graph_task_update_begin(stream, handle)
+            torch.npu.graph_task_update_begin(update_stream, handle)
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
                 k,
@@ -336,4 +354,5 @@ def update_attn_params(
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
-            torch.npu.graph_task_update_end(stream)
+            torch.npu.graph_task_update_end(update_stream)
+            event.record(update_stream)

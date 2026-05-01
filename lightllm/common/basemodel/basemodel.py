@@ -35,6 +35,7 @@ from lightllm.utils.envs_utils import (
     profile_all_or_decode,
 )
 from lightllm.distributed.communication_op import dist_group_manager
+from lightllm.common.basemodel.attention.paged_fa3.fp import update_attn_params
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
 from lightllm.common.triton_utils.autotuner import AutotuneLevel
 from lightllm.utils.custom_kernel_utis import pad2dim_tensor_to_new_batch
@@ -137,6 +138,10 @@ class TpPartBaseModel:
             logger.info(f"use prefill att backend1: {self.prefill_att_backend1.__class__.__name__}")
             logger.info(f"use decode att backend1: {self.decode_att_backend1.__class__.__name__}")
 
+        if not self.disable_cudagraph:
+            self.b1_cu_q_seq_len_cpu_ref = torch.zeros(self.graph_max_batch_size, dtype=torch.int32)
+            self.b_cu_kv_seq_len_cpu_ref = torch.zeros(self.graph_max_batch_size, dtype=torch.int32)
+            self.ref_initialized = False
         self._autotune_warmup()
         self._init_padded_req()
         self._init_cudagraph()
@@ -559,6 +564,21 @@ class TpPartBaseModel:
             infer_state.init_some_extra_state(self)
             infer_state.init_att_state()
 
+            batch_size = infer_state.batch_size
+            b1_cu_q_seq_len_cpu_slice = self.b1_cu_q_seq_len_cpu_ref[:batch_size]
+            b_cu_kv_seq_len_cpu_slice = self.b_cu_kv_seq_len_cpu_ref[:batch_size]
+            if not torch.npu.is_current_stream_capturing():
+                need_update_attn_params = not self.ref_initialized or not torch.equal(
+                    b_cu_kv_seq_len_cpu_slice, infer_state.b_cu_kv_seq_len_cpu
+                )
+                if need_update_attn_params:
+                    b1_cu_q_seq_len_cpu_slice.copy_(infer_state.b1_cu_q_seq_len_cpu)
+                    b_cu_kv_seq_len_cpu_slice.copy_(infer_state.b_cu_kv_seq_len_cpu)
+                    update_attn_params(
+                        batch_size, b1_cu_q_seq_len_cpu_slice, b_cu_kv_seq_len_cpu_slice, self.graph.update_stream,
+                    )
+                    self.ref_initialized = True
+
             if enable_npu_profiler() and profile_all_or_decode() == "decode" and infer_state.batch_size > npu_profiler_min_batch_threshold():
                 import torch_npu
 
@@ -590,14 +610,22 @@ class TpPartBaseModel:
                             infer_state.is_cuda_graph = True
                             model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
                         else:
-                            model_output: ModelOutput = self.graph.replay(infer_state)
+                            model_output: ModelOutput = self.graph.replay(
+                                infer_state,
+                                b1_cu_q_seq_len_cpu_slice,
+                                b_cu_kv_seq_len_cpu_slice,
+                            )
                         prof.step()
             else:
                 if self.graph.need_capture(find_graph_batch_size):
                     infer_state.is_cuda_graph = True
                     model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
                 else:
-                    model_output: ModelOutput = self.graph.replay(infer_state)
+                    model_output: ModelOutput = self.graph.replay(
+                        infer_state,
+                        b1_cu_q_seq_len_cpu_slice,
+                        b_cu_kv_seq_len_cpu_slice,
+                    )
             model_output = self._create_unpad_decode_model_output(
                 model_output, origin_batch_size=model_input.batch_size
             )
@@ -1024,14 +1052,20 @@ class TpPartBaseModel:
                 self.req_manager.free_all()
                 self.mem_manager.free_all()
                 gc.collect()
-                torch.cuda.empty_cache()
+                if is_npu():
+                    torch.npu.empty_cache()
+                else:
+                    torch.cuda.empty_cache()
             except Exception as e:
                 logger.warning(f"autotune warmup for length {input_len} failed: {str(e)}")
                 logger.exception(str(e))
                 self.req_manager.free_all()
                 self.mem_manager.free_all()
                 gc.collect()
-                torch.cuda.empty_cache()
+                if is_npu():
+                    torch.npu.empty_cache()
+                else:
+                    torch.cuda.empty_cache()
         self.layers_num = layer_num_bak
         torch.distributed.barrier()
         Autotuner.end_autotune_warmup()

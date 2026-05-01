@@ -1,3 +1,5 @@
+from typing import Any
+import torch
 from . import (
     MemoryManager,
     CalibrationFP8KVMemoryManager,
@@ -51,3 +53,12 @@ def select_mem_manager_class():
 def used_mem_manager_has_scale() -> bool:
     mem_class = select_mem_manager_class()
     return mem_class in [PPLINT8KVMemoryManager, PPLINT4KVMemoryManager]
+
+
+def weak_ref_tensor(tensor: Any) -> Any:
+    import torch_npu
+
+    if isinstance(tensor, torch.Tensor):
+        return torch_npu._C._weak_ref_tensor(tensor)
+    else:
+        return tensor

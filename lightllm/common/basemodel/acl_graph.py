@@ -45,6 +45,7 @@ class AclGraph:
 
         logger.info(f"acl graph batch_sizes: {self.acl_graph_batch_sizes}")
         init_attn_params(batch_sizes)
+        self.update_stream = torch.npu.Stream()
 
     def can_run(self, batch_size: int, max_len_in_batch: int) -> bool:
         return batch_size <= self.max_batch_size and max_len_in_batch <= self.graph_max_len_in_batch
@@ -83,7 +84,6 @@ class AclGraph:
             with torch.npu.graph(graph_obj, pool=self.mempool):
                 model_output = decode_func(infer_state)
         self.graph[batch_size] = (graph_obj, infer_state, model_output)
-        graph_obj.replay()
         return model_output
 
     def _capture_decode_overlap(
@@ -141,14 +141,15 @@ class AclGraph:
             assert infer_state1 is None
             return self._capture_decode(decode_func, infer_state)
 
-    def _replay(self, infer_state: InferStateInfo):
+    def _replay(self, infer_state: InferStateInfo, b1_cu_q_seq_len_cpu: torch.Tensor, b_cu_kv_seq_len_cpu: torch.Tensor):
         batch_size = infer_state.input_ids.shape[0]
         graph_obj, graph_infer_state, graph_output = self.graph[batch_size]
         graph_infer_state.copy_for_cuda_graph(infer_state)
-        update_attn_params(
-            batch_size, infer_state.b1_cu_q_seq_len_cpu, infer_state.b_cu_kv_seq_len_cpu
-        )
         graph_obj.replay()
+
+        update_attn_params(
+            batch_size, b1_cu_q_seq_len_cpu, b_cu_kv_seq_len_cpu.add_(1), self.update_stream,
+        )
 
         return graph_output
 
@@ -171,12 +172,12 @@ class AclGraph:
 
         return graph_model_output, graph_model_output1
 
-    def replay(self, infer_state, infer_state1=None):
+    def replay(self, infer_state, b1_cu_q_seq_len_cpu, b_cu_kv_seq_len_cpu, infer_state1=None):
         if self.enable_decode_microbatch_overlap:
             return self._replay_overlap(infer_state, infer_state1)
         else:
             assert infer_state1 is None
-            return self._replay(infer_state)
+            return self._replay(infer_state, b1_cu_q_seq_len_cpu, b_cu_kv_seq_len_cpu)
 
     @torch.no_grad()
     def warmup(self, model):
@@ -310,6 +311,7 @@ class AclGraph:
 @dataclass
 class AclGraphParams:
     handles: dict[int, list[Any]] = field(default_factory=dict)
+    events: dict[int, list[torch.npu.ExternalEvent]] = field(default_factory=dict)
     workspaces: dict[int, Any] = field(default_factory=dict)
     attn_params: dict[int, list[tuple]] = field(default_factory=dict)
 
@@ -321,6 +323,7 @@ def init_attn_params(batch_sizes: list[int]):
     global ATTN_PARAMS
     ATTN_PARAMS = AclGraphParams(
         handles={bs: [] for bs in batch_sizes},
+        events={bs: [] for bs in batch_sizes},
         workspaces={bs: None for bs in batch_sizes},
         attn_params={bs: [] for bs in batch_sizes},
     )
@@ -330,8 +333,9 @@ def get_attn_params():
     return ATTN_PARAMS
 
 
-def add_attn_params(batch_size: int, handle: Any, attn_params: tuple):
+def add_attn_params(batch_size: int, event: torch.npu.ExternalEvent, handle: Any, attn_params: tuple):
     global ATTN_PARAMS
     if ATTN_PARAMS is not None:
         ATTN_PARAMS.handles[batch_size].append(handle)
+        ATTN_PARAMS.events[batch_size].append(event)
         ATTN_PARAMS.attn_params[batch_size].append(attn_params)
