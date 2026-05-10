@@ -16,6 +16,7 @@ from lightllm.models.vit.triton_kernel.rms_norm_vit import rms_norm
 from lightllm.server.visualserver import get_vit_attn_backend
 from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_manager
 from lightllm.models.qwen2_vl.triton_kernel.rotary_pos_emb import apply_rotary_pos_emb_triton
+from lightllm.utils.device_utils import is_npu
 
 
 class Qwen2RMSNorm(nn.Module):
@@ -210,6 +211,10 @@ class Qwen2_5_VisionTransformerPretrainedModel(nn.Module):
         self.processor = Qwen2VLImageProcessor(**processor_config_dict)
 
         self._init_datatype()
+        if is_npu():
+            self.device = "npu"
+        else:
+            self.device = "cuda"
 
     def _init_datatype(self):
         if isinstance(self.data_type, torch.dtype):
@@ -402,9 +407,8 @@ class Qwen2_5_VisionTransformerPretrainedModel(nn.Module):
         imgs = torch.cat(img_tensors, dim=0)
         grid_thw = torch.cat(img_grids, dim=0)
 
-        device = self.patch_embed.device
-        pixel_values = imgs.to(device, dtype=self.data_type, non_blocking=True)
-        image_grid_thw = grid_thw.to(device, non_blocking=True)
+        pixel_values = imgs.to(self.device, dtype=self.data_type, non_blocking=True)
+        image_grid_thw = grid_thw.to(self.device, non_blocking=True)
 
         all_img_embeds = self.forward(pixel_values, grid_thw=image_grid_thw)
 

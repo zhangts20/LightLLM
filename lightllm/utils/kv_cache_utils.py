@@ -16,6 +16,7 @@ from lightllm.utils.envs_utils import (
 )
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.config_utils import get_num_key_value_heads, get_head_dim, get_layer_num
+from lightllm.utils.device_utils import is_npu
 from lightllm.common.kv_cache_mem_manager.mem_utils import select_mem_manager_class
 from lightllm.common.kv_cache_mem_manager import (
     MemoryManager,
@@ -265,7 +266,26 @@ def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> "AsyncRegistrationHandle
         assert host_ptr.value == device_ptr.value
         handle.tasks_finished.set()
 
-    th = threading.Thread(target=_worker, name=f"cpu_cache_register_{shm_ptr}", daemon=True)
+    def _worker_npu():
+        import acl
+
+        acl.init()
+        ret = acl.rt.set_device(get_current_device_id())
+        assert ret == 0, f"acl.rt.set_device failed with error code {ret}"
+
+        ACL_HOST_REGISTER_MAPPED = 0
+        for offset, seg_len in tasks:
+            ptr = shm_ptr + offset
+            res = acl.rt.host_register(ptr, seg_len, ACL_HOST_REGISTER_MAPPED)
+            assert res[1] == 0, f"acl.rt.host_register failed with error code {res}"
+            handle.task_count += 1
+        handle.tasks_finished.set()
+
+    if is_npu():
+        target_worker = _worker_npu
+    else:
+        target_worker = _worker
+    th = threading.Thread(target=target_worker, name=f"cpu_cache_register_{shm_ptr}", daemon=True)
     handle.thread = th
     th.start()
     return handle

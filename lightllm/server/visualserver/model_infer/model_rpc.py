@@ -110,8 +110,10 @@ class VisualModelRpcServer(rpyc.Service):
     def exposed_encode(self, images: List[ImageItem]):
         images = obtain(images)
         all_img_embeds, uuids, valid_ids = self.forward(images)
-        all_img_embeds = all_img_embeds.to(torch.device("cuda"))
-
+        if is_npu():
+            all_img_embeds = all_img_embeds.to(torch.device("npu"))
+        else:
+            all_img_embeds = all_img_embeds.to(torch.device("cuda"))
         if self.tp_rank_id == 0:
             ready_flags = obtain(self.cache_client.root.get_items_embed(uuids))
             ids_to_set = []
@@ -127,7 +129,10 @@ class VisualModelRpcServer(rpyc.Service):
                 ids_to_set.append(uid)
             if ids_to_set:
                 self.cache_client.root.set_items_embed(ids_to_set)
-                torch.cuda.current_stream().synchronize()
+                if is_npu():
+                    torch.npu.current_stream().synchronize()
+                else:
+                    torch.cuda.current_stream().synchronize()
         return
 
 
