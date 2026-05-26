@@ -80,14 +80,15 @@ def init_vision_distributed_env(kvargs):
     set_current_rank_in_dp(tp_rank_id)
     device_id = kvargs["device_id"]
     set_current_device_id(device_id)
-    target_device = get_backend().runtime.target_device(device_id)
-    get_backend().runtime.set_device(target_device)
+    backend_runtime = get_backend().runtime
+    target_device = backend_runtime.target_device(device_id)
+    backend_runtime.set_device(target_device)
     # 不要在init_process_group时，显示的传入device_id
     # 这会触发torch的device-bound split优化，会默认后面想加入新进程组的rank
     # 都已经存在于默认组，这样RL更新weight的init_group时，外部想加入的组，在执行
     # 通信原语时例如all_reduce，会永远等不到LightLLM默认组里的回复，从而导致错误结果。
     dist.init_process_group(
-        get_backend().runtime.dist_backend,
+        backend_runtime.dist_backend,
         init_method=f'tcp://127.0.0.1:{kvargs["visual_nccl_port"]}',
         rank=kvargs["tp_rank_id"],
         world_size=tp_world_size,
@@ -116,10 +117,12 @@ def init_audio_distributed_env(kvargs):
     set_current_rank_in_dp(tp_rank_id)
     device_id = kvargs["device_id"]
     set_current_device_id(device_id)
-    target_device = get_target_device(device_id)
-    get_backend().runtime.set_device(target_device)
+
+    backend_runtime = get_backend().runtime
+    target_device = backend_runtime.target_device(device_id)
+    backend_runtime.set_device(target_device)
     dist.init_process_group(
-        get_backend().runtime.dist_backend,
+        backend_runtime.dist_backend,
         init_method=f'tcp://127.0.0.1:{kvargs["audio_nccl_port"]}',
         rank=tp_rank_id,
         world_size=tp_world_size,
@@ -150,7 +153,9 @@ def init_distributed_env(kvargs):
     _init_nccl_env()
     device_id = kvargs["rank_id"] % get_node_world_size()
     set_current_device_id(device_id)
-    target_device = get_backend().runtime.target_device(device_id)
+
+    backend_runtime = get_backend().runtime
+    target_device = backend_runtime.target_device(device_id)
     get_backend().runtime.set_device(target_device)
     dist.init_process_group(
         get_backend().runtime.dist_backend,
