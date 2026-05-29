@@ -880,8 +880,8 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--hardware_platform",
         type=str,
         default="cuda",
-        choices=["cuda", "musa"],
-        help="""Hardware platform: cuda | musa""",
+        choices=["cuda", "musa", "ascend"],
+        help="""Hardware platform: cuda | musa | ascend""",
     )
     parser.add_argument(
         "--enable_torch_fallback",

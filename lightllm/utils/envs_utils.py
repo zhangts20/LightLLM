@@ -260,3 +260,7 @@ def get_pd_split_max_new_tokens() -> int:
 @lru_cache(maxsize=None)
 def get_lightllm_url_pool_maxsize() -> int:
     return int(os.getenv("LIGHTLLM_URL_POOL_MAXSIZE", 512))
+
+
+def get_page_size():
+    return int(os.getenv("PAGE_SIZE", 1))

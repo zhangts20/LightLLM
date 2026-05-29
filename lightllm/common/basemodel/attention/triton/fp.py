@@ -74,7 +74,7 @@ class TritonPrefillAttState(BasePrefillAttState):
         else:
             sliding_window = (-1, -1)
 
-        out = alloc_func(q.shape, q.dtype)
+        out = alloc_func(q.shape, q.dtype, device=q.device)
         context_attention_fwd(
             q,
             k,
