@@ -32,6 +32,7 @@ from lightllm.utils.auto_shm_cleanup import register_sysv_shm_for_cleanup
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.common.linear_att_cache_manager.config_objs import LinearAttCacheConfig
 from lightllm.platform import get_backend
+from lightllm.utils.cpu_cache_host_register import get_host_register_worker
 
 logger = init_logger(__name__)
 
