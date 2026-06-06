@@ -1,4 +1,5 @@
 import uuid
+from lightllm.utils.envs_utils import get_page_size
 import numpy as np
 from ...batch import Batch, Req
 from lightllm.server.router.req_queue.base_queue import BaseQueue
