@@ -148,7 +148,7 @@ def get_row_slice_mixin(
 ) -> SliceMixinTpl:
     if quant_method_name.startswith("awq"):
         return AwqQuantizedRowSliceMixin(tp_rank, tp_world_size, repeat_times)
-    elif quant_method_name == "none":
+    elif quant_method_name == "none" or quant_method_name.startswith("gguf"):
         return RowSliceMixin(tp_rank, tp_world_size, repeat_times)
     else:
         return QuantizedRowSliceMixin(tp_rank, tp_world_size, repeat_times)
@@ -159,7 +159,7 @@ def get_col_slice_mixin(
 ) -> SliceMixinTpl:
     if quant_method_name.startswith("awq"):
         return AwqQuantizedColSliceMixin(tp_rank, tp_world_size, repeat_times)
-    elif quant_method_name == "none":
+    elif quant_method_name == "none" or quant_method_name.startswith("gguf"):
         return ColSliceMixin(tp_rank, tp_world_size, repeat_times)
     else:
         return QuantizedColSliceMixin(tp_rank, tp_world_size, repeat_times)

@@ -21,6 +21,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from lightllm.server.multimodal_params import MultimodalParams, ImageItem
 from .model_infer import start_model_process, VisualModelRpcClient
 from lightllm.common.basemodel.attention_vit.create_utils import init_vit_att_backend
+from lightllm.utils.config_utils import create_model_paths
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.utils.process_check import start_parent_check_thread
@@ -39,7 +40,12 @@ class VisualOnlyManager(rpyc.Service):
         args: StartArgs,
     ):
         self.args = args
-        self.model_weightdir = args.model_dir
+        self.visual_weight_dir, self.processor_dir = create_model_paths(
+            args.model_dir,
+            config_path=args.config_path,
+            tokenizer_dir=args.tokenizer_dir,
+            mmproj_path=args.mmproj_path,
+        ).resolve_visual_dirs()
         self.vit_dp = args.visual_dp
         assert self.vit_dp == 1
         self.vit_tp = args.visual_tp
@@ -106,7 +112,8 @@ class VisualOnlyManager(rpyc.Service):
             for tp_rank_id in range(self.vit_tp):
                 device_id = self.args.visual_gpu_ids[dp_rank_id * self.vit_tp + tp_rank_id]
                 kvargs = {
-                    "weight_dir": self.model_weightdir,
+                    "weight_dir": self.visual_weight_dir,
+                    "processor_dir": self.processor_dir,
                     "device_id": device_id,
                     "vit_tp": self.vit_tp,
                     "cache_port": None,  # visual only 模式下不使用 embed cache

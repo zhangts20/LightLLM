@@ -1,20 +1,241 @@
 import json
 import os
-from typing import Optional, List
+from dataclasses import dataclass, field
 from functools import lru_cache
-from .envs_utils import get_env_start_args
+from typing import List, Optional, Union
+
+from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
 
 
-def get_config_json(model_path: str):
-    with open(os.path.join(model_path, "config.json"), "r") as file:
-        json_obj = json.load(file)
-    return json_obj
+@dataclass(frozen=True)
+class ModelPaths:
+    """ Resolved model-related paths for config / tokenizer / multimodal loading """
+    model_dir: str
+    tokenizer_dir: Optional[str] = None
+    config_path: Optional[str] = None
+    mmproj_path: Optional[str] = None
+    _gguf_path: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    @property
+    def is_gguf(self) -> bool:
+        return self._gguf_path is not None
+
+    @property
+    def gguf_path(self) -> Optional[str]:
+        return self._gguf_path
+
+    @property
+    def processor_dir(self) -> str:
+        return self.tokenizer_dir or self.model_dir
+
+    @property
+    def tokenizer_load_path(self) -> tuple[str, bool]:
+        if self._gguf_path is not None and not self.tokenizer_dir:
+            return self._gguf_path, True
+        return self.processor_dir, False
+
+    def resolve_visual_dirs(self) -> tuple[Optional[str], Optional[str]]:
+        if self.is_gguf:
+            return self.mmproj_path, self.tokenizer_dir
+        return self.model_dir, self.model_dir
+
+    def load_config(self) -> dict:
+        if self.config_path is not None:
+            return _load_config_from_path(self.config_path)
+
+        gguf_path = self.gguf_path
+
+        if gguf_path is not None and self.tokenizer_dir is not None:
+            hf_config_path = os.path.join(self.tokenizer_dir, "config.json")
+            assert os.path.isfile(hf_config_path), f"config.json {hf_config_path} is not found"
+            return _load_config_from_path(hf_config_path)
+
+        if gguf_path is None and self.model_dir:
+            config_json_path = os.path.join(self.model_dir, "config.json")
+            if os.path.isfile(config_json_path):
+                return _load_config_from_path(config_json_path)
+
+        if gguf_path is not None:
+            return _load_config_from_gguf(gguf_path)
+
+        raise FileNotFoundError(
+            f"no model config found (config_path={self.config_path!r}, model_dir={self.model_dir!r}). "
+            "Provide --config_path, place config.json under model_dir, or use a .gguf model path."
+        )
+
+    def align_quant_type(self, quant_type: str) -> str:
+        if self.is_gguf:
+            return "gguf"
+
+        if quant_type == "gguf":
+            raise ValueError("--quant_type gguf is not supported for non-GGUF models")
+
+        return quant_type
+
+    def __post_init__(self):
+        object.__setattr__(self, "_gguf_path", _find_gguf_path_cached(self.model_dir))
 
 
-def _derive_max_req_total_len_from_model_config(model_dir: str) -> Optional[int]:
+def _fill_paths_from_env(paths: ModelPaths) -> ModelPaths:
+    try:
+        start_args = get_env_start_args()
+    except KeyError:
+        return paths
+
+    config_path = paths.config_path if paths.config_path is not None else getattr(start_args, "config_path", None)
+    tokenizer_dir = (
+        paths.tokenizer_dir if paths.tokenizer_dir is not None else getattr(start_args, "tokenizer_dir", None)
+    )
+    mmproj_path = paths.mmproj_path if paths.mmproj_path is not None else getattr(start_args, "mmproj_path", None)
+
+    if config_path == paths.config_path and tokenizer_dir == paths.tokenizer_dir and mmproj_path == paths.mmproj_path:
+        return paths
+
+    return ModelPaths(
+        model_dir=paths.model_dir,
+        config_path=config_path,
+        tokenizer_dir=tokenizer_dir,
+        mmproj_path=mmproj_path,
+    )
+
+
+def create_model_paths(
+    model_dir_or_paths: Union[str, ModelPaths, None] = None,
+    *,
+    config_path: Optional[str] = None,
+    tokenizer_dir: Optional[str] = None,
+    mmproj_path: Optional[str] = None,
+) -> ModelPaths:
+    if model_dir_or_paths is None:
+        start_args = get_env_start_args()
+        return create_model_paths(
+            start_args.model_dir,
+            config_path=getattr(start_args, "config_path", None),
+            tokenizer_dir=getattr(start_args, "tokenizer_dir", None),
+            mmproj_path=getattr(start_args, "mmproj_path", None),
+        )
+
+    if isinstance(model_dir_or_paths, ModelPaths):
+        paths = model_dir_or_paths
+    else:
+        paths = ModelPaths(
+            model_dir=model_dir_or_paths,
+            config_path=config_path,
+            tokenizer_dir=tokenizer_dir,
+            mmproj_path=mmproj_path,
+        )
+
+    return _fill_paths_from_env(paths)
+
+
+@lru_cache(maxsize=1)
+def get_model_paths() -> ModelPaths:
+    return create_model_paths()
+
+
+def _load_config_from_path(config_path: str) -> dict:
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"config file not found: {config_path}")
+    with open(config_path, "r") as file:
+        return json.load(file)
+
+
+def _load_config_from_gguf(gguf_path: str) -> dict:
+    from lightllm.common.basemodel.layer_weights.gguf_load_utils import get_gguf_reader
+
+    return get_gguf_reader(gguf_path).load_config()
+
+
+@lru_cache(maxsize=128)
+def _find_gguf_path_cached(model_dir: Optional[str]) -> Optional[str]:
+    if not model_dir:
+        return None
+
+    if model_dir.endswith(".gguf") and os.path.isfile(model_dir):
+        return model_dir
+
+    if os.path.isdir(model_dir):
+        gguf_files = sorted(
+            os.path.join(model_dir, name) for name in os.listdir(model_dir) if name.endswith(".gguf")
+        )
+        if not gguf_files:
+            return None
+        if len(gguf_files) > 1:
+            raise ValueError(
+                f"multiple GGUF files found in {model_dir} is not supported, please specify the target gguf file."
+            )
+        return gguf_files[0]
+
+    return None
+
+
+def apply_gguf_quant_type(paths: Union[str, ModelPaths], quant_type: str) -> str:
+    """Align quant_type for GGUF models and log when overriding."""
+    paths = create_model_paths(paths)
+    aligned = paths.align_quant_type(quant_type)
+    if aligned != quant_type:
+        logger.warning(
+            f"model_dir contains GGUF weights; overriding --quant_type {quant_type!r} -> {aligned!r}"
+        )
+    return aligned
+
+
+def _normalize_gguf_model_config(config: dict) -> dict:
+    if config.get("head_dim") is None:
+        hidden_size = config.get("hidden_size") or config.get("n_embd") or config.get("n_embed")
+        num_heads = config.get("num_attention_heads") or config.get("n_head")
+        if hidden_size and num_heads:
+            config["head_dim"] = hidden_size // num_heads
+    return config
+
+
+@lru_cache(maxsize=None)
+def get_model_config(paths: Union[str, ModelPaths]) -> dict:
+    paths = create_model_paths(paths)
+    config = paths.load_config()
+    if paths.is_gguf:
+        config = _normalize_gguf_model_config(config)
+    return config
+
+
+def check_gguf_multimodal_paths(paths: ModelPaths, enable_multimodal: bool = False) -> None:
+    if not enable_multimodal or not paths.is_gguf:
+        return
+
+    if not paths.tokenizer_dir:
+        raise ValueError("tokenizer_dir is required when enable_multimodal is True for GGUF models")
+    if not os.path.isdir(paths.tokenizer_dir):
+        raise FileNotFoundError(f"tokenizer_dir {paths.tokenizer_dir} is not found")
+
+    effective_config_path = paths.config_path
+    if effective_config_path is not None:
+        if not os.path.isfile(effective_config_path):
+            raise FileNotFoundError(f"config.json {effective_config_path} is not found")
+    else:
+        effective_config_path = os.path.join(paths.tokenizer_dir, "config.json")
+        if not os.path.isfile(effective_config_path):
+            raise FileNotFoundError(
+                f"config.json is not provided and not found in tokenizer_dir: "
+                f"{paths.tokenizer_dir} when enable_multimodal is True for GGUF models"
+            )
+
+    processor_path = os.path.join(paths.tokenizer_dir, "preprocessor_config.json")
+    if not os.path.isfile(processor_path):
+        raise FileNotFoundError(
+            f"preprocessor_config.json not found in tokenizer_dir: "
+            f"{paths.tokenizer_dir} when enable_multimodal is True for GGUF models"
+        )
+
+    if not paths.mmproj_path:
+        raise ValueError("mmproj_path is required when enable_multimodal is True for GGUF models")
+    if not os.path.isfile(paths.mmproj_path):
+        raise FileNotFoundError(f"mmproj_path {paths.mmproj_path} is not found")
+
+
+def _derive_max_req_total_len_from_model_config(paths: ModelPaths) -> Optional[int]:
     """
     Derive `max_req_total_len` from model config.json.
 
@@ -24,7 +245,7 @@ def _derive_max_req_total_len_from_model_config(model_dir: str) -> Optional[int]
     """
 
     try:
-        cfg = get_config_json(model_dir)
+        cfg = get_model_config(paths)
     except Exception as e:
         logger.warning(f"failed to load config.json for max_req_total_len derive: {e}")
         return None
@@ -113,7 +334,7 @@ def _derive_max_req_total_len_from_model_config(model_dir: str) -> Optional[int]
     return None
 
 
-def auto_set_max_req_total_len(args) -> None:
+def auto_set_max_req_total_len(args, paths: ModelPaths) -> None:
     """
     Ensure `args.max_req_total_len` is an int.
 
@@ -125,14 +346,13 @@ def auto_set_max_req_total_len(args) -> None:
     if args.max_req_total_len is not None:
         return
 
-    model_dir = args.model_dir
-    if not model_dir:
+    if not paths.model_dir:
         logger.warning("model_dir is empty; fallback max_req_total_len=16384")
         args.max_req_total_len = default_fallback
         return
 
     try:
-        derived = _derive_max_req_total_len_from_model_config(model_dir)
+        derived = _derive_max_req_total_len_from_model_config(paths)
     except Exception as e:
         logger.warning(f"failed to derive max_req_total_len from model config: {e}")
         derived = None
@@ -146,8 +366,8 @@ def auto_set_max_req_total_len(args) -> None:
     logger.info(f"auto derived max_req_total_len={args.max_req_total_len} from model config")
 
 
-def _get_config_llm_keyvalue(model_path: str, key_name: list[str]):
-    config_json = get_config_json(model_path)
+def _get_config_llm_keyvalue(paths: ModelPaths, key_name: list[str]):
+    config_json = get_model_config(paths)
     for key in key_name:
         try:
             value = config_json[key]
@@ -167,53 +387,57 @@ def _get_config_llm_keyvalue(model_path: str, key_name: list[str]):
     return None
 
 
-def get_hidden_size(model_path: str) -> Optional[int]:
-    hidden_size = _get_config_llm_keyvalue(model_path=model_path, key_name=["hidden_size", "n_embd", "n_embed"])
+def get_hidden_size(model_dir_or_paths: Union[str, ModelPaths]) -> Optional[int]:
+    paths = create_model_paths(model_dir_or_paths)
+    hidden_size = _get_config_llm_keyvalue(paths, key_name=["hidden_size", "n_embd", "n_embed"])
     if isinstance(hidden_size, int):
         return hidden_size
     return None
 
 
 @lru_cache(maxsize=None)
-def get_num_key_value_heads(model_path: str) -> int:
-    num_key_value_heads = _get_config_llm_keyvalue(model_path=model_path, key_name=["num_key_value_heads"])
+def get_num_key_value_heads(model_dir_or_paths: Union[str, ModelPaths]) -> int:
+    paths = create_model_paths(model_dir_or_paths)
+    num_key_value_heads = _get_config_llm_keyvalue(paths, key_name=["num_key_value_heads"])
     if isinstance(num_key_value_heads, int):
         return num_key_value_heads
     return None
 
 
 @lru_cache(maxsize=None)
-def get_num_attention_heads(model_path: str) -> int:
-    num_attention_heads = _get_config_llm_keyvalue(model_path=model_path, key_name=["num_attention_heads"])
+def get_num_attention_heads(model_dir_or_paths: Union[str, ModelPaths]) -> int:
+    paths = create_model_paths(model_dir_or_paths)
+    num_attention_heads = _get_config_llm_keyvalue(paths, key_name=["num_attention_heads"])
     if isinstance(num_attention_heads, int):
         return num_attention_heads
     return None
 
 
 @lru_cache(maxsize=None)
-def get_head_dim(model_path: str) -> int:
-    head_dim = _get_config_llm_keyvalue(model_path=model_path, key_name=["head_dim"])
+def get_head_dim(model_dir_or_paths: Union[str, ModelPaths]) -> int:
+    paths = create_model_paths(model_dir_or_paths)
+    head_dim = _get_config_llm_keyvalue(paths, key_name=["head_dim"])
     if isinstance(head_dim, int):
         return head_dim
 
-    # calcu head_dim
-    head_dim = get_hidden_size(model_path=model_path) // get_num_attention_heads(model_path=model_path)
+    head_dim = get_hidden_size(paths) // get_num_attention_heads(paths)
 
     return head_dim
 
 
 @lru_cache(maxsize=None)
-def get_layer_num(model_path: str) -> int:
-    num_hidden_layers = _get_config_llm_keyvalue(model_path=model_path, key_name=["num_hidden_layers"])
+def get_layer_num(model_dir_or_paths: Union[str, ModelPaths]) -> int:
+    paths = create_model_paths(model_dir_or_paths)
+    num_hidden_layers = _get_config_llm_keyvalue(paths, key_name=["num_hidden_layers"])
     if isinstance(num_hidden_layers, int):
         return num_hidden_layers
     return None
 
 
-def get_eos_token_ids(model_path: str) -> Optional[List[int]]:
+def get_eos_token_ids(model_dir_or_paths: Union[str, ModelPaths]) -> Optional[List[int]]:
+    paths = create_model_paths(model_dir_or_paths)
     try:
-        # qwen3-omini special eos_token_id
-        config_json = get_config_json(model_path)
+        config_json = get_model_config(paths)
         assert config_json["architectures"][0] == "Qwen3OmniMoeForConditionalGeneration"
         return [151645]
     except:
@@ -221,20 +445,20 @@ def get_eos_token_ids(model_path: str) -> Optional[List[int]]:
 
     # Qwen3.5 checkpoints can have an eos_token_id in config that differs from
     # tokenizer.eos_token_id. In practice tokenizer.eos_token_id is the reliable
-    # stop id (<|im_end|>) for detokenization/stop behavior.
+    # stop id (<|im_end|>)
     try:
-        config_json = get_config_json(model_path)
+        config_json = get_model_config(paths)
         model_type = config_json.get("model_type") or config_json.get("text_config", {}).get("model_type")
         if model_type in {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+            tokenizer = AutoTokenizer.from_pretrained(paths.processor_dir, trust_remote_code=False)
             if tokenizer.eos_token_id is not None:
                 return [int(tokenizer.eos_token_id)]
     except Exception:
         pass
 
-    eos_token_id = _get_config_llm_keyvalue(model_path=model_path, key_name=["eos_token_id"])
+    eos_token_id = _get_config_llm_keyvalue(paths, key_name=["eos_token_id"])
     if isinstance(eos_token_id, int):
         return [eos_token_id]
     if isinstance(eos_token_id, list):
@@ -244,9 +468,10 @@ def get_eos_token_ids(model_path: str) -> Optional[List[int]]:
     return
 
 
-def get_model_architectures(model_path: str):
+def get_model_architectures(model_dir_or_paths: Union[str, ModelPaths]):
+    paths = create_model_paths(model_dir_or_paths)
     try:
-        config_json = get_config_json(model_path)
+        config_json = get_model_config(paths)
         arch = config_json["architectures"][0]
         return arch
     except:
@@ -254,9 +479,13 @@ def get_model_architectures(model_path: str):
         return "unknown_architecture"
 
 
-def get_vocab_size(model_path: str):
+def get_vocab_size(paths: Optional[Union[str, ModelPaths]] = None) -> int:
     try:
-        config_json = get_config_json(model_path)
+        if paths is None:
+            paths = get_model_paths()
+        elif not isinstance(paths, ModelPaths):
+            paths = create_model_paths(paths)
+        config_json = get_model_config(paths)
         # qwen3-omini special
         if "thinker_config" in config_json:
             config_json = config_json["thinker_config"]
@@ -275,8 +504,9 @@ def get_vocab_size(model_path: str):
         return 0
 
 
-def get_dtype(model_path: str):
-    torch_dtype = _get_config_llm_keyvalue(model_path=model_path, key_name=["torch_dtype", "dtype", "model_dtype"])
+def get_dtype(model_dir_or_paths: Union[str, ModelPaths]):
+    paths = create_model_paths(model_dir_or_paths)
+    torch_dtype = _get_config_llm_keyvalue(paths, key_name=["torch_dtype", "dtype", "model_dtype"])
     if torch_dtype is None:
         logger.warning("torch_dtype not in config.json, use float16 as default")
         return "float16"
@@ -286,8 +516,7 @@ def get_dtype(model_path: str):
 
 @lru_cache(maxsize=None)
 def get_fixed_kv_len():
-    start_args = get_env_start_args()
-    model_cfg = get_config_json(start_args.model_dir)
+    model_cfg = get_model_config(get_model_paths())
     if "prompt_cache_token_ids" in model_cfg:
         return len(model_cfg["prompt_cache_token_ids"])
     else:
@@ -295,11 +524,10 @@ def get_fixed_kv_len():
 
 
 @lru_cache(maxsize=None)
-def has_vision_module(model_path: str) -> bool:
+def has_vision_module(model_dir_or_paths: Union[str, ModelPaths]) -> bool:
+    paths = create_model_paths(model_dir_or_paths)
     try:
-        from transformers.configuration_utils import PretrainedConfig
-
-        model_cfg, _ = PretrainedConfig.get_config_dict(model_path)
+        model_cfg = get_model_config(paths)
         model_type = model_cfg["model_type"]
         if model_type == "qwen":
             # QWenVisionTransformer
@@ -338,16 +566,15 @@ def has_vision_module(model_path: str) -> bool:
         else:
             raise Exception("unknown vision model type")
     except:
-        logger.info(f"model path: {model_path} does not has vision module")
+        logger.info(f"model path: {paths.model_dir} does not has vision module")
         return False
 
 
 @lru_cache(maxsize=None)
-def has_audio_module(model_path: str) -> bool:
+def has_audio_module(model_dir_or_paths: Union[str, ModelPaths]) -> bool:
+    paths = create_model_paths(model_dir_or_paths)
     try:
-        from transformers.configuration_utils import PretrainedConfig
-
-        model_cfg, _ = PretrainedConfig.get_config_dict(model_path)
+        model_cfg = get_model_config(paths)
         if model_cfg.get("thinker_config") is not None:
             model_cfg = model_cfg["thinker_config"]
         audio_config = model_cfg["audio_config"]
@@ -361,40 +588,39 @@ def has_audio_module(model_path: str) -> bool:
         else:
             raise Exception("unknown audio model type")
     except:
-        logger.info(f"model path: {model_path} does not has audio module")
+        logger.info(f"model path: {paths.model_dir} does not has audio module")
         return False
 
 
 @lru_cache(maxsize=None)
-def is_linear_att_mixed_model(model_path: str) -> bool:
+def is_linear_att_mixed_model(model_dir_or_paths: Union[str, ModelPaths]) -> bool:
+    paths = create_model_paths(model_dir_or_paths)
     try:
-        from transformers.configuration_utils import PretrainedConfig
-
-        model_cfg, _ = PretrainedConfig.get_config_dict(model_path)
+        model_cfg = get_model_config(paths)
         model_type = model_cfg["model_type"]
         if model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"]:
             return True
         else:
             return False
     except:
-        logger.info(f"model path: {model_path} does not has linear hybrid attention")
+        logger.info(f"model path: {paths.model_dir} does not has linear hybrid attention")
         return False
 
 
-def get_model_type(model_path: str) -> Optional[str]:
-    """Get model type from config.json"""
+def get_model_type(paths: Union[str, ModelPaths]) -> Optional[str]:
+    """Get model type from model config."""
     try:
-        config_json = get_config_json(model_path)
+        config_json = get_model_config(paths)
         model_type = config_json.get("model_type") or config_json.get("text_config", {}).get("model_type")
         return model_type
     except Exception as e:
-        logger.error(f"Failed to get model_type from {model_path}: {e}")
+        logger.error(f"Failed to get model_type (paths={paths!r}): {e}")
         return None
 
 
-def get_tool_call_parser_for_model(model_path: str) -> Optional[str]:
+def get_tool_call_parser_for_model(paths: Union[str, ModelPaths]) -> Optional[str]:
     """Auto-detect tool_call_parser based on model type"""
-    model_type = get_model_type(model_path)
+    model_type = get_model_type(paths)
     if model_type is None:
         return None
 
@@ -421,9 +647,8 @@ def get_tool_call_parser_for_model(model_path: str) -> Optional[str]:
     return None
 
 
-def get_reasoning_parser_for_model(model_path: str) -> Optional[str]:
-    """Auto-detect reasoning_parser based on model type"""
-    model_type = get_model_type(model_path)
+def get_reasoning_parser_for_model(paths: Union[str, ModelPaths]) -> Optional[str]:
+    model_type = get_model_type(paths)
     if model_type is None:
         return None
 

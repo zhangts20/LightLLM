@@ -2,6 +2,7 @@ import torch
 from .impl import ChunkedPrefillBackend
 from typing import List
 from lightllm.server.router.model_infer.infer_batch import g_infer_context, InferReq
+from lightllm.utils.config_utils import create_model_paths
 from lightllm.server.tokenizer import get_tokenizer
 from lightllm.utils.log_utils import init_logger
 
@@ -21,7 +22,14 @@ class TokenHealingBackend(ChunkedPrefillBackend):
         初始化tokenizer 词表相关的的操作
         """
         self.tokenizer = get_tokenizer(
-            self.args.model_dir, self.args.tokenizer_mode, trust_remote_code=self.args.trust_remote_code
+            create_model_paths(
+                self.args.model_dir,
+                config_path=self.args.config_path,
+                tokenizer_dir=self.args.tokenizer_dir,
+                mmproj_path=self.args.mmproj_path,
+            ),
+            tokenizer_mode=self.args.tokenizer_mode,
+            trust_remote_code=self.args.trust_remote_code,
         )
         vob_dict = self.tokenizer.get_vocab()
         self.token_to_token_id = vob_dict

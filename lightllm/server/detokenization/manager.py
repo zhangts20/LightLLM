@@ -12,7 +12,7 @@ from typing import Union, Dict, List
 from .decode import decode_token
 from .decode_mode_fix import decode_mode_fix
 from .decode_req import DecodeReq
-from ..tokenizer import get_tokenizer
+from ..tokenizer import create_model_paths, get_tokenizer
 import pickle
 import time
 from lightllm.utils.log_utils import init_logger
@@ -34,7 +34,16 @@ class DeTokenizationManager:
         self.pub_to_httpserver = context.socket(zmq.PUB)
         self.pub_to_httpserver.bind(f"{args.zmq_mode}127.0.0.1:{args.http_server_port}")
         logger.info(f"pub_to_httpserver sendhwm {self.pub_to_httpserver.getsockopt(zmq.SNDHWM)}")
-        self.tokenizer = get_tokenizer(args.model_dir, args.tokenizer_mode, trust_remote_code=args.trust_remote_code)
+        self.tokenizer = get_tokenizer(
+            create_model_paths(
+                args.model_dir,
+                config_path=args.config_path,
+                tokenizer_dir=args.tokenizer_dir,
+                mmproj_path=args.mmproj_path,
+            ),
+            tokenizer_mode=args.tokenizer_mode,
+            trust_remote_code=args.trust_remote_code,
+        )
         self.all_special_ids = set(self.tokenizer.all_special_ids)
         self.req_id_to_out: Dict[int, DecodeReq] = {}
         self.eos_id = args.eos_id

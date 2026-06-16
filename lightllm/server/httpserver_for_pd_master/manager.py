@@ -12,7 +12,7 @@ from lightllm.server.core.objs import FinishStatus
 from ..pd_io_struct import PD_Client_Obj, UpKVStatus, NixlUpKVStatus, ObjType, NodeRole, NIXLDecodeNodeInfo
 from lightllm.server.core.objs import SamplingParams, StartArgs
 from ..multimodal_params import MultimodalParams
-from ..tokenizer import get_tokenizer
+from ..tokenizer import create_model_paths, get_tokenizer
 from ..req_id_generator import ReqIDGenerator, convert_sub_id_to_group_id
 from fastapi import Request
 from lightllm.utils.log_utils import init_logger
@@ -42,7 +42,16 @@ class HttpServerManagerForPDMaster:
         self.req_id_to_out_inf: Dict[int, ReqStatus] = {}
         self.infos_queues = None  # 这个需要延迟初始化，否则使用的loop不对
 
-        self.tokenizer = get_tokenizer(args.model_dir, args.tokenizer_mode, trust_remote_code=args.trust_remote_code)
+        self.tokenizer = get_tokenizer(
+            create_model_paths(
+                args.model_dir,
+                config_path=args.config_path,
+                tokenizer_dir=args.tokenizer_dir,
+                mmproj_path=args.mmproj_path,
+            ),
+            tokenizer_mode=args.tokenizer_mode,
+            trust_remote_code=args.trust_remote_code,
+        )
 
         self.first_time_costs = MovingAverage()
         self.per_token_costs = MovingAverage()

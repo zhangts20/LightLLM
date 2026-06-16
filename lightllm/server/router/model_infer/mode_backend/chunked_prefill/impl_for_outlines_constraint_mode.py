@@ -7,6 +7,7 @@ from .impl import ChunkedPrefillBackend
 from lightllm.server.core.objs import FinishStatus
 from lightllm.server.router.model_infer.infer_batch import g_infer_context, InferReq
 from lightllm.server.tokenizer import get_tokenizer
+from lightllm.utils.config_utils import create_model_paths
 from typing import List, Tuple
 from lightllm.utils.log_utils import init_logger
 
@@ -35,7 +36,16 @@ class OutlinesConstraintBackend(ChunkedPrefillBackend):
         from outlines.models.transformers import TransformerTokenizer
 
         self.tokenizer = TransformerTokenizer(
-            get_tokenizer(self.args.model_dir, self.args.tokenizer_mode, trust_remote_code=self.args.trust_remote_code)
+            get_tokenizer(
+                create_model_paths(
+                    self.args.model_dir,
+                    config_path=self.args.config_path,
+                    tokenizer_dir=self.args.tokenizer_dir,
+                    mmproj_path=self.args.mmproj_path,
+                ),
+                tokenizer_mode=self.args.tokenizer_mode,
+                trust_remote_code=self.args.trust_remote_code,
+            ),
         )
         eos_token_ids = []
         eos_token_ids.append(self.tokenizer.eos_token_id)
