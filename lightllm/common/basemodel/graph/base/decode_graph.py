@@ -18,6 +18,25 @@ from .infer_struct import InferStateInfo
 
 logger = init_logger(__name__)
 
+_DECODE_GRAPH_REGISTRY: dict[str, type["DecodeGraph"]] = {}
+
+
+def register_decode_graph(*platforms: str):
+    """Register a DecodeGraph subclass for one or more hardware platforms."""
+
+    def decorator(cls: type["DecodeGraph"]) -> type["DecodeGraph"]:
+        for platform in platforms:
+            if platform in _DECODE_GRAPH_REGISTRY:
+                existing = _DECODE_GRAPH_REGISTRY[platform]
+                raise ValueError(
+                    f"DecodeGraph for platform {platform!r} already registered as "
+                    f"{existing.__module__}.{existing.__qualname__}"
+                )
+            _DECODE_GRAPH_REGISTRY[platform] = cls
+        return cls
+
+    return decorator
+
 
 class DecodeGraph:
 
@@ -61,7 +80,12 @@ class DecodeGraph:
     ):
         if cls is not DecodeGraph:
             return object.__new__(cls)
-        impl_cls = cls.PLATFORM_CLASS_MAP[platform_backend]
+        impl_cls = _DECODE_GRAPH_REGISTRY.get(platform_backend)
+        if impl_cls is None:
+            raise RuntimeError(
+                f"No DecodeGraph registered for platform {platform_backend!r}. "
+                f"Registered: {sorted(_DECODE_GRAPH_REGISTRY)}"
+            )
         return object.__new__(impl_cls)
 
     def __init__(
