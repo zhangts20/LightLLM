@@ -5,7 +5,9 @@ from lightllm.common.kv_cache_mem_manager import MemoryManager
 from lightllm.common.req_manager import ReqManager
 from lightllm.distributed import CustomProcessGroup
 from typing import Tuple, Any, Optional, List
-from .triton_kernel.gen_prefill_params import gen_prefill_params
+
+from lightllm.platform import get_backend
+from .triton_kernel.gen_prefill_params import gen_prefill_params 
 from .triton_kernel.gen_decode_params import gen_decode_params
 from .triton_kernel.multimodal_emb import mark_multimodal_obj
 from .batch_objs import ModelInput
@@ -68,7 +70,9 @@ class InferStateInfo:
         # b1 开头的tensor变量其shape为[batch_size + 1,]
         self.b_q_seq_len: torch.Tensor = None
         self.b1_cu_q_seq_len: torch.Tensor = None
+        self.b1_cu_q_seq_len_cpu: torch.Tensor = None
         self.b_kv_seq_len: torch.Tensor = None
+        self.b_kv_seq_len_cpu: torch.Tensor = None
         self.b1_cu_kv_seq_len: torch.Tensor = None
         self.position_ids: torch.Tensor = None
         self.max_q_seq_len: int = None
@@ -100,6 +104,14 @@ class InferStateInfo:
         self.dp_output_split_sizes: List[List[int]] = None
         self.dp_input_split_sizes: List[List[int]] = None
 
+        self.platform_backend = get_backend()
+
+        if self.platform_backend.name == "ascend":
+            from lightllm.common.basemodel.graph.acl_graph import SeqLenManager
+
+            args = get_env_start_args()
+            self.seq_len_manager = SeqLenManager(args.running_max_req_size + 1)
+
     def init_some_extra_state(self, model):
         if self.is_prefill:
             (
@@ -123,6 +135,12 @@ class InferStateInfo:
                 self.position_ids,
             ) = gen_decode_params(self.b_seq_len)
             self.b_kv_start_loc = self.b1_cu_kv_seq_len[0:-1]
+        if self.platform_backend.name == "ascend":
+            self.seq_len_manager.update(self.b1_cu_q_seq_len, self.b_kv_seq_len)
+            self.b1_cu_q_seq_len_cpu, self.b_cu_kv_seq_len_cpu = self.seq_len_manager.get_tensor_slices()
+        else:
+            self.b1_cu_q_seq_len_cpu = [] 
+            self.b_cu_kv_seq_len_cpu = [] 
 
     def init_att_state(self):
         if self.is_prefill:
@@ -172,8 +190,8 @@ class InferStateInfo:
 
         args = get_env_start_args()
 
-        dp_input_lens = torch.empty(size=(args.dp,), device="cuda", dtype=torch.int32)
-        input_len = torch.empty(size=(1,), device="cuda", dtype=torch.int32)
+        dp_input_lens = torch.empty(size=(args.dp,), device=input_ids.device, dtype=torch.int32)
+        input_len = torch.empty(size=(1,), device=input_ids.device, dtype=torch.int32)
         input_len.fill_(len(input_ids))
         dist.all_gather_into_tensor(
             output_tensor=dp_input_lens,
@@ -302,7 +320,7 @@ class InferStateInfo:
         dest_data = g_cache_manager.alloc_tensor(
             shape=(handle_len * scale_size,),
             data_type=data.dtype,
-            device="cuda",
+            device=data.device,
         )
         dist.all_to_all_single(
             output=dest_data.view(-1),
@@ -332,7 +350,7 @@ class InferStateInfo:
         origin_data = g_cache_manager.alloc_tensor(
             shape=(origin_len * scale_size,),
             data_type=data.dtype,
-            device="cuda",
+            device=data.device,
         )
         dist.all_to_all_single(
             output=origin_data.view(-1),
@@ -348,19 +366,19 @@ class InferStateInfo:
     def prefill_cuda_graph_create_graph_obj(self):
         if not hasattr(self, "prefill_cuda_graph_exe_list"):
             self.prefill_cuda_graph_exe_list = []
-        graph_obj = torch.cuda.CUDAGraph()
-        capture_graph = torch.cuda.graph(graph_obj, pool=self.mem_pool)
+        graph_obj = self.platform_backend.graph.create_graph()
+        capture_graph = self.platform_backend.graph.graph(graph_obj, pool=self.mem_pool)
         self.prefill_cuda_graph_exe_list.append((graph_obj, capture_graph))
         return
 
-    def prefill_cuda_graph_get_current_capture_graph(self) -> torch.cuda.graph:
+    def prefill_cuda_graph_get_current_capture_graph(self) -> Any:
         assert len(self.prefill_cuda_graph_exe_list) > 0, "no cuda graph exe obj found"
         if isinstance(self.prefill_cuda_graph_exe_list[-1], tuple):
             return self.prefill_cuda_graph_exe_list[-1][1]
         else:
             return self.prefill_cuda_graph_exe_list[-2][1]
 
-    def prefill_cuda_graph_add_cpu_runnning_func(self, func, after_graph: torch.cuda.graph):
+    def prefill_cuda_graph_add_cpu_runnning_func(self, func, after_graph: Any):
         if not hasattr(self, "prefill_cuda_graph_exe_list"):
             self.prefill_cuda_graph_exe_list = []
         if after_graph is None:
@@ -377,7 +395,7 @@ class InferStateInfo:
         for func in self.prefill_cuda_graph_exe_list:
             if isinstance(func, tuple):
                 graph_obj, _ = func
-                graph_obj.replay()
+                self.platform_backend.graph.replay_graph(graph_obj)
             else:
                 func(new_infer_state)
         return

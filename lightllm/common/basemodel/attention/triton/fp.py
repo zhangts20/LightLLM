@@ -2,8 +2,10 @@ import dataclasses
 import torch
 from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, AttControl
 from typing import Optional
+from lightllm.platform.base.attention import register_att_backend
 
 
+@register_att_backend(name="triton", category="standard", platforms=("cuda",))
 class TritonAttBackend(BaseAttBackend):
     def create_att_prefill_state(self, infer_state) -> "TritonPrefillAttState":
         return TritonPrefillAttState(backend=self, infer_state=infer_state)
@@ -62,7 +64,7 @@ class TritonPrefillAttState(BasePrefillAttState):
     def _nomarl_prefill_att(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alloc_func=torch.empty):
         from ...triton_kernel.att.prefill_att.context_flashattention_nopad import context_attention_fwd
 
-        out = alloc_func(q.shape, q.dtype)
+        out = alloc_func(q.shape, q.dtype, device=q.device)
         context_attention_fwd(
             q,
             k,

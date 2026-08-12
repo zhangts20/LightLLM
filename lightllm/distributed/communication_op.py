@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp, ProcessGroup
 from typing import List, Dict, Optional, Union
+from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.device_utils import has_nvlink
 from lightllm.utils.envs_utils import (
@@ -56,13 +57,15 @@ class CustomProcessGroup:
         self.symm_mem_reduce = None
         self.flashinfer_reduce = None
         self.dp_world_size = get_dp_world_size()
-        self.device_group = create_new_group_for_current_dp("nccl")
+        dist_backend = get_backend().runtime.dist_backend
+        self.device_group = create_new_group_for_current_dp(dist_backend)
         if get_env_start_args().enable_dp_prefill_balance:
-            self.dp_prefill_balance_group = create_dp_special_inter_group("nccl")
+            self.dp_prefill_balance_group = create_dp_special_inter_group(dist_backend)
         else:
             self.dp_prefill_balance_group = None
 
         self.autotune_group = dist.new_group([i for i in range(get_global_world_size())], backend="gloo")
+        self.backend_runtime = get_backend().runtime
 
     def _support_custom_allreduce(self) -> bool:
         return has_nvlink() and self.dp_world_size in [2, 4, 6, 8]
@@ -73,7 +76,7 @@ class CustomProcessGroup:
         from .symm_mem_all_reduce import SymmMemAllreduce
 
         data_type = get_torch_dtype(get_env_start_args().data_type)
-        symm = SymmMemAllreduce(self.device_group, torch.cuda.current_device(), dtype=data_type)
+        symm = SymmMemAllreduce(self.device_group, self.backend_runtime.current_device(), dtype=data_type)
         if not symm.disabled:
             self.symm_mem_reduce = symm
             logger.info("Enable SymmMem ALLReduce.")
@@ -84,7 +87,7 @@ class CustomProcessGroup:
         from .flashinfer_all_reduce import FlashInferAllReduce
 
         fi_cpu_group = create_new_group_for_current_dp("gloo")
-        fi = FlashInferAllReduce(fi_cpu_group, torch.cuda.current_device())
+        fi = FlashInferAllReduce(fi_cpu_group, self.backend_runtime.current_device())
         if not fi.disabled:
             self.flashinfer_reduce = fi
             logger.info("Enable FlashInfer ALLReduce.")

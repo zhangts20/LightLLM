@@ -4,8 +4,10 @@ from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, 
 from lightllm.utils.dist_utils import get_dp_world_size, get_current_device_id
 from ...triton_kernel.repack_kv_index import repack_kv_index
 from .env_utils import set_flashinfer_envs
+from lightllm.platform.base.attention import register_att_backend
 
 
+@register_att_backend(name="flashinfer", category="standard", platforms=("cuda",))
 class FlashInferAttBackend(BaseAttBackend):
     def __init__(self, model):
         set_flashinfer_envs()
@@ -110,7 +112,7 @@ class FlashInferPrefillAttState(BasePrefillAttState):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alloc_func=torch.empty
     ) -> torch.Tensor:
         self.backend: FlashInferAttBackend = self.backend  # for typing
-        o_tensor = alloc_func(q.shape, q.dtype, device="cuda")
+        o_tensor = alloc_func(q.shape, q.dtype, device=q.device)
         self.prefill_wrapper.run(
             q,
             (k.unsqueeze(1), v.unsqueeze(1)),

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Any, Union
 from lightllm.common.req_manager import ReqManager, ReqManagerForMamba
 from lightllm.utils.infer_utils import mark_start, mark_end
+from lightllm.platform import get_backend
 from lightllm.server.core.objs import Req, SamplingParams, FinishStatus, ShmReqManager
 from lightllm.server.router.dynamic_prompt.radix_cache import RadixCache, TreeNode
 from lightllm.server.router.dynamic_prompt.linear_att_radix_cache import (
@@ -38,8 +39,8 @@ class InferenceContext:
     vocab_size = None
     cpu_embed_cache_client: Optional[CpuEmbedCacheClient] = None
 
-    overlap_stream: torch.cuda.Stream = None  # 一些情况下推理进程进行异步折叠操作的异步流对象。
-    cpu_kv_cache_stream: torch.cuda.Stream = None  # 用 cpu kv cache 操作的 stream
+    overlap_stream: Any = None  # 一些情况下推理进程进行异步折叠操作的异步流对象。
+    cpu_kv_cache_stream: Any = None  # 用 cpu kv cache 操作的 stream
     is_linear_att_mixed_model: bool = False  # 标记模型是否是full att 混合 linear att 的混合模型。
 
     def register(
@@ -66,20 +67,22 @@ class InferenceContext:
 
         self.is_linear_att_mixed_model = isinstance(self.req_manager, ReqManagerForMamba)
 
+        self.platform_backend = get_backend()
+
         return
 
     def init_cpu_embed_cache_client(self):
         self.cpu_embed_cache_client = CpuEmbedCacheClient(create_meta_data=False, init_shm_data=False)
         return
 
-    def get_overlap_stream(self) -> torch.cuda.Stream:
+    def get_overlap_stream(self) -> Any:
         if self.overlap_stream is None:
-            self.overlap_stream = torch.cuda.Stream()
+            self.overlap_stream = self.platform_backend.runtime.create_stream()
         return self.overlap_stream
 
-    def get_cpu_kv_cache_stream(self) -> torch.cuda.Stream:
+    def get_cpu_kv_cache_stream(self) -> Any:
         if self.cpu_kv_cache_stream is None:
-            self.cpu_kv_cache_stream = torch.cuda.Stream()
+            self.cpu_kv_cache_stream = self.platform_backend.runtime.create_stream()
         return self.cpu_kv_cache_stream
 
     def add_reqs(self, requests: List[Tuple[int, int, Any, int]], init_prefix_cache: bool = True) -> List["InferReq"]:
@@ -373,7 +376,7 @@ class InferenceContext:
 
         assert len(b_req_idx) == len(big_page_buffer_ids)
         big_page_buffer_ids = torch.tensor(big_page_buffer_ids, dtype=torch.int32, requires_grad=False, device="cpu")
-        big_page_buffer_ids = big_page_buffer_ids.cuda(non_blocking=True)
+        big_page_buffer_ids = big_page_buffer_ids.to(device=b_req_idx.device, non_blocking=True)
 
         from lightllm.common.basemodel.triton_kernel.linear_att_copy import copy_linear_att_state_to_kv_buffer
 
@@ -513,6 +516,7 @@ class InferReq:
         self.shm_index = shm_index
         self.multimodal_params = multimodal_params
         self.vocab_size = vocab_size
+        self.last_kv_mem_index = -1
 
         # 请求需要被暂停
         self.wait_pause = False
@@ -626,6 +630,7 @@ class InferReq:
                 # 从 cpu 到 gpu 是流内阻塞操作
                 g_infer_context.req_manager.req_to_token_indexs[self.req_idx, 0:ready_cache_len] = value_tensor
                 self.cur_kv_len = int(ready_cache_len)  # 序列化问题, 该对象可能为numpy.int64，用 int(*)转换
+                self.last_kv_mem_index = value_tensor[-1].item() if ready_cache_len > 0 else -1
                 self.shm_req.prompt_cache_len = self.cur_kv_len  # 记录 prompt cache 的命中长度
 
         self.shm_req.shm_cur_kv_len = self.cur_kv_len

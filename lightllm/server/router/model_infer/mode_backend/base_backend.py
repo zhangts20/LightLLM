@@ -6,6 +6,7 @@ import threading
 import torch.distributed as dist
 from typing import List, Tuple, Callable, Optional
 from transformers.configuration_utils import PretrainedConfig
+from lightllm.platform import get_backend
 from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.log_utils import init_logger
 from lightllm.models import get_model
@@ -17,10 +18,11 @@ from lightllm.common.req_manager import ReqManagerForMamba
 from lightllm.common.linear_att_cache_manager import LinearAttCacheManager
 from lightllm.server.router.dynamic_prompt.linear_att_radix_cache import LinearAttPagedRadixCache
 from lightllm.server.router.dynamic_prompt.radix_cache import RadixCache
+from lightllm.server.router.dynamic_prompt.paged_radix_cache import PagedRadixCache
 from lightllm.common.basemodel.batch_objs import ModelOutput, ModelInput
 from lightllm.common.basemodel.triton_kernel.mtp_utils import mtp_verify
 from lightllm.utils.dist_utils import init_distributed_env
-from lightllm.utils.envs_utils import get_unique_server_name
+from lightllm.utils.envs_utils import get_page_size, get_unique_server_name
 from lightllm.server.core.objs import ShmReqManager, StartArgs
 from lightllm.server.core.objs.io_objs import AbortedReqCmd, StopStrMatchedReqCmd
 from lightllm.server.router.model_infer.infer_batch import g_infer_context
@@ -81,7 +83,10 @@ class ModeBackend:
         self._radix_tree_merge_counter: int = 0
         self._enable_radix_tree_timer_merge: bool = enable_radix_tree_timer_merge()
         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
-        pass
+
+    @property
+    def backend_runtime(self):
+        return get_backend().runtime
 
     def init_model(self, kvargs):
         self.args: StartArgs = kvargs.get("args", None)
@@ -199,11 +204,12 @@ class ModeBackend:
                     linear_att_small_page_buffers=self.linear_att_cache_manager,
                 )
             else:
-                self.radix_cache = RadixCache(
+                radix_cacahe_class = PagedRadixCache if get_page_size() > 1 else RadixCache
+                self.radix_cache = radix_cacahe_class(
                     unique_name=get_unique_server_name(),
                     total_token_num=self.model.mem_manager.size,
                     rank_in_node=self.rank_in_node,
-                    mem_manager=self.model.mem_manager,
+                    mem_manager=self.model.mem_manager
                 )
 
         if "prompt_cache_kv_buffer" in model_cfg:
@@ -220,26 +226,31 @@ class ModeBackend:
             vocab_size=self.model.vocab_size,
         )
 
+        device = self.backend_runtime.target_device()
+
         # 初始化 dp 模式使用的通信 tensor, 对于非dp模式，不会使用到
         if self.dp_size > 1:
-            self.dp_reduce_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
-            self.dp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
+            self.dp_reduce_tensor = torch.tensor([0], dtype=torch.int32, device=device, requires_grad=False)
+            self.dp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device=device, requires_grad=False)
             self.dp_all_gather_tensor = torch.tensor(
-                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device="cuda", requires_grad=False
+                [0 for _ in range(self.global_world_size)],
+                dtype=torch.int32,
+                device=device,
+                requires_grad=False,
             )
 
         # 用于协同读取 ShmObjsIOBuffer 中的请求信息的通信tensor和通信组对象。
-        self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device="cuda", requires_grad=False)
-        self.node_nccl_group = create_new_group_for_current_node("nccl")
+        self.node_broadcast_tensor = torch.tensor([0], dtype=torch.int32, device=device, requires_grad=False)
+        self.node_nccl_group = create_new_group_for_current_node(self.backend_runtime.dist_backend)
 
         # 用于在多节点tp模式下协同读取 ShmObjsIOBuffer 中的请求信息的通信tensor和通信组对象。
         if self.is_multinode_tp:
-            self.multinode_tp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device="cuda")
+            self.multinode_tp_gather_item_tensor = torch.tensor([0], dtype=torch.int32, device=device)
             self.multinode_tp_all_gather_tensor = torch.tensor(
-                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device="cuda", requires_grad=False
+                [0 for _ in range(self.global_world_size)], dtype=torch.int32, device=device, requires_grad=False
             )
             self.multinode_tp_nccl_group = dist.new_group(
-                [rank for rank in range(self.global_world_size)], backend="nccl"
+                [rank for rank in range(self.global_world_size)], backend=self.backend_runtime.dist_backend
             )
 
         if (
@@ -279,7 +290,7 @@ class ModeBackend:
         from lightllm.server.router.model_infer.mode_backend.dp_backend.dp_shared_kv_trans import DPKVSharedMoudle
         from lightllm.common.kv_cache_mem_manager import MemoryManager
 
-        torch.cuda.set_device(get_current_device_id())
+        self.backend_runtime.set_device(get_current_device_id())
 
         self.dp_kv_shared_module = DPKVSharedMoudle(
             max_req_num=self.args.running_max_req_size,
@@ -481,7 +492,7 @@ class ModeBackend:
                                 )
                                 # to do 这个地方是否需要加流同步
                                 req_to_next_token_ids[req.req_idx, 0:1].fill_(obj.first_gen_token_id)
-                                torch.cuda.current_stream().synchronize()
+                                self.backend_runtime.current_stream().synchronize()
                                 InferReqUpdatePack(req_obj=req, output_len=req.cur_output_len).handle(
                                     next_token_id=obj.first_gen_token_id,
                                     next_token_logprob=obj.first_gen_token_logprob,
@@ -807,7 +818,7 @@ class ModeBackend:
         if is_prefill:
             b_has_out = g_pin_mem_manager.gen_from_list(
                 key="b_has_out", data=b_prefill_has_output_cpu, dtype=torch.bool
-            ).cuda(non_blocking=True)
+            ).to(device=logits.device, non_blocking=True)
 
         scatter_token(
             next_token_ids=next_token_ids,

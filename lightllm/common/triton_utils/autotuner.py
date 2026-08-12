@@ -9,6 +9,7 @@ import collections
 from pathlib import Path
 from tqdm import tqdm
 from frozendict import frozendict
+from lightllm.platform import get_backend
 from lightllm.utils.device_utils import get_current_device_name
 from lightllm.utils.log_utils import init_logger
 from typing import Callable, Optional, Union, List
@@ -103,17 +104,9 @@ class Autotuner:
         run_key_distance_func: Callable = lambda run_key, config_key: abs(int(run_key) - int(config_key)),
         mutates_args: List[str] = [],
     ):
-
         self.configs_gen_func = configs_gen_func
         self.kernel_name = kernel_name
-        self.cache_dir = os.path.join(
-            Path(__file__).parent,
-            "autotune_kernel_configs",
-            get_triton_version(),
-            get_current_device_name(),
-            self.kernel_name,
-        )
-        os.makedirs(self.cache_dir, exist_ok=True)
+        self._cache_dir = None
         self.fn = fn
         self.static_key_func = static_key_func
         self.run_key_func = run_key_func
@@ -130,6 +123,7 @@ class Autotuner:
         ]
         self._run_key_func_param_names = [name for name, _ in inspect.signature(self.run_key_func).parameters.items()]
         self.mutates_args = mutates_args
+        self._platform_backend = None
 
         assert get_triton_autotune_level() in [
             AutotuneLevel.USE_AUTOTUNE_HIS_CONFIG,
@@ -138,6 +132,25 @@ class Autotuner:
             AutotuneLevel.CLOSE_AUTOTUNE,
         ]
         return
+
+    @property
+    def platform_backend(self):
+        if self._platform_backend is None:
+            self._platform_backend = get_backend()
+        return self._platform_backend
+
+    @property
+    def cache_dir(self) -> str:
+        if self._cache_dir is None:
+            self._cache_dir = os.path.join(
+                Path(__file__).parent,
+                "autotune_kernel_configs",
+                get_triton_version(),
+                get_current_device_name(),
+                self.kernel_name,
+            )
+            os.makedirs(self._cache_dir, exist_ok=True)
+        return self._cache_dir
 
     @torch.no_grad()
     def __call__(self, *args, **kwargs):
@@ -253,19 +266,19 @@ class Autotuner:
             # warmup
             kernel_call()
 
-            torch.cuda.current_stream().synchronize()
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, stream=torch.cuda.Stream()):
+            self.platform_backend.runtime.current_stream().synchronize()
+            g = self.platform_backend.graph.create_graph()
+            with self.platform_backend.graph.graph(g, stream=self.platform_backend.runtime.create_stream()):
                 for _ in range(n_repeat):
                     kernel_call()
-            torch.cuda.current_stream().synchronize()
+            self.platform_backend.runtime.current_stream().synchronize()
 
             state = _BenchmarkState()
             for i in range(n_retries):
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
+                start_event = self.platform_backend.runtime.create_event(enable_timing=True)
+                end_event = self.platform_backend.runtime.create_event(enable_timing=True)
                 start_event.record()
-                g.replay()
+                self.platform_backend.graph.replay_graph(g)
                 end_event.record()
                 end_event.synchronize()
                 state.update(start_event.elapsed_time(end_event) / n_repeat)

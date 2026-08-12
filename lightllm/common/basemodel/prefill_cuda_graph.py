@@ -3,29 +3,34 @@ import torch
 import copy
 import bisect
 import triton
-from typing import List, Tuple
-from typing import Optional
+from typing import List, Tuple, Optional
+from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.tensor_utils import tensor_to_no_ref_tensor
 from lightllm.distributed import dist_group_manager
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
+from lightllm.common.basemodel.graph.base.decode_graph import DecodeGraph
 from .infer_struct import InferStateInfo
-from .cuda_graph import CudaGraph
 
 logger = init_logger(__name__)
 
 
 class PrefillCudaGraph:
-    # CudaGraph forward pass for the decoding stage.
 
-    def __init__(self, decode_cuda_graph: CudaGraph, tp_world_size: int):
+    def __init__(self, decode_cuda_graph: Optional[DecodeGraph], tp_world_size: int):
         self.graph = {}
         self.tp_world_size = tp_world_size
+
         if decode_cuda_graph is not None:
+            self.platform_backend = decode_cuda_graph.platform_backend
+            self.target_device = decode_cuda_graph.target_device
             self.mempool = decode_cuda_graph.mempool  # prefill 和 decode 共享一个 mempool
         else:
-            self.mempool = torch.cuda.graph_pool_handle() if torch.cuda.is_available() else None
+            self.platform_backend = get_backend()
+            self.target_device = self.platform_backend.runtime.target_device()
+            self.mempool = self.platform_backend.graph.graph_pool_handle() \
+                if self.platform_backend.runtime.is_available() else None
 
         self.args = get_env_start_args()
         self.enable_prefill_microbatch_overlap = self.args.enable_prefill_microbatch_overlap
@@ -165,14 +170,14 @@ class PrefillCudaGraph:
         for handle_token_num in self.graph_handle_token_nums[::-1]:
             logger.info(f"Capture prefill cudagraph, handle_token_num: {handle_token_num}")
             total_token_num = handle_token_num
-            input_ids = torch.tensor([1 for _ in range(total_token_num)], dtype=torch.int32, device="cuda")
-            mem_indexes = model.mem_manager.alloc(len(input_ids)).cuda()
-            b_req_idx = torch.tensor([model.req_manager.HOLD_REQUEST_ID], dtype=torch.int32, device="cuda")
-            b_seq_len = torch.empty(1, dtype=torch.int32, device="cuda")
+            input_ids = torch.tensor([1 for _ in range(total_token_num)], dtype=torch.int32, device=self.target_device)
+            mem_indexes = model.mem_manager.alloc(len(input_ids)).to(device=self.target_device, non_blocking=True)
+            b_req_idx = torch.tensor([model.req_manager.HOLD_REQUEST_ID], dtype=torch.int32, device=self.target_device)
+            b_seq_len = torch.empty(1, dtype=torch.int32, device=self.target_device)
             b_seq_len.fill_(total_token_num)
-            b_mtp_index = torch.zeros(1, dtype=torch.int32, device="cuda")
-            b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device="cuda")
-            b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device="cuda")
+            b_mtp_index = torch.zeros(1, dtype=torch.int32, device=self.target_device)
+            b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device=self.target_device)
+            b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device=self.target_device)
 
             model_input = ModelInput(
                 batch_size=1,
@@ -206,7 +211,7 @@ class PrefillCudaGraph:
             for var_name, var_value in list(locals().items()):
                 if isinstance(var_value, torch.Tensor):
                     del locals()[var_name]
-            torch.cuda.empty_cache()
+            self.platform_backend.runtime.empty_cache()
 
         logger.info(
             f"Capture repfill cudagraph success, token_num <={self.max_handle_token_num} " f"will infer with cudagraph."
@@ -225,14 +230,14 @@ class PrefillCudaGraph:
             for micro_batch_index in [0, 1]:
                 # dummy prefill, capture the cudagraph
                 total_token_num = handle_token_num
-                input_ids = torch.tensor([1 for _ in range(total_token_num)], dtype=torch.int32, device="cuda")
-                mem_indexes = model.mem_manager.alloc(len(input_ids)).cuda()
-                b_req_idx = torch.tensor([model.req_manager.HOLD_REQUEST_ID], dtype=torch.int32, device="cuda")
-                b_seq_len = torch.empty(1, dtype=torch.int32, device="cuda")
+                input_ids = torch.tensor([1 for _ in range(total_token_num)], dtype=torch.int32, device=self.target_device)
+                mem_indexes = model.mem_manager.alloc(len(input_ids)).to(device=self.target_device, non_blocking=True)
+                b_req_idx = torch.tensor([model.req_manager.HOLD_REQUEST_ID], dtype=torch.int32, device=self.target_device)
+                b_seq_len = torch.empty(1, dtype=torch.int32, device=self.target_device)
                 b_seq_len.fill_(total_token_num)
-                b_mtp_index = torch.zeros(1, dtype=torch.int32, device="cuda")
-                b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device="cuda")
-                b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device="cuda")
+                b_mtp_index = torch.zeros(1, dtype=torch.int32, device=self.target_device)
+                b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device=self.target_device)
+                b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device=self.target_device)
 
                 micro_batch = ModelInput(
                     batch_size=1,
@@ -260,7 +265,7 @@ class PrefillCudaGraph:
                 for var_name, var_value in list(locals().items()):
                     if isinstance(var_value, torch.Tensor):
                         del locals()[var_name]
-                torch.cuda.empty_cache()
+                self.platform_backend.runtime.empty_cache()
 
             _, _ = model.microbatch_overlap_prefill(prefill_batches[0], prefill_batches[1])
 
@@ -273,7 +278,7 @@ class PrefillCudaGraph:
             for var_name, var_value in list(locals().items()):
                 if isinstance(var_value, torch.Tensor):
                     del locals()[var_name]
-            torch.cuda.empty_cache()
+            self.platform_backend.runtime.empty_cache()
 
         logger.info(
             f"Capture overlap cudagraph success, handle_token_num <={self.max_handle_token_num} "

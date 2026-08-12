@@ -5,8 +5,10 @@ from lightllm.utils.dist_utils import get_dp_world_size, get_current_device_id
 from ...triton_kernel.repack_kv_index import repack_kv_index
 from typing import Tuple
 from .env_utils import set_flashinfer_envs
+from lightllm.platform.base.attention import register_att_backend
 
 
+@register_att_backend(name="flashinfer", category="mla", platforms=("cuda",))
 class MlaFlashInferAttBackend(BaseAttBackend):
     def __init__(self, model):
         set_flashinfer_envs()
@@ -102,7 +104,7 @@ class MlaFlashInferPrefillAttState(BasePrefillAttState):
     ) -> torch.Tensor:
         self.backend: MlaFlashInferAttBackend = self.backend  # for typing
         k_nope, k_rope = k
-        o_tensor = alloc_func((q.shape[0], q.shape[1], v.shape[-1]), q.dtype, device="cuda")
+        o_tensor = alloc_func((q.shape[0], q.shape[1], v.shape[-1]), q.dtype, device=q.device)
         q_head_num = q.shape[1]
         k = torch.cat([k_nope, torch.repeat_interleave(k_rope, q_head_num, dim=-2)], dim=-1)
         self.prefill_wrapper.run(q, k, v, out=o_tensor)
@@ -125,7 +127,7 @@ class MlaFlashInferDecodeAttState(BaseDecodeAttState):
 
         self.kv_starts = self.infer_state.b1_cu_kv_seq_len
 
-        self.q_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+        self.q_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
         if batch_size <= model.graph_max_batch_size and self.infer_state.max_kv_seq_len <= model.graph_max_len_in_batch:
             self.kv_indices = self.backend.kv_indices_buffer[self.infer_state.microbatch_index][
                 : batch_size * self.backend.max_seq_length
