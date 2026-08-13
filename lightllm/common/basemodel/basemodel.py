@@ -19,13 +19,13 @@ from lightllm.common.infer_utils import init_req_to_token_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_manager
-from lightllm.common.basemodel.graph import DecodeGraph
+from lightllm.common.basemodel.graph import CudaGraph, DecodeGraph
 from lightllm.common.basemodel.prefill_cuda_graph import PrefillCudaGraph
 from lightllm.common.quantization import Quantcfg
 from lightllm.common.basemodel.triton_kernel.gather_token_id import gather_token, gather_token_prefill_decode_mixed
 from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.dist_utils import get_dp_world_size
+from lightllm.utils.dist_utils import get_dp_world_size, dist_barrier
 from lightllm.utils.envs_utils import get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num
 from lightllm.distributed.communication_op import dist_group_manager
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
@@ -1048,12 +1048,12 @@ class TpPartBaseModel:
             return
 
         # 做一次 同步
-        torch.distributed.barrier()
+        dist_barrier()
 
         # 模拟最大长度进行 prefill，观察是否出现 OOM
         try:
             logger.info("begin check max_len infer")
-            dummy_input_ids = torch.ones(self.batch_max_tokens, dtype=torch.int32, device=self.target_device)
+            dummy_input_ids = torch.ones(self.batch_max_tokens, dtype=torch.int64, device=self.target_device)
             b_req_idx = torch.tensor([self.req_manager.alloc()], dtype=torch.int32, device=self.target_device)
             mem_indexes = self.mem_manager.alloc(len(dummy_input_ids)).to(device=self.target_device)
             b_seq_len = torch.ones(1, dtype=torch.int32, device=self.target_device)
@@ -1111,7 +1111,7 @@ class TpPartBaseModel:
     @post_empty_cache
     def _autotune_warmup(self):
         Autotuner.start_autotune_warmup()
-        torch.distributed.barrier()
+        dist_barrier()
 
         warmup_lengths = [1, 4, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096]
 
@@ -1129,7 +1129,7 @@ class TpPartBaseModel:
                 rand_gen = torch.Generator(device=self.target_device)
                 rand_gen.manual_seed(input_len)
                 dummy_input_ids = torch.randint(
-                    0, 10000, (input_len,), dtype=torch.int32, device=self.target_device, generator=rand_gen
+                    0, 10000, (input_len,), dtype=torch.int64, device=self.target_device, generator=rand_gen
                 )
                 b_req_idx = torch.tensor([self.req_manager.alloc()], dtype=torch.int32, device=self.target_device)
                 mem_indexes = self.mem_manager.alloc(len(dummy_input_ids)).to(device=self.target_device)
@@ -1176,7 +1176,7 @@ class TpPartBaseModel:
                 gc.collect()
                 self.platform_backend.runtime.empty_cache()
         self.layers_num = layer_num_bak
-        torch.distributed.barrier()
+        dist_barrier()
         Autotuner.end_autotune_warmup()
 
     @final
@@ -1186,12 +1186,12 @@ class TpPartBaseModel:
         对 padded 所使用的req 进行初始化， 目前有非常多的地方需要使用，所以将其初始化固定为固定流程
         """
         # 做一次 同步
-        torch.distributed.barrier()
+        dist_barrier()
 
         # prefill init padding req.
         prefill_input_len = 1
         batch_size = 1
-        dummy_input_ids = torch.ones((batch_size,), dtype=torch.int32, device=self.target_device)
+        dummy_input_ids = torch.ones((batch_size,), dtype=torch.int64, device=self.target_device)
         b_req_idx = torch.tensor(
             [self.req_manager.HOLD_REQUEST_ID for _ in range(batch_size)], dtype=torch.int32, device=self.target_device
         )

@@ -162,6 +162,7 @@ def init_distributed_env(kvargs):
         port=kvargs["nccl_port"],
         rank=kvargs["rank_id"],
         world_size=kvargs["world_size"],
+        device_id=device_id,
     )
 
 def set_global_rank(global_rank: int):
@@ -245,6 +246,15 @@ def set_node_world_size(node_world_size: int):
 
 def get_node_world_size():
     return int(get_environ("LIGHTLLM_NODE_WORLD_SIZE"))
+
+
+def dist_barrier(group=None, async_op: bool = False):
+    barrier_kwargs = {"async_op": async_op}
+    if group is not None:
+        barrier_kwargs["group"] = group
+    if dist.is_initialized() and dist.get_backend(group) in ("nccl", "hccl"):
+        barrier_kwargs["device_ids"] = [get_backend().runtime.current_device()]
+    return dist.barrier(**barrier_kwargs)
 
 
 def create_new_group_for_current_dp(backend):

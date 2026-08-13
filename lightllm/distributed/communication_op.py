@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp, ProcessGroup
 from typing import List, Dict, Optional, Set, Union
+from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.device_utils import has_nvlink
 from lightllm.utils.envs_utils import (
@@ -36,6 +37,7 @@ from lightllm.utils.dist_utils import (
     get_dp_world_size,
     create_new_group_for_current_dp,
     create_dp_special_inter_group,
+    dist_barrier,
 )
 from lightllm.utils.device_utils import get_device_sm_count, is_sm100_gpu
 from lightllm.utils.torch_dtype_utils import get_torch_dtype
@@ -187,10 +189,7 @@ class DistributeGroupManager:
         # DeepEP reuses this group's NCCL communicator via _comm_ptr(). Because the
         # group is created without device_id, warm it up first to avoid reading a null
         # communicator. The default process group's warmup does not cover this group.
-        dist.barrier(
-            group=deepep_group,
-            device_ids=[torch.cuda.current_device()],
-        )
+        dist_barrier(group=deepep_group)
         self.ll_num_tokens = prefill_num_max_dispatch_tokens_per_rank
         self.ll_decode_num_tokens = decode_num_max_dispatch_tokens_per_rank
         self.ll_hidden = hidden_size

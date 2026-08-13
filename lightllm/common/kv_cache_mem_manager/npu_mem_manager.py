@@ -3,7 +3,6 @@ from lightllm.common.kv_cache_mem_manager.operator.base import BaseMemManagerOpe
 import torch
 from typing import Any, List, Tuple
 
-from lightllm.server.pd_io_struct import KVMoveTask
 from lightllm.utils.envs_utils import get_page_size
 from lightllm.utils.log_utils import init_logger
 
@@ -96,9 +95,6 @@ class NPUMemoryManager(MemoryManager):
         self.k_buffer[:, index].copy_(t[:, : self.head_num])
         self.v_buffer[:, index].copy_(t[:, self.head_num :])
 
-    def alloc_kv_move_buffer(self, max_req_total_len):
-        raise NotImplementedError("NPUMemoryManager does not support PD-separated alloc_kv_move_buffer")
-
     def alloc_paged_kv_move_buffer(self, page_num, page_size) -> torch.Tensor:
         raise NotImplementedError("NPUMemoryManager does not support PD-separated alloc_paged_kv_move_buffer")
 
@@ -109,6 +105,8 @@ class NPUMemoryManager(MemoryManager):
         dp_index: int,
         mem_managers: List["MemoryManager"],
         dp_world_size: int,
+        page_kind: str = "kv",
+        req_idx: int = None,
     ):
         raise NotImplementedError("NPUMemoryManager does not support PD-separated write_mem_to_page_kv_move_buffer")
 
@@ -119,54 +117,7 @@ class NPUMemoryManager(MemoryManager):
         dp_index: int,
         mem_managers: List["MemoryManager"],
         dp_world_size: int,
+        page_kind: str = "kv",
+        req_idx: int = None,
     ):
         raise NotImplementedError("NPUMemoryManager does not support PD-separated read_page_kv_move_buffer_to_mem")
-
-    def send_to_decode_node(
-        self,
-        move_tasks: List[KVMoveTask],
-        mem_managers: List["MemoryManager"],
-        dp_size_in_node: int,
-        nccl_comm,
-    ):
-        raise NotImplementedError("NPUMemoryManager does not support PD-separated send_to_decode_node")
-
-    def receive_from_prefill_node(
-        self,
-        move_tasks: List[KVMoveTask],
-        mem_managers: List["MemoryManager"],
-        dp_size_in_node: int,
-        nccl_comm,
-    ):
-        raise NotImplementedError("NPUMemoryManager does not support PD-separated receive_from_prefill_node")
-
-    def send_to_decode_node_p2p(
-        self,
-        move_tasks: List[KVMoveTask],
-        mem_managers: List["MemoryManager"],
-        dp_size_in_node: int,
-        nccl_comm,
-    ):
-        raise NotImplementedError("NPUMemoryManager does not support PD-separated send_to_decode_node_p2p")
-
-    def receive_from_prefill_node_p2p(
-        self,
-        move_tasks: List[KVMoveTask],
-        mem_managers: List["MemoryManager"],
-        dp_size_in_node: int,
-        nccl_comm,
-    ):
-        raise NotImplementedError("NPUMemoryManager does not support PD-separated receive_from_prefill_node_p2p")
-
-    def copy_kv_from_other_dp_ranks(
-        self,
-        mem_managers: List["MemoryManager"],
-        move_token_indexes: torch.Tensor,
-        token_dp_indexes: torch.Tensor,
-        mem_indexes: torch.Tensor,
-        dp_size_in_node: int,
-        rank_in_dp: int,
-    ):
-        raise NotImplementedError(
-            "NPUMemoryManager does not support copy_kv_from_other_dp_ranks (needs split-kv kernel)"
-        )

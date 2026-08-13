@@ -45,6 +45,13 @@ class Gemma3VisionModel(VisualDeviceMixin):
         assert "model.mm_projector.linear" in self.projector_weights
         assert "model.mm_projector.norm" in self.projector_weights
 
+    @staticmethod
+    def _force_eager_attention(module):
+        if hasattr(module, "config") and hasattr(module.config, "_attn_implementation"):
+            module.config._attn_implementation = "eager"
+        for child in module.children():
+            Gemma3VisionModel._force_eager_attention(child)
+
     def load_hf_model(self, config, weight_dir):
         from transformers import AutoConfig, AutoProcessor, Gemma3ForConditionalGeneration
 
@@ -52,20 +59,30 @@ class Gemma3VisionModel(VisualDeviceMixin):
         processor = AutoProcessor.from_pretrained(weight_dir)
         self.image_processor = processor.image_processor
 
-        model = Gemma3ForConditionalGeneration.from_pretrained(
-            weight_dir,
-            torch_dtype=torch.float16,
-        )
-        self.vision_tower = model.vision_tower
+        # Match server --data_type bfloat16. transformers 5 SigLIP defaults to SDPA,
+        # and new PyTorch cuDNN SDPA can fail with "No valid execution plans built".
+        # Old transformers used eager attention; keep that path.
+        load_kwargs = {"torch_dtype": torch.bfloat16}
+        try:
+            model = Gemma3ForConditionalGeneration.from_pretrained(
+                weight_dir, attn_implementation="eager", **load_kwargs
+            )
+        except TypeError:
+            model = Gemma3ForConditionalGeneration.from_pretrained(weight_dir, **load_kwargs)
+        # transformers <5: vision_tower lives on Gemma3ForConditionalGeneration.
+        # transformers 5+: it lives on the inner Gemma3Model (`model.model`).
+        inner_model = model.model if hasattr(model, "model") and not hasattr(model, "vision_tower") else model
+        self.vision_tower = inner_model.vision_tower
+        self._force_eager_attention(self.vision_tower)
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
         # Free projector/LLM memory. New transformers uses read-only properties on the
         # wrapper; fall back to inner model.model (Gemma3Model) when setattr fails.
         try:
-            model.multi_modal_projector = None
-            model.language_model = None
-        except AttributeError:
-            inner_model = getattr(model, "model", model)
             inner_model.multi_modal_projector = None
             inner_model.language_model = None
+        except AttributeError:
+            pass
 
         # load projector weights
         self.projector_weights = {}

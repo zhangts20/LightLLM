@@ -51,6 +51,9 @@ class AclGraph(DecodeGraph):
         self.update_stream = torch.npu.Stream()
         logger.info("AclGraph: weak_ref_fia_workspace enabled after capture")
 
+    def _warmup_dummy_seq_len(self) -> int:
+        return self.graph_max_len_in_batch
+
     def warmup(self, model):
         super().warmup(model)
         weak_ref_fia_workspaces()

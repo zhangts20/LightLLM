@@ -9,7 +9,7 @@ from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
 from .allocator import KvCacheAllocator
 from lightllm.utils.profile_max_tokens import get_available_gpu_memory, get_total_gpu_memory
 from lightllm.utils.dist_utils import get_current_rank_in_node, get_node_world_size
-from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args
+from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args, get_page_size
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.utils.config_utils import get_num_key_value_heads
 from lightllm.common.kv_trans_kernel.nixl_kv_trans import page_io

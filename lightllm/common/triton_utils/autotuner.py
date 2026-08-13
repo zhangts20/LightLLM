@@ -222,25 +222,6 @@ class Autotuner:
 
         return self.fn(*args, **kwargs)
 
-    @property
-    def cache_dir(self) -> str:
-        if not hasattr(self, "_cache_dir"):
-            device_name = get_current_device_name()
-            if device_name is None:
-                raise RuntimeError(
-                    f"Autotuner for kernel {self.kernel_name} requires a visible CUDA/MUSA device "
-                    f"to resolve its cache directory, but torch.cuda.is_available() is False."
-                )
-            self._cache_dir = os.path.join(
-                Path(__file__).parent,
-                "autotune_kernel_configs",
-                get_triton_version(),
-                device_name,
-                self.kernel_name,
-            )
-            os.makedirs(self._cache_dir, exist_ok=True)
-        return self._cache_dir
-
     def _try_load_cache(self, static_key):
         if static_key in self.cached_configs:
             return False

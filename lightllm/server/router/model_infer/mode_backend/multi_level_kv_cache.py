@@ -10,7 +10,7 @@ from lightllm.server.multi_level_kv_cache.cpu_cache_client import CpuKvCacheClie
 from lightllm.utils.config_utils import is_linear_att_mixed_model
 from lightllm.utils.envs_utils import get_env_start_args
 from ..infer_batch import InferReq
-from lightllm.utils.dist_utils import create_new_group_for_current_dp 
+from lightllm.utils.dist_utils import create_new_group_for_current_dp, dist_barrier 
 from lightllm.common.basemodel.triton_kernel.kv_cache_offload import offload_gpu_kv_to_cpu, load_cpu_kv_to_gpu
 from lightllm.server.router.model_infer.infer_batch import g_infer_context
 from lightllm.utils.log_utils import init_logger
@@ -32,9 +32,9 @@ class MultiLevelKvCacheModule(object):
         self.gloo_group = create_new_group_for_current_dp("gloo")
         self.filter_group = create_new_group_for_current_dp("gloo")
         self.init_sync_group = create_new_group_for_current_dp(self.backend_runtime.dist_backend)
-        dist.barrier(group=self.init_sync_group)
+        dist_barrier(group=self.init_sync_group)
         self.offload_sync_group = create_new_group_for_current_dp(self.backend_runtime.dist_backend)
-        dist.barrier(group=self.offload_sync_group)
+        dist_barrier(group=self.offload_sync_group)
         self.offload_sync_tensor = torch.empty((1,), dtype=torch.int32, device=self.target_device)
 
         self.page_index_buffer = torch.empty((1024 * 1024 * 4,), dtype=torch.int32, device=self.target_device)
@@ -158,7 +158,7 @@ class MultiLevelKvCacheModule(object):
 
             all_page_list.extend(page_list)
 
-        dist.barrier(group=self.init_sync_group)
+        dist_barrier(group=self.init_sync_group)
 
         if self.backend.is_master_in_dp:
             self.cpu_cache_client.lock.acquire_sleep1ms()

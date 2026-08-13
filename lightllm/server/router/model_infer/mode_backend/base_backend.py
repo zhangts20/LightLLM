@@ -31,7 +31,7 @@ from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
 from lightllm.utils.dist_utils import get_global_rank, get_global_world_size, get_dp_size
 from lightllm.utils.dist_utils import get_dp_world_size, get_global_dp_rank, get_current_rank_in_dp
 from lightllm.utils.dist_utils import get_current_device_id, get_current_rank_in_node, get_node_world_size
-from lightllm.utils.dist_utils import get_dp_rank_in_node, create_new_group_for_current_node
+from lightllm.utils.dist_utils import get_dp_rank_in_node, create_new_group_for_current_node, dist_barrier
 from lightllm.utils.envs_utils import (
     get_env_start_args,
     enable_radix_tree_timer_merge,
@@ -233,7 +233,7 @@ class ModeBackend:
             # 如果存在需要跨进程使用mem manger的特性，则将mem manager写入到 shm中，方便
             # 读取
             self.model.mem_manager.write_to_shm(req_manager=self.model.req_manager)
-            dist.barrier(group=self.node_nccl_group)
+            dist_barrier(group=self.node_nccl_group)
 
         # 同一 DP 组内只需主 rank 初始化真实的 capture buffer 并执行后续相关操作；
         # 非主 rank 不需要分配 buffer，避免重复占用内存。

@@ -2,6 +2,7 @@ import torch
 from typing import List, Optional, Sequence, Tuple
 from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
+from lightllm.utils.envs_utils import get_env_start_args
 
 
 def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
@@ -129,11 +130,11 @@ def top_p_top_k_sample_triton(
     sampling_backend = get_env_start_args().sampling_backend
 
     if sampling_backend == "triton":
-        probs_sort, probs_idx = _top_p_top_k(probs, b_top_ps, b_top_ks)
-        if not exist_req_use_random_seed:
+        probs_sort, probs_idx = _top_p_top_k(probs, top_ps, top_ks)
+        if generators is None:
             sampled_index = torch.multinomial(probs_sort, num_samples=1, replacement=True)
         else:
-            sampled_index = _random_sample(probs_sort, reqs, exist_req_use_random_seed).view(-1, 1)
+            sampled_index = _random_sample(probs_sort, generators).view(-1, 1)
         next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
         next_token_logprobs = torch.log(torch.gather(probs_sort, dim=1, index=sampled_index))
         return next_token_ids.view(-1), next_token_logprobs.view(-1)
@@ -143,8 +144,8 @@ def top_p_top_k_sample_triton(
 
         batch_next_token_ids = top_k_top_p_sampling_from_probs(
             probs,
-            b_top_ks,
-            b_top_ps,
+            top_ks,
+            top_ps,
             filter_apply_order="joint",
             check_nan=False,
         )
