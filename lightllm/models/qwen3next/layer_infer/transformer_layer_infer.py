@@ -249,7 +249,7 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         assert isinstance(infer_state.mem_manager, Qwen3NextMemManager)
         mixed_qkvzba = self._linear_in_proj(input_embdings, layer_weight)
 
-        if torch.cuda.is_current_stream_capturing():
+        if self.platform_backend.graph.is_capturing():
             core_attn_out, z = self._linear_prefill_cuda_graph_wrapper(mixed_qkvzba, infer_state, layer_weight)
         else:
             core_attn_out, z = infer_state.prefill_att_state1.prefill_att(

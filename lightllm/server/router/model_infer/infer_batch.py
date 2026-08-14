@@ -18,6 +18,7 @@ from lightllm.server.router.dynamic_prompt.linear_att_radix_cache import (
     LinearAttPagedTreeNode,
 )
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.device_utils import get_target_device
 from lightllm.server.req_id_generator import convert_sub_id_to_group_id
 from lightllm.server.multimodal_params import MultimodalParams
 from lightllm.utils.custom_kernel_utis import custom_cat
@@ -586,7 +587,7 @@ class InferReq:
 
         self.generator = None
         if self.sampling_param.shm_param.seed != -1:
-            self.generator = torch.Generator(device="cuda")
+            self.generator = torch.Generator(device=get_target_device())
             self.generator.manual_seed(self.sampling_param.shm_param.seed)
 
         if init_prefix_cache:

@@ -42,10 +42,13 @@ class Qwen3NextTpPartModel(Qwen3MOEModel):
         def _triton_allocator(size: int, alignment: int, stream: Optional[int]) -> torch.Tensor:
             return torch.empty(size, device=self.target_device, dtype=torch.int8)
 
-        # Set Triton allocator for TMA descriptors
+        # Set Triton allocator for TMA descriptors (CUDA). Ascend Triton has no set_allocator.
         # This is required for kernels in common/.../linear_att/fla/ops/solve_tril.py
-        triton.set_allocator(_triton_allocator)
-        logger.info("Triton allocator set for Qwen3Next model")
+        if hasattr(triton, "set_allocator"):
+            triton.set_allocator(_triton_allocator)
+            logger.info("Triton allocator set for Qwen3Next model")
+        else:
+            logger.info("Triton set_allocator not available; skip for Qwen3Next model")
         return
 
     def autotune_layers(self):

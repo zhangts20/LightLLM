@@ -26,12 +26,10 @@ from lightllm.common.kv_cache_mem_manager import (
     Qwen3NextMemManager,
 )
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 from tqdm import tqdm
 from lightllm.utils.auto_shm_cleanup import register_sysv_shm_for_cleanup
-from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.common.linear_att_cache_manager.config_objs import LinearAttCacheConfig
-from lightllm.platform import get_backend
 from lightllm.utils.cpu_cache_host_register import get_host_register_worker
 
 logger = init_logger(__name__)
@@ -225,7 +223,7 @@ def create_shm_kv_cache_ptr(key: int, size: int) -> int:
 
     interleave_pages_across_numa_nodes(libc, shm_addr, size_to_alloc)
 
-    # Best-effort memory prefaulting in background to speed up subsequent cudaHostRegister
+    # Best-effort memory prefaulting in background to speed up subsequent host register
     def _pre_warm_memory():
         page_size = _get_default_hugepage_size() if use_hugetlb else 4096
         arr = np.ctypeslib.as_array(ctypes.cast(shm_addr, ctypes.POINTER(ctypes.c_uint8)), shape=(size_to_alloc,))
@@ -249,7 +247,7 @@ def create_shm_kv_cache_ptr(key: int, size: int) -> int:
 
 @lru_cache(maxsize=None)
 def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> int:
-    """Synchronously cudaHostRegister the given [shm_ptr, shm_ptr+size)."""
+    """Synchronously host-register [shm_ptr, shm_ptr+size) via platform worker."""
     chunk_bytes = 128 * 1024 * 1024  # 128M性能最好
     tasks: list[tuple[int, int]] = []
     offset = 0
@@ -258,26 +256,12 @@ def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> int:
         tasks.append((offset, seg_len))
         offset += seg_len
 
-    cuda = ctypes.CDLL("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so")
-    cuda.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-    cuda.cudaHostRegister.restype = ctypes.c_int
-    cuda.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_int]
-    cuda.cudaHostGetDevicePointer.restype = ctypes.c_int
-
-    cudaHostRegisterFlag = 3
-
-    device_id = get_current_device_id()
-    torch.cuda.set_device(device_id)
+    ops = get_host_register_worker()
     desc = f"pid {os.getpid()} Registering pinned host memory"
 
     def _register_one_segment(task: Tuple[int, int]):
-        offset, seg_len = task
-        torch.cuda.set_device(device_id)
-        ptr = ctypes.c_void_p(shm_ptr + offset)
-        r = cuda.cudaHostRegister(ptr, ctypes.c_size_t(seg_len), cudaHostRegisterFlag)
-        if r != 0:
-            raise Exception(f"cudaHostRegister failed with error code {r}, prefer to use hugetlb")
-        return
+        seg_offset, seg_len = task
+        ops.register_segment(shm_ptr, seg_offset, seg_len)
 
     # worker_num的数值需要与_pre_warm_memory一致，不然会丢失warmup的效果
     if tasks:
@@ -287,13 +271,7 @@ def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> int:
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=desc):
                 future.result()
 
-    device_ptr = ctypes.c_void_p()
-    host_ptr = ctypes.c_void_p(shm_ptr)
-    res = cuda.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
-    if res != 0:
-        raise Exception(f"cudaHostGetDevicePointer failed with error code {res}")
-    logger.info(f"cudaHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}")
-    return device_ptr.value
+    return ops.get_device_ptr(shm_ptr)
 
 
 @lru_cache(maxsize=None)

@@ -132,6 +132,11 @@ class DecodeGraph:
         else:
             return None
 
+    def _graph_capture(self, graph_obj):
+        if self.args.enable_torch_memory_saver:
+            return self.torch_memory_saver.cuda_graph(graph_obj, pool=self.mempool)
+        return self.platform_backend.graph.graph(graph_obj, pool=self.mempool)
+
     def _capture_decode(self, decode_func, infer_state: InferStateInfo) -> ModelOutput:
         graph_obj = self.platform_backend.graph.create_graph()
         batch_size = infer_state.input_ids.shape[0]
@@ -147,10 +152,12 @@ class DecodeGraph:
                 if param_name not in pure_para_set:
                     delattr(infer_state, param_name)
 
-        with self.torch_memory_saver.cuda_graph(graph_obj, pool=self.mempool):
+        with self._graph_capture(graph_obj):
             model_output = decode_func(infer_state)
         self.graph[batch_size] = (graph_obj, infer_state, model_output)
-        self.platform_backend.graph.replay_graph(graph_obj)
+
+        if self.platform_backend.name != "ascend":
+            self.platform_backend.graph.replay_graph(graph_obj)
 
         return model_output
 
@@ -180,10 +187,12 @@ class DecodeGraph:
                 if param_name not in pure_para_set1:
                     delattr(infer_state1, param_name)
 
-        with self.torch_memory_saver.cuda_graph(graph_obj, pool=self.mempool):
+        with self._graph_capture(graph_obj):
             model_output, model_output1 = decode_func(infer_state, infer_state1)
         self.graph[batch_size] = (graph_obj, infer_state, infer_state1, model_output, model_output1)
-        self.platform_backend.graph.replay_graph(graph_obj)
+
+        if self.platform_backend.name != "ascend":
+            self.platform_backend.graph.replay_graph(graph_obj)
 
         return model_output, model_output1
 

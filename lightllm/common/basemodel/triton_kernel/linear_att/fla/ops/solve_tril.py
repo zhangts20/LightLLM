@@ -24,6 +24,8 @@ from lightllm.utils.device_utils import get_target_device
 
 def _ensure_triton_allocator():
     """Ensure Triton has an allocator set for kernels requiring scratch memory."""
+    if not hasattr(triton, "set_allocator"):
+        return
 
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device=torch.device(get_target_device()), dtype=torch.int8)

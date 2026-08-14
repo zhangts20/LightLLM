@@ -136,15 +136,17 @@ def rms_norm(
     gate_value: Optional[torch.Tensor] = None,
     alloc_func: Callable = torch.empty,
 ) -> torch.Tensor:
-    if gate_value is not None:
-        raise NotImplementedError("gate_value is not supported for rms_norm on ascend")
-
     import torch_npu
+    import torch.nn.functional as F
 
     # Gemma3 fp32 norm + bf16 weight
     if weight.dtype != input.dtype:
         weight = weight.to(dtype=input.dtype)
     _out = torch_npu.npu_rms_norm(input, weight, epsilon=eps)[0]
+
+    if gate_value is not None:
+        _out = _out * F.silu(gate_value)
+
     if out is not None and out.data_ptr() != _out.data_ptr():
         out.copy_(_out)
         return out
