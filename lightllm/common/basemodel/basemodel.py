@@ -1099,7 +1099,7 @@ class TpPartBaseModel:
             )
             logger.error(exception_str)
             raise Exception(exception_str)
-        torch.cuda.empty_cache()
+        self.platform_backend.runtime.empty_cache()
         return
 
     def autotune_layers(self):

@@ -154,10 +154,7 @@ def top_p_top_k_sample_triton(
         batch_next_token_probs = torch.gather(probs, dim=1, index=int64_batch_next_token_ids.view(-1, 1))
         return batch_next_token_ids.view(-1), torch.log(batch_next_token_probs).view(-1)
     else:
-        sampled_index = _random_sample(probs_sort, generators).view(-1, 1)
-    next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
-    next_token_logprobs = torch.log(torch.gather(probs_sort, dim=1, index=sampled_index))
-    return next_token_ids.view(-1), next_token_logprobs.view(-1)
+        assert False, "Unsupported sampling backend for top_p_top_k_sample"
 
 
 def top_p_top_k_sample_sglang_kernel(

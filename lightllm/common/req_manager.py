@@ -67,18 +67,19 @@ class _ReqLinkedList:
 class ReqManager:
     def __init__(self, max_request_num, max_sequence_length, mem_manager: MemoryManager):
         platform_backend = get_backend()
-        device = platform_backend.runtime.target_device()
+        self.target_device = platform_backend.runtime.target_device()
         # 这里对最大请求数量的管理在默认上多申请了一个，主要是 index 为 max_request_num 代表
         # 的这个请求管理 id， 主要是为了兼容 DP 运行模式下，让各个 DP 能 padding 到 DP 中最大
         # 的那个batch size 进行运行，所有 padding 的请求都会使用预留的这个请求管理 id 进行处理
         # 这样让 DP 的实现更为简化一些。
         self.req_list = _ReqLinkedList(max_request_num)
         self.req_to_token_indexs = torch.zeros(
-            (max_request_num + 1, max_sequence_length), dtype=torch.int32, device=device
+            (max_request_num + 1, max_sequence_length), dtype=torch.int32, device=self.target_device
         )
         self.mem_manager = mem_manager
         self.req_sampling_params_manager = ReqSamplingParamsManager(
-            max_request_num, device=device, platform_backend=platform_backend)
+            max_request_num, device=self.target_device, platform_backend=platform_backend
+        )
         self.max_request_num = max_request_num
         self.HOLD_REQUEST_ID = max_request_num
 
@@ -332,7 +333,9 @@ class ReqManagerForMamba(ReqManager):
         # 因为在mtp的推理中，需要标记每个请求对应的mtp index状态(conv state 和 ssm state)，在mtp对应序列中
         # 的真实位置，所以需要需要一个标记来记录，不然算子无法找到真实的处理起点。
         self.req_to_mtp_state_index = (
-            torch.zeros((max_request_num + 1,), dtype=torch.int32, device="cuda") if self.mtp_step > 0 else None
+            torch.zeros((max_request_num + 1,), dtype=torch.int32, device=self.target_device)
+            if self.mtp_step > 0
+            else None
         )
         # 突然想到， 在linear att 开启mtp的模式中，现在的prefill linear att 算子默认是从0的位置读取信息进行操作
         # 所以不能支持 prefill decode mixed 操作了，因为一个decode过的请求，重新用prefill 算子跑，会出现读错linear

@@ -5,7 +5,6 @@ from typing import Tuple
 from lightllm.models.qwen3_moe.layer_weights.transformer_layer_weight import Qwen3MOETransformerLayerWeight
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
-from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
 from lightllm.common.basemodel.triton_kernel.fused_moe.grouped_fused_moe_ep import (
     use_sm100_mega_moe,
 )
