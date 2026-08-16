@@ -295,7 +295,7 @@ class TpPartBaseModel:
     def _init_prefill_cuda_graph(self):
         self.prefill_graph = (
             None
-            if not get_env_start_args().enable_prefill_cudagraph
+            if (not get_env_start_args().enable_prefill_cudagraph or self.platform_backend.name == "ascend")
             else PrefillCudaGraph(decode_cuda_graph=self.graph, tp_world_size=self.tp_world_size_)
         )
         if self.prefill_graph is not None:

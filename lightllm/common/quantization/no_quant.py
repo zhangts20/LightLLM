@@ -8,6 +8,7 @@ from lightllm.common.quantization.registry import QUANTMETHODS
 @QUANTMETHODS.register("none", platform="musa")
 @QUANTMETHODS.register("none", platform="cuda")
 @QUANTMETHODS.register("none", platform="ascend")
+@QUANTMETHODS.register("none", platform="maca")
 class NoQuantization(QuantizationMethod):
     """No quantization - uses full precision weights."""
 

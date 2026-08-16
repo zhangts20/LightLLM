@@ -5,7 +5,7 @@ from typing import Optional
 from lightllm.platform.base.attention import register_att_backend
 
 
-@register_att_backend(name="triton", category="standard", platforms=("cuda",))
+@register_att_backend(name="triton", category="standard", platforms=("cuda", "maca"))
 class TritonAttBackend(BaseAttBackend):
     def create_att_prefill_state(self, infer_state) -> "TritonPrefillAttState":
         return TritonPrefillAttState(backend=self, infer_state=infer_state)
