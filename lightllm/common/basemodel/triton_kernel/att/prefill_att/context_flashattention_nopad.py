@@ -15,11 +15,19 @@ def _prefill_block_m(head_dim: int | None = None) -> int:
     backend_name = get_backend().name
     if backend_name == "maca":
         if head_dim is not None and head_dim >= 256:
-            return 16
-        return 32
+            return 32
+        return 64
     if backend_name != "ascend" and is_tesla():
         return 64
     return 128
+
+
+def _prefill_block_n(block_m: int, head_dim: int) -> int:
+    if get_backend().name == "maca":
+        if head_dim >= 256:
+            return 64
+        return max(block_m, min(64, block_m * 2))
+    return block_m
 
 
 @triton.jit
@@ -182,7 +190,7 @@ def context_attention_fwd(
 
     grid = lambda meta: (triton.cdiv(max_input_len, meta["BLOCK_M"]), batch * head, 1)
 
-    BLOCK_N = BLOCK_M
+    BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
     num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
     num_stages = 1
 
@@ -362,7 +370,7 @@ def context_attention_fwd_no_prompt_cache(q, k, v, o, b_start_loc, b_seq_len, ma
     kv_group_num = q.shape[1] // k.shape[1]
 
     grid = (triton.cdiv(max_input_len, BLOCK_M), batch * head, 1)
-    BLOCK_N = BLOCK_M
+    BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
     num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
     num_stages = 1
 
@@ -541,7 +549,7 @@ def context_attention_fwd_contiguous_kv(
     kv_group_num = q.shape[1] // k.shape[1]
 
     grid = lambda meta: (triton.cdiv(max_q_input_len, meta["BLOCK_M"]), batch * head, 1)
-    BLOCK_N = BLOCK_M
+    BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
     num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
     num_stages = 1
 

@@ -104,8 +104,8 @@ def _fwd_kernel_gather(
     block_index = tl.program_id(0)
     block_range = block_index * BLOCK + tl.arange(0, BLOCK)
     block_mask = block_range < num_size
-    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask)
-    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask)
+    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask, other=0)
+    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask, other=0)
     cur_next_token_id = tl.load(
         req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + cur_mtp_index, mask=block_mask
     )
@@ -159,15 +159,17 @@ def _fwd_kernel_gather_prefill_decode_mixed(
     block_index = tl.program_id(0)
     block_range = block_index * BLOCK + tl.arange(0, BLOCK)
     block_mask = block_range < num_size
-    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask)
-    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask)
+    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask, other=0)
+    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask, other=0)
     cur_next_token_id = tl.load(
         req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + cur_mtp_index, mask=block_mask
     )
-    cur_is_decode_req = tl.load(b_is_decode_req + block_range, mask=block_mask, other=False)
-    cur_prefill_start_loc = tl.load(b_prefill_start_loc + block_range, mask=block_mask, other=-1)
-
-    tl.store(input_ids + cur_prefill_start_loc, cur_next_token_id, mask=block_mask & cur_is_decode_req)
+    # Maca: mask must be boolean scalar type
+    cur_is_decode_req = tl.load(b_is_decode_req + block_range, mask=block_mask, other=0)
+    cur_is_decode_req = (cur_is_decode_req != 0).to(tl.int1)
+    cur_prefill_start_loc = tl.load(b_prefill_start_loc + block_range, mask=block_mask, other=0)
+    store_mask = block_mask & cur_is_decode_req
+    tl.store(input_ids + cur_prefill_start_loc, cur_next_token_id, mask=store_mask)
     return
 
 

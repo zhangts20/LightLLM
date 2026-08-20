@@ -250,7 +250,15 @@ class Autotuner:
 
     def _bench(self, *args, n_repeat=3, n_retries=3, **kwargs):
         from triton.compiler.errors import CompileTimeAssertionFailure
-        from triton.runtime.errors import OutOfResources, PTXASError
+        from triton.runtime.errors import OutOfResources
+
+        # MetaX triton may not export PTXASError; keep autotune usable on maca.
+        try:
+            from triton.runtime.errors import PTXASError
+        except ImportError:
+
+            class PTXASError(Exception):
+                pass
 
         new_args, new_kwargs, origin_list, new_list = self._mutate_args_clone(args, kwargs)
 

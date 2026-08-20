@@ -58,6 +58,7 @@ class CustomProcessGroup:
     def __init__(self):
         self.symm_mem_reduce = None
         self.flashinfer_reduce = None
+        self.pynccl_reduce = None
         self.dp_world_size = get_dp_world_size()
         dist_backend = get_backend().runtime.dist_backend
         self.device_group = create_new_group_for_current_dp(dist_backend)
@@ -94,13 +95,42 @@ class CustomProcessGroup:
             self.flashinfer_reduce = fi
             logger.info("Enable FlashInfer ALLReduce.")
 
+    def init_pynccl_reduce(self) -> None:
+        if self.dp_world_size <= 1:
+            return
+        try:
+            from .pynccl import PyNcclCommunicator
+        except Exception as e:
+            logger.warning("PyNcclCommunicator import failed: %s", e)
+            return
+
+        # Unique-id exchange must use a non-NCCL group (gloo).
+        cpu_group = create_new_group_for_current_dp("gloo")
+        device = self.backend_runtime.current_device()
+        try:
+            comm = PyNcclCommunicator(cpu_group, device)
+        except Exception as e:
+            logger.warning("PyNcclCommunicator init failed: %s. Falling back to dist.all_reduce.", e)
+            return
+        if comm.disabled:
+            return
+        self.pynccl_reduce = comm
+        logger.info(
+            "Enable PyNccl/MCCL graph-safe ALLReduce (world_size=%d, device=%s).",
+            comm.world_size,
+            device,
+        )
+
     def all_reduce(self, input_: torch.Tensor) -> None:
-        # Dispatch chain: FlashInfer -> SymmMem -> NCCL.
+        # Dispatch chain: FlashInfer -> SymmMem -> PyNccl(MCCL/NCCL) -> dist.
         if self.flashinfer_reduce is not None and self.flashinfer_reduce.should_use(input_):
             input_.data = self.flashinfer_reduce.all_reduce(input_)
             return
         if self.symm_mem_reduce is not None and self.symm_mem_reduce.should_use(input_):
             self.symm_mem_reduce.all_reduce(input_)
+            return
+        if self.pynccl_reduce is not None and not self.pynccl_reduce.disabled:
+            self.pynccl_reduce.all_reduce(input_, inplace=True)
             return
         return dist.all_reduce(input_, group=self.device_group)
 
@@ -127,6 +157,7 @@ class DistributeGroupManager:
                 group.init_symm_mem_reduce()
             if not args.disable_flashinfer_allreduce:
                 group.init_flashinfer_reduce()
+            group.init_pynccl_reduce()
             self.groups.append(group)
         return
 

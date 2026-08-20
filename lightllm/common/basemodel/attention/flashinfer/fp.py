@@ -4,10 +4,15 @@ from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, 
 from lightllm.utils.dist_utils import get_dp_world_size, get_current_device_id
 from ...triton_kernel.repack_kv_index import repack_kv_index
 from .env_utils import set_flashinfer_envs
+from .utils import (
+    refresh_cuda_graph_decode_plan,
+    should_init_decode_wrapper,
+    use_maca_cuda_graph_uniform_kv_layout,
+)
 from lightllm.platform.base.attention import register_att_backend
 
 
-@register_att_backend(name="flashinfer", category="standard", platforms=("cuda",))
+@register_att_backend(name="flashinfer", category="standard", platforms=("cuda", "maca"))
 class FlashInferAttBackend(BaseAttBackend):
     def __init__(self, model):
         set_flashinfer_envs()
@@ -152,15 +157,32 @@ class FlashInferDecodeAttState(BaseDecodeAttState):
                 device=device,
             )
 
-        repack_kv_index(
-            self.infer_state.req_manager.req_to_token_indexs,
-            self.infer_state.b_req_idx,
-            self.infer_state.b_seq_len,
-            self.infer_state.b_kv_start_loc,
-            self.infer_state.max_kv_seq_len,
-            self.kv_indices,
-        )
-        self.kv_starts = self.infer_state.b1_cu_kv_seq_len.int()
+        max_kv_len = int(self.infer_state.max_kv_seq_len)
+        batch_size = int(self.infer_state.batch_size)
+        if use_maca_cuda_graph_uniform_kv_layout(model, self.infer_state):
+            hold = int(model.mem_manager.HOLD_TOKEN_MEMINDEX)
+            used = batch_size * max_kv_len
+            self.kv_indices[:used].fill_(hold)
+            kv_start_loc = torch.arange(batch_size, dtype=torch.int32, device=device) * max_kv_len
+            repack_kv_index(
+                self.infer_state.req_manager.req_to_token_indexs,
+                self.infer_state.b_req_idx,
+                self.infer_state.b_seq_len,
+                kv_start_loc,
+                max_kv_len,
+                self.kv_indices,
+            )
+            self.kv_starts = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * max_kv_len
+        else:
+            repack_kv_index(
+                self.infer_state.req_manager.req_to_token_indexs,
+                self.infer_state.b_req_idx,
+                self.infer_state.b_seq_len,
+                self.infer_state.b_kv_start_loc,
+                max_kv_len,
+                self.kv_indices,
+            )
+            self.kv_starts = self.infer_state.b1_cu_kv_seq_len.int()
         if not self._should_init_decode_wrapper():
             # 处于 graph replay 回放阶段，不需要特殊初始化 decode wrapper。
             return
@@ -195,8 +217,6 @@ class FlashInferDecodeAttState(BaseDecodeAttState):
         return
 
     def _refresh_cuda_graph_decode_plan(self, max_kv_len: int):
-        from flashinfer.decode import fast_decode_plan
-
         uniform_kv_indptr_cpu = (
             torch.arange(
                 self.infer_state.batch_size + 1,
@@ -206,7 +226,7 @@ class FlashInferDecodeAttState(BaseDecodeAttState):
             * max_kv_len
         )
 
-        fast_decode_plan(
+        refresh_cuda_graph_decode_plan(
             self.decode_wrapper,
             indptr=self.kv_starts,
             indices=self.kv_indices,
