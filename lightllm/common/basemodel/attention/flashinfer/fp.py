@@ -58,7 +58,7 @@ class FlashInferPrefillAttState(BasePrefillAttState):
         kv_starts = self.infer_state.b1_cu_kv_seq_len.int()
         kv_last_page_len = torch.full((batch_size,), 1, dtype=torch.int32, device=device)
         kv_indices = torch.empty(
-            batch_size * self.backend.max_seq_length,
+            self.infer_state.total_token_num,
             dtype=torch.int32,
             device=device,
         )
