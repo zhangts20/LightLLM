@@ -109,6 +109,9 @@ class DecodeGraph:
     def _init_decode_graph_extra(self):
         pass
 
+    def _after_capture_batch(self, batch_size: int) -> None:
+        pass
+
     def _warmup_dummy_seq_len(self) -> int:
         # CUDA graph captures kernel launches; b_seq_len is a tensor and can vary at replay.
         # Dummy decode only needs a tiny KV length. Ascend ACL graphs override this.
@@ -283,6 +286,7 @@ class DecodeGraph:
 
             model.mem_manager.free_all()
             model.req_manager.free_all()
+            self._after_capture_batch(batch_size)
             # release local tensors
             for var_name, var_value in list(locals().items()):
                 if isinstance(var_value, torch.Tensor):

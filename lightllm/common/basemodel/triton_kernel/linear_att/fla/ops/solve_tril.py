@@ -105,6 +105,54 @@ def solve_tril_16x16_kernel(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.jit(do_not_specialize=["T"])
+def solve_tril_npu_recurrence_kernel(
+    A,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    o_i = tl.arange(0, BT)
+    m_A = o_i[:, None] > o_i[None, :]
+    m_I = o_i[:, None] == o_i[None, :]
+    A += (bos * H + i_h) * BT
+    Ai += (bos * H + i_h) * BT
+
+    p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+    b_A = -tl.where(m_A, b_A, 0.0)
+
+    rows = min(BT, T - i_t * BT)
+    for i in range(2, rows):
+        b_a = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
+        b_a += tl.sum(b_a[:, None] * b_A, axis=0)
+        b_A = tl.where((o_i == i)[:, None], b_a, b_A)
+    b_A += m_I
+
+    p_Ai = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    tl.store(p_Ai, b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+
+
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_32x32_inverse_kernel(
     A,
     Ai,
@@ -440,6 +488,17 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
+    if BT in (32, 64) and A.device.type == "npu":
+        solve_tril_npu_recurrence_kernel[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+        )
+        return Ai
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:

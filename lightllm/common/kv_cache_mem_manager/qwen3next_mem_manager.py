@@ -2,9 +2,10 @@ import torch
 import triton
 from lightllm.utils.log_utils import init_logger
 from lightllm.common.kv_cache_mem_manager.mem_manager import MemoryManager
-from lightllm.utils.envs_utils import get_env_start_args
+from lightllm.utils.envs_utils import get_env_start_args, get_page_size
 from lightllm.common.linear_att_cache_manager import LinearAttCacheConfig, LinearAttCacheManager
 from .operator import LinearAttMemOperator
+from .operator.linear_att import NpuLinearAttMemOperator
 from typing import Tuple, Any, List
 
 logger = init_logger(__name__)
@@ -27,6 +28,8 @@ class Qwen3NextMemManager(MemoryManager):
         self.linear_config = linear_config
 
         super().__init__(size, dtype, num_kv_heads, head_dim, full_att_layer_num, always_copy, mem_fraction)
+        if self._split_full_att_kv:
+            self.operator = NpuLinearAttMemOperator(self)
 
     def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:
         if layer_index >= self.linear_config.all_layer_num:
@@ -34,13 +37,36 @@ class Qwen3NextMemManager(MemoryManager):
             layer_index -= self.linear_config.linear_layer_num
         else:
             layer_index = layer_index // self.linear_config.full_attention_interval
+        if self._split_full_att_kv:
+            return self.k_buffer[layer_index], self.v_buffer[layer_index]
         return super().get_att_input_params(layer_index)
 
     def _init_buffers(self, size, dtype, head_num, head_dim, layer_num):
-        super()._init_buffers(size, dtype, head_num, head_dim, layer_num)
+        self._split_full_att_kv = torch.device(self.target_device).type == "npu"
+        if self._split_full_att_kv:
+            page_size = get_page_size()
+            alloc_size = ((size // page_size) + 1) * page_size if page_size > 1 else size + 1
+            shape = (layer_num, alloc_size, head_num, head_dim)
+            self.k_buffer = torch.empty(shape, dtype=dtype, device=self.target_device)
+            self.v_buffer = torch.empty(shape, dtype=dtype, device=self.target_device)
+            self.kv_buffer = None
+        else:
+            super()._init_buffers(size, dtype, head_num, head_dim, layer_num)
         # TODO 初始化线性 att 对应的部分 buffer.
         self._init_linear_att_buffers()
         return
+
+    def get_index_kv_buffer(self, index):
+        if not self._split_full_att_kv:
+            return super().get_index_kv_buffer(index)
+        return {"kv_buffer": torch.cat([self.k_buffer[:, index], self.v_buffer[:, index]], dim=-2)}
+
+    def load_index_kv_buffer(self, index, load_tensor_dict):
+        if not self._split_full_att_kv:
+            return super().load_index_kv_buffer(index, load_tensor_dict)
+        kv = load_tensor_dict["kv_buffer"]
+        self.k_buffer[:, index].copy_(kv[..., : self.head_num, :])
+        self.v_buffer[:, index].copy_(kv[..., self.head_num :, :])
 
     def _init_linear_att_buffers(self):
         big_page_token_num = (
@@ -60,7 +86,12 @@ class Qwen3NextMemManager(MemoryManager):
         return
 
     def _free_buffers(self):
-        super()._free_buffers()
+        if self._split_full_att_kv:
+            self.k_buffer = None
+            self.v_buffer = None
+            self.kv_buffer = None
+        else:
+            super()._free_buffers()
         self._free_linear_att_buffers()
         return
 

@@ -38,13 +38,13 @@ def update_attn_params(
             events = attn_params.events[batch_size][microbatch_index]
             params_list = attn_params.attn_params[batch_size][microbatch_index]
             for handle, event, attn_param in zip(handles, events, params_list):
-                (q, k, v, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse) = attn_param
+                (q, k, v, sm_scale, N_Q, N_KV, page_table, block_size, output, softmax_lse, input_layout) = attn_param
                 torch.npu.graph_task_update_begin(update_stream, handle)
                 torch_npu.npu_fused_infer_attention_score.out(
                     q,
                     k,
                     v,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     scale=sm_scale,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,

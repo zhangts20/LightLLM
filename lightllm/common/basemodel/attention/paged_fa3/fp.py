@@ -221,6 +221,11 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             k = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
             v = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
 
+            # Use BNSD for single-token decode; keep packed MTP on TND. TODO: Test on MTP + BNSD.
+            input_layout = "BNSD" if self.decode_max_q_seq_len == 1 else "TND"
+            if input_layout == "BNSD":
+                q = q.unsqueeze(2)
+
             output = torch.empty_like(q)
             softmax_lse = torch.empty(1, dtype=torch.float16, device=q.device)
             if torch.npu.is_current_stream_capturing():
@@ -241,7 +246,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         query=q,
                         key=k,
                         value=v,
-                        input_layout="TND",
+                        input_layout=input_layout,
                         scale=sm_scale,
                         actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                         actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
@@ -257,7 +262,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     query=q,
                     key=k,
                     value=v,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     scale=sm_scale,
                     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
@@ -287,6 +292,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         self.backend.page_size,
                         weak_ref_tensor(output),
                         weak_ref_tensor(softmax_lse),
+                        input_layout,
                     ),
                     microbatch_index=self.infer_state.microbatch_index,
                 )
@@ -295,7 +301,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     query=q,
                     key=k,
                     value=v,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     scale=sm_scale,
                     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
@@ -306,7 +312,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     out=[output, softmax_lse],
                 )
 
-            return output
+            return output.squeeze(2) if input_layout == "BNSD" else output
         else:
             return flash_attn_with_kvcache(
                 q=q,

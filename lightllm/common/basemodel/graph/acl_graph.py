@@ -43,6 +43,14 @@ def weak_ref_fia_workspaces() -> None:
         ATTN_PARAMS.workspaces[bs] = weak_ref_tensor(ws)
 
 
+def weak_ref_fia_workspace(batch_size: int) -> None:
+    if ATTN_PARAMS is None:
+        return
+    workspace = ATTN_PARAMS.workspaces.get(batch_size)
+    if workspace is not None:
+        ATTN_PARAMS.workspaces[batch_size] = weak_ref_tensor(workspace)
+
+
 @register_decode_graph("ascend")
 class AclGraph(DecodeGraph):
 
@@ -53,6 +61,10 @@ class AclGraph(DecodeGraph):
 
     def _warmup_dummy_seq_len(self) -> int:
         return self.graph_max_len_in_batch
+
+    def _after_capture_batch(self, batch_size: int) -> None:
+        weak_ref_fia_workspace(batch_size)
+        logger.info("AclGraph: batch_size=%s FIA workspace weak-ref'd", batch_size)
 
     def warmup(self, model):
         super().warmup(model)
