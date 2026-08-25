@@ -262,5 +262,6 @@ def get_lightllm_url_pool_maxsize() -> int:
     return int(os.getenv("LIGHTLLM_URL_POOL_MAXSIZE", 512))
 
 
+@lru_cache(maxsize=1)
 def get_page_size():
     return int(os.getenv("PAGE_SIZE", 1))

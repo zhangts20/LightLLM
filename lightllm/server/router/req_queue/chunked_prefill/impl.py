@@ -34,7 +34,9 @@ class ChunkedPrefillQueue(BaseQueue):
         size_array = np.arange(1, len(self.cache_len_list) + 1, 1)
 
         need_max_token_num = (left_out_len_array * size_array + cum_run_len_array).max()
-        ok_token_num = need_max_token_num < self.max_total_tokens
+        page_size = get_page_size()
+        page_remaining = len(self.cache_len_list) * (page_size - 1) if page_size > 1 else 0
+        ok_token_num = need_max_token_num < self.max_total_tokens - page_remaining
 
         ok_req_num = len(self.cache_len_list) <= self.running_max_req_size
 
