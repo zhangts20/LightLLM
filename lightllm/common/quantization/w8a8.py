@@ -59,6 +59,7 @@ class BaseQuantizationMethod(QuantizationMethod):
 
 
 @QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="cuda")
+@QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="maca")
 class w8a8QuantizationMethod(BaseQuantizationMethod):
     def __init__(self):
         super().__init__()
