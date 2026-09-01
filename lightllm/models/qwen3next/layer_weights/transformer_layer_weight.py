@@ -193,6 +193,8 @@ class Qwen3NextTransformerLayerWeight(Qwen3MOETransformerLayerWeight):
             data_type=self.data_type_,
             quant_method=None,
         )
+        # Save the trans to avoid repeated trans in causal_conv1d_update
+        self.linear_conv1d_mtp_weight_t = None
 
         # in_proj_qkvz: q(qk_dim) + k(qk_dim) + v(v_dim) + z(v_dim)
         # in_proj_ba: beta(num_v_heads) + alpha(num_v_heads) — per-head scalars
@@ -314,9 +316,15 @@ class Qwen3NextTransformerLayerWeight(Qwen3MOETransformerLayerWeight):
         return new_weight
 
     def load_hf_weights(self, weights):
+        linear_conv1d_weight_name = f"model.layers.{self.layer_num_}.linear_attn.conv1d.weight"
+        loaded_linear_conv1d = self.is_linear_attention_layer and linear_conv1d_weight_name in weights
         self._split_q_with_gate(weights)
         if self.is_moe:
             self._rename_shared_expert_to_moe_expert(weights)
         if self.is_linear_attention_layer:
             self._preprocess_weight(weights)
         super().load_hf_weights(weights)
+        if loaded_linear_conv1d:
+            conv_weight = self.linear_conv1d.mm_param.weight
+            if conv_weight.device.type == "npu":
+                self.linear_conv1d_mtp_weight_t = conv_weight.transpose(0, 1).contiguous()

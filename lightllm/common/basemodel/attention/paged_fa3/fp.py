@@ -29,6 +29,13 @@ class PagedFa3AttBackend(BaseAttBackend):
             ]
         return self._shared_page_table_buffer
 
+    def get_causal_attn_mask(self, device):
+        if not hasattr(self, "_causal_attn_mask"):
+            self._causal_attn_mask = torch.triu(
+                torch.ones((2048, 2048), dtype=torch.int8, device=device), diagonal=1
+            )
+        return self._causal_attn_mask
+
     def get_decode_seq_len_cpu_buffers(self, min_len: int):
         """Pinned CPU int32 buffers reused for npu_fused_infer_attention_score list args."""
         model = self.model
@@ -67,8 +74,7 @@ class PagedFa3PrefillAttState(BasePrefillAttState):
             b_req_idx=self.infer_state.b_req_idx,
             page_size=self.backend.page_size,
         )
-        if self.atten_mask is None:
-            self.atten_mask = torch.triu(torch.ones([2048, 2048]), diagonal=1).to(dtype=torch.int8, device=self.infer_state.input_ids.device)
+        self.atten_mask = self.backend.get_causal_attn_mask(self.infer_state.input_ids.device)
 
     def prefill_att(self, q, k, v, att_control: AttControl = AttControl(), alloc_func=torch.empty):
         assert att_control.use_alibi is False
@@ -90,11 +96,11 @@ class PagedFa3PrefillAttState(BasePrefillAttState):
         if q.device.type == "npu":
             import torch_npu
 
-            N_KV, HEAD_DIM = k.shape[-2:]
-            # to (num_blocks, block_size, hidden_size)
+            N_Q, HEAD_DIM = q.shape[-2:]
+            N_KV = k.shape[-2]
             key = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
             value = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
-            out = torch_npu.npu_fused_infer_attention_score(
+            return torch_npu.npu_fused_infer_attention_score(
                 query=q,
                 key=key,
                 value=value,
@@ -102,14 +108,14 @@ class PagedFa3PrefillAttState(BasePrefillAttState):
                 sparse_mode=3,
                 atten_mask=self.atten_mask,
                 scale=sm_scale,
+                next_tokens=0,
                 actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                 actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
-                num_heads=q.shape[-2],
+                num_heads=N_Q,
                 num_key_value_heads=N_KV,
                 block_table=self.page_table,
                 block_size=self.backend.page_size,
             )[0]
-            return out
         else:
             return flash_attn_with_kvcache(
                 q=q,
@@ -138,6 +144,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
     page_table: torch.Tensor = None
     b_att_seq_len: torch.Tensor = None
     decode_max_q_seq_len: int = None
+    use_mtp_bnsd: bool = False
 
     def init_state(self):
         args_mtp_step = get_env_start_args().mtp_step
@@ -159,6 +166,8 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
 
         att_batch_size = self.infer_state.batch_size // (args_mtp_step + 1)
         assert self.infer_state.batch_size % (args_mtp_step + 1) == 0
+        self.use_mtp_bnsd = args_mtp_step > 0 and self.infer_state.input_ids.device.type == "npu"
+        page_table_batch_size = self.infer_state.batch_size if self.use_mtp_bnsd else att_batch_size
         model = self.backend.model
         table_len = triton.cdiv(self.infer_state.max_kv_seq_len, self.backend.page_size)
         if (
@@ -168,20 +177,25 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             page_buffer = self.backend.get_page_table_buffer()
             shared_table_len = triton.cdiv(model.graph_max_len_in_batch, self.backend.page_size)
             self.page_table = page_buffer[self.infer_state.microbatch_index][
-                : att_batch_size * shared_table_len
-            ].reshape(att_batch_size, shared_table_len)
+                : page_table_batch_size * shared_table_len
+            ].reshape(page_table_batch_size, shared_table_len)
         else:
             self.page_table = torch.empty(
-                (att_batch_size, table_len),
+                (page_table_batch_size, table_len),
                 dtype=torch.int32,
                 device=self.infer_state.input_ids.device,
             )
 
         if args_mtp_step > 0:
+            page_table_req_idx = (
+                self.infer_state.b_req_idx
+                if self.use_mtp_bnsd
+                else self.infer_state.b_req_idx[args_mtp_step :: (args_mtp_step + 1)]
+            )
             page_table_copy(
                 page_table=self.page_table[:, :table_len],
                 req_to_token_indexs=model.req_manager.req_to_token_indexs,
-                b_req_idx=self.infer_state.b_req_idx[args_mtp_step :: (args_mtp_step + 1)],
+                b_req_idx=page_table_req_idx,
                 page_size=self.backend.page_size,
             )
             self.b_att_seq_len = self.infer_state.b_seq_len[args_mtp_step :: (args_mtp_step + 1)].contiguous()
@@ -221,10 +235,15 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             k = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
             v = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
 
-            # Use BNSD for single-token decode; keep packed MTP on TND. TODO: Test on MTP + BNSD.
-            input_layout = "BNSD" if self.decode_max_q_seq_len == 1 else "TND"
-            if input_layout == "BNSD":
+            if self.decode_max_q_seq_len == 1 or self.use_mtp_bnsd:
+                input_layout = "BNSD"
+                sparse_mode = 0
+                atten_mask = None
                 q = q.unsqueeze(2)
+            else:
+                input_layout = "TND"
+                sparse_mode = 3
+                atten_mask = self.backend.get_causal_attn_mask(q.device)
 
             output = torch.empty_like(q)
             softmax_lse = torch.empty(1, dtype=torch.float16, device=q.device)
@@ -246,7 +265,10 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         query=q,
                         key=k,
                         value=v,
+                        atten_mask=atten_mask,
                         input_layout=input_layout,
+                        sparse_mode=sparse_mode,
+                        next_tokens=0,
                         scale=sm_scale,
                         actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                         actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
@@ -262,7 +284,10 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     query=q,
                     key=k,
                     value=v,
+                    atten_mask=atten_mask,
                     input_layout=input_layout,
+                    sparse_mode=sparse_mode,
+                    next_tokens=0,
                     scale=sm_scale,
                     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
@@ -292,7 +317,9 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         self.backend.page_size,
                         weak_ref_tensor(output),
                         weak_ref_tensor(softmax_lse),
+                        weak_ref_tensor(atten_mask),
                         input_layout,
+                        sparse_mode,
                     ),
                     microbatch_index=self.infer_state.microbatch_index,
                 )
@@ -301,7 +328,10 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     query=q,
                     key=k,
                     value=v,
+                    atten_mask=atten_mask,
                     input_layout=input_layout,
+                    sparse_mode=sparse_mode,
+                    next_tokens=0,
                     scale=sm_scale,
                     actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
                     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,

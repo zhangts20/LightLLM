@@ -116,7 +116,8 @@ class InferStateInfo:
             from lightllm.common.basemodel.graph.acl_graph import SeqLenManager
 
             args = get_env_start_args()
-            self.seq_len_manager = SeqLenManager(args.running_max_req_size + 1)
+            max_batch = max(args.running_max_req_size, args.graph_max_batch_size) * (args.mtp_step + 1)
+            self.seq_len_manager = SeqLenManager(max_batch)
 
     def init_some_extra_state(self, model):
         if self.is_prefill:

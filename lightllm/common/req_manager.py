@@ -98,12 +98,26 @@ class ReqManager:
         return b_last_mem_index
 
     def alloc_mem_indices(
-        self, need_size, b_seq_len=None, b_ready_cache_len=None, b_last_mem_index=None
+        self,
+        need_size,
+        b_seq_len=None,
+        b_ready_cache_len=None,
+        b_last_mem_index=None,
+        b_req_idx=None
     ) -> torch.Tensor:
         page_size = get_page_size()
         if page_size > 1 and b_seq_len is not None:
-            return self._alloc_paged_mem_indices(page_size, b_seq_len, b_ready_cache_len, b_last_mem_index)
+            return self._alloc_paged_mem_indices(
+                page_size, b_seq_len, b_ready_cache_len, b_last_mem_index, b_req_idx
+            )
         return self.mem_manager.alloc(need_size)
+
+    def get_page_aligned_mem_size(self, need_size: int) -> int:
+        page_size = get_page_size()
+        return ((need_size + page_size - 1) // page_size) * page_size
+
+    def alloc_page_aligned_mem_indices(self, need_size: int) -> torch.Tensor:
+        return self.mem_manager.alloc(self.get_page_aligned_mem_size(need_size))
 
     def free(self, free_req_indexes: List[int], free_token_index):
         for req_index in free_req_indexes:
@@ -122,6 +136,14 @@ class ReqManager:
     def free_token(self, free_token_index):
         self.mem_manager.free(self._expand_to_page_mem_indices(free_token_index))
         return
+
+    def get_mtp_rejected_mem_indices_to_free(self, rejected_token_indices: torch.Tensor) -> torch.Tensor:
+        page_size = get_page_size()
+        if page_size > 1:
+            rejected_token_indices = torch.unique(
+                rejected_token_indices[rejected_token_indices % page_size == 0]
+            )
+        return self._expand_to_page_mem_indices(rejected_token_indices)
 
     def free_all(self):
         self.req_list = _ReqLinkedList(self.max_request_num)
@@ -150,7 +172,7 @@ class ReqManager:
         p_token_len[last_page_positions] = remainders
         return need_pages_num, p_token_len
 
-    def _alloc_paged_mem_indices(self, page_size, b_seq_len, b_ready_cache_len, b_last_mem_index):
+    def _alloc_paged_mem_indices(self, page_size, b_seq_len, b_ready_cache_len, b_last_mem_index, b_req_idx):
         b_seq_len = b_seq_len.cpu()
         if b_ready_cache_len is not None:
             b_ready_cache_len = b_ready_cache_len.cpu()
@@ -169,9 +191,26 @@ class ReqManager:
         if new_pages_num > 0:
             new_pages_tokens = self.mem_manager.alloc(new_pages_num * page_size)
             token_idxs[need_new_page_mask] = new_pages_tokens[::page_size]
-        mask = ~need_new_page_mask
-        if mask.any():
-            token_idxs[mask] = b_last_mem_index[mask] + 1
+
+        if b_req_idx is None:
+            mask = ~need_new_page_mask
+            if mask.any():
+                token_idxs[mask] = b_last_mem_index[mask] + 1
+            return token_idxs
+
+        b_req_idx = b_req_idx.cpu()
+        for index in range(len(token_idxs)):
+            if need_new_page_mask[index]:
+                continue
+            continues_previous_req = bool(
+                index > 0
+                and b_req_idx[index] == b_req_idx[index - 1]
+                and b_seq_len[index] == b_seq_len[index - 1] + 1
+            )
+            if continues_previous_req:
+                token_idxs[index] = token_idxs[index - 1] + 1
+            else:
+                token_idxs[index] = b_last_mem_index[index] + 1
         return token_idxs
 
     def _get_need_paged_token_num(self, b_seq_len, b_ready_cache_len=None):

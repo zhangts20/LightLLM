@@ -550,13 +550,19 @@ class DPChunkedPrefillBackend(ModeBackend):
             # 第二阶段
             event_pack.notify_post_handle_and_wait_pre_post_handle()
             verify_event.synchronize()
+            self._update_mtp_last_kv_mem_index(
+                run_reqs, model_input.mem_indexes_cpu[0:req_num], accepted_index_cpu
+            )
             verify_ok_reqs = [run_reqs[i] for i in range(len(run_reqs)) if accepted_index_cpu[i] == 1]
             update_packs = self._pre_post_handle(verify_ok_reqs, is_chuncked_mode=False)
 
             # 第三阶段
             event_pack.notify_forward_and_wait_post_handle()
             sync_event.synchronize()
-            need_free_mem_indexes = model_input.mem_indexes_cpu[0:req_num][accepted_index_cpu == 0]
+            rejected_mem_indexes = model_input.mem_indexes_cpu[0:req_num][accepted_index_cpu == 0]
+            need_free_mem_indexes = g_infer_context.req_manager.get_mtp_rejected_mem_indices_to_free(
+                rejected_mem_indexes
+            )
             if eagle_mem_indexes_cpu is not None:
                 need_free_mem_indexes = torch.cat([need_free_mem_indexes, eagle_mem_indexes_cpu], dim=0)
 
@@ -642,10 +648,14 @@ class DPChunkedPrefillBackend(ModeBackend):
 
         real_req_num = req_num // (self.mtp_step + 1)
         padded_req_num = model_input.batch_size // (self.mtp_step + 1) - real_req_num
+        eagle_token_num = real_req_num * self.mtp_step
+        eagle_alloc_token_num = g_infer_context.req_manager.get_page_aligned_mem_size(eagle_token_num)
         if g_infer_context.radix_cache is not None:
-            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(real_req_num * self.mtp_step)
-        eagle_mem_indexes_cpu = g_infer_context.req_manager.mem_manager.alloc(real_req_num * self.mtp_step)
-        eagle_mem_indexes = eagle_mem_indexes_cpu.to(device=next_token_ids.device, non_blocking=True)
+            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(eagle_alloc_token_num)
+        eagle_mem_indexes_cpu = g_infer_context.req_manager.alloc_page_aligned_mem_indices(eagle_token_num)
+        eagle_mem_indexes = eagle_mem_indexes_cpu[:eagle_token_num].to(
+            device=next_token_ids.device, non_blocking=True
+        )
 
         # process the draft model output
         for _step in range(self.mtp_step):
@@ -896,7 +906,11 @@ class DPChunkedPrefillBackend(ModeBackend):
             mem_indexes_cpu = torch.cat(
                 (model_input0.mem_indexes_cpu[0:req_num0], model_input1.mem_indexes_cpu[0:req_num1]), dim=0
             )
-            need_free_mem_indexes = mem_indexes_cpu[accepted_index_cpu == 0]
+            self._update_mtp_last_kv_mem_index(run_reqs, mem_indexes_cpu, accepted_index_cpu)
+            rejected_mem_indexes = mem_indexes_cpu[accepted_index_cpu == 0]
+            need_free_mem_indexes = g_infer_context.req_manager.get_mtp_rejected_mem_indices_to_free(
+                rejected_mem_indexes
+            )
             if eagle_mem_indexes_cpu is not None:
                 need_free_mem_indexes = torch.cat((need_free_mem_indexes, eagle_mem_indexes_cpu), dim=0)
 
@@ -1024,10 +1038,14 @@ class DPChunkedPrefillBackend(ModeBackend):
         real_req_num = real_req_num0 + real_req_num1
         padded_req_num0 = model_input0.batch_size // (self.mtp_step + 1) - real_req_num0
         padded_req_num1 = model_input1.batch_size // (self.mtp_step + 1) - real_req_num1
+        eagle_token_num = real_req_num * self.mtp_step
+        eagle_alloc_token_num = g_infer_context.req_manager.get_page_aligned_mem_size(eagle_token_num)
         if g_infer_context.radix_cache is not None:
-            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(real_req_num * self.mtp_step)
-        eagle_mem_indexes_cpu = g_infer_context.req_manager.mem_manager.alloc(real_req_num * self.mtp_step)
-        eagle_mem_indexes = eagle_mem_indexes_cpu.to(device=next_token_ids.device, non_blocking=True)
+            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(eagle_alloc_token_num)
+        eagle_mem_indexes_cpu = g_infer_context.req_manager.alloc_page_aligned_mem_indices(eagle_token_num)
+        eagle_mem_indexes = eagle_mem_indexes_cpu[:eagle_token_num].to(
+            device=next_token_ids.device, non_blocking=True
+        )
         eagle_mem_indexes0 = eagle_mem_indexes[0 : real_req_num0 * self.mtp_step]
         eagle_mem_indexes1 = eagle_mem_indexes[real_req_num0 * self.mtp_step : real_req_num * self.mtp_step]
 

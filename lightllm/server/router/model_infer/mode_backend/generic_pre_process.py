@@ -156,11 +156,15 @@ def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[In
     if g_infer_context.radix_cache is not None:
         token_num = g_infer_context.req_manager.calc_real_need_token_num(b_seq_len.shape[0], b_seq_len)
         g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(token_num)
+    mtp_step = req_objs[0].mtp_step
     mem_indexes = g_infer_context.req_manager.alloc_mem_indices(
-        b_seq_len.shape[0], b_seq_len, b_last_mem_index=b_last_mem_index
+        b_seq_len.shape[0],
+        b_seq_len,
+        b_last_mem_index=b_last_mem_index,
+        b_req_idx=b_req_idx if mtp_step > 0 else None,
     )
     for i, req in enumerate(req_objs):
-        req.last_kv_mem_index = mem_indexes[i].item()
+        req.last_kv_mem_index = mem_indexes[i * (mtp_step + 1)].item()
 
     model_input = ModelInput(
         batch_size=b_seq_len.shape[0],

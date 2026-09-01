@@ -169,24 +169,40 @@ class LinearAttPrefillAttState(BasePrefillAttState):
 
         # Recurrent processing
         query, key, value = backend._rearrange_mixed_qkv(mixed_qkv)
-        initial_state = ssm_states[self.b_ssm_buffer_idx]
         # g and beta have shape (total_tokens, num_heads), need to unsqueeze to get (1, total_tokens, num_heads)
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            q=query,
-            k=key,
-            v=value,
-            g=g.unsqueeze(0),
-            beta=beta.unsqueeze(0),
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=infer_state.b1_cu_q_seq_len,
-            head_first=False,
-            use_qk_l2norm_in_kernel=True,
-        )
-        # The chunk kernel accumulates the recurrent state in float32 even when
-        # the state cache is configured as bfloat16. Advanced indexing does
-        # not perform an implicit dtype conversion for index_put.
-        ssm_states[self.b_ssm_buffer_idx] = last_recurrent_state.to(ssm_states.dtype, copy=False)
+        if query.device.type == "npu":
+            from lightllm.common.basemodel.triton_kernel.linear_att.fla.ops.fused_recurrent_npu import (
+                fused_recurrent_gated_delta_rule_npu,
+            )
+            core_attn_out = fused_recurrent_gated_delta_rule_npu(
+                q=query,
+                k=key,
+                v=value,
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state=ssm_states,
+                state_indices=self.b_ssm_buffer_idx,
+                cu_seqlens=infer_state.b1_cu_q_seq_len,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            initial_state = ssm_states[self.b_ssm_buffer_idx]
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=infer_state.b1_cu_q_seq_len,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # The chunk kernel accumulates the recurrent state in float32 even when
+            # the state cache is configured as bfloat16. Advanced indexing does
+            # not perform an implicit dtype conversion for index_put.
+            ssm_states[self.b_ssm_buffer_idx] = last_recurrent_state.to(ssm_states.dtype, copy=False)
         return core_attn_out
 
 
@@ -197,6 +213,7 @@ class LinearAttDecodeAttState(BaseDecodeAttState):
     b_ssm_buffer_idx: torch.Tensor = None
     b1_mtp_cu_q_seq_len: torch.Tensor = None
     b_num_accepted_tokens: torch.Tensor = None
+    b_accepted_ssm_state_indices: torch.Tensor = None
 
     def init_state(self):
         backend: LinearAttBackend = self.backend
@@ -227,6 +244,9 @@ class LinearAttDecodeAttState(BaseDecodeAttState):
             # shape 为 [att_batch_size]
             # 上一步接受的数量，用于linear att 的decode mtp 算子定位正确的conv 和 ssm信息的起点。
             self.b_num_accepted_tokens = self.infer_state.req_manager.req_to_mtp_state_index[self.b_conv_buffer_idx] + 1
+            self.b_accepted_ssm_state_indices = (
+                self.b_ssm_buffer_idx[:, 0] + self.b_num_accepted_tokens - 1
+            )
             return
 
     def decode_att(
@@ -251,7 +271,10 @@ class LinearAttDecodeAttState(BaseDecodeAttState):
 
         if backend.mtp_step > 0:
             # MTP 模式下，使用线性层 MTP 状态。
-            core_attn_out = self._gdn_mtp_kernel(
+            gdn_mtp_kernel = (
+                self._gdn_mtp_kernel_npu if mixed_qkv.device.type == "npu" else self._gdn_mtp_kernel
+            )
+            core_attn_out = gdn_mtp_kernel(
                 mixed_qkv,
                 conv_states,
                 ssm_states,
@@ -360,8 +383,57 @@ class LinearAttDecodeAttState(BaseDecodeAttState):
             k=key,
             v=value,
             initial_state=ssm_states,
+            final_state=ssm_states,
             cu_seqlens=cu_seqlens_q.to(torch.long),
             ssm_state_indices=self.b_ssm_buffer_idx,
+            ssm_state_write_indices=self.b_ssm_buffer_idx,
+            num_accepted_tokens=self.b_num_accepted_tokens,
+            A_log=layer_weight.linear_A_log.weight,
+            dt_bias=layer_weight.linear_dt_bias.weight,
+            a_raw=a,
+            b_raw=b,
+        )
+        return core_attn_out
+
+    def _gdn_mtp_kernel_npu(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        infer_state: "Qwen3NextInferStateInfo",
+        layer_weight: "Qwen3NextTransformerLayerWeight",
+    ):
+        from lightllm.common.basemodel.triton_kernel.linear_att.causal_conv1d_spec_sgl_npu import (
+            causal_conv1d_update_sgl_npu,
+        )
+
+        backend: LinearAttBackend = self.backend
+        conv_weight_t = layer_weight.linear_conv1d_mtp_weight_t
+        if conv_weight_t is None:
+            conv_weight_t = layer_weight.linear_conv1d.mm_param.weight.transpose(0, 1).contiguous()
+            layer_weight.linear_conv1d_mtp_weight_t = conv_weight_t
+        mixed_qkv = causal_conv1d_update_sgl_npu(
+            x=mixed_qkv,
+            conv_state=conv_states,
+            weight_t=conv_weight_t,
+            num_accepted_tokens=self.b_num_accepted_tokens,
+            conv_state_indices=self.b_conv_buffer_idx,
+            mtp_step=backend.mtp_step,
+            bias=layer_weight.linear_conv1d.bias,
+            activation=backend.activation,
+        )
+
+        query, key, value = backend._rearrange_mixed_qkv(mixed_qkv, decode=False)
+        core_attn_out, _ = mtp_fused_recurrent_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            initial_state=ssm_states,
+            final_state=ssm_states,
+            cu_seqlens=self.b1_mtp_cu_q_seq_len,
+            ssm_state_indices=self.b_accepted_ssm_state_indices,
             ssm_state_write_indices=self.b_ssm_buffer_idx,
             num_accepted_tokens=self.b_num_accepted_tokens,
             A_log=layer_weight.linear_A_log.weight,

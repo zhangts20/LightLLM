@@ -315,6 +315,7 @@ class ChunkedPrefillBackend(ModeBackend):
         # 第二阶段
         event_pack.notify_post_handle_and_wait_pre_post_handle()
         verify_event.synchronize()
+        self._update_mtp_last_kv_mem_index(run_reqs, model_input.mem_indexes_cpu, accepted_index_cpu)
         verify_ok_reqs = [run_reqs[i] for i in range(len(run_reqs)) if accepted_index_cpu[i] == 1]
         update_packs = self._pre_post_handle(verify_ok_reqs, is_chuncked_mode=False)
 
@@ -323,7 +324,10 @@ class ChunkedPrefillBackend(ModeBackend):
         sync_event.synchronize()
 
         # 处理需要释放的内存索引
-        need_free_mem_indexes = model_input.mem_indexes_cpu[accepted_index_cpu == 0]
+        rejected_mem_indexes = model_input.mem_indexes_cpu[accepted_index_cpu == 0]
+        need_free_mem_indexes = g_infer_context.req_manager.get_mtp_rejected_mem_indices_to_free(
+            rejected_mem_indexes
+        )
         if additional_mem_indexes_cpu is not None:
             need_free_mem_indexes = torch.cat([need_free_mem_indexes, additional_mem_indexes_cpu], dim=0)
 
@@ -405,10 +409,14 @@ class ChunkedPrefillBackend(ModeBackend):
     ):
         batch_size = main_model_input.batch_size
         num_reqs = batch_size // (self.mtp_step + 1)
+        eagle_token_num = num_reqs * self.mtp_step
+        eagle_alloc_token_num = g_infer_context.req_manager.get_page_aligned_mem_size(eagle_token_num)
         if g_infer_context.radix_cache is not None:
-            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(num_reqs * self.mtp_step)
-        eagle_mem_indexes_cpu = g_infer_context.req_manager.mem_manager.alloc(num_reqs * self.mtp_step)
-        eagle_mem_indexes = eagle_mem_indexes_cpu.to(device=next_token_ids.device, non_blocking=True)
+            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(eagle_alloc_token_num)
+        eagle_mem_indexes_cpu = g_infer_context.req_manager.alloc_page_aligned_mem_indices(eagle_token_num)
+        eagle_mem_indexes = eagle_mem_indexes_cpu[:eagle_token_num].to(
+            device=next_token_ids.device, non_blocking=True
+        )
 
         # share some inference info with the main model
         draft_model_input = main_model_input

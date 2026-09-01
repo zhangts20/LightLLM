@@ -891,6 +891,17 @@ class ModeBackend:
                 req.update_mtp_accepted_token_num(accept_token_num=accept_len - 1)
         return
 
+    def _update_mtp_last_kv_mem_index(
+        self,
+        run_reqs: List[InferReq],
+        mem_indexes_cpu: torch.Tensor,
+        accepted_index_cpu: torch.Tensor,
+    ):
+        for req, mem_index, accepted in zip(run_reqs, mem_indexes_cpu, accepted_index_cpu):
+            if bool(accepted):
+                req.last_kv_mem_index = mem_index.item()
+        return
+
     def _gen_argmax_token_ids(self, model_output: ModelOutput):
         logits = model_output.logits
         draft_next_token_ids_gpu = torch.argmax(logits, dim=-1)

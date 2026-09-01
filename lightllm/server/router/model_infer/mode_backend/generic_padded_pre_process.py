@@ -108,7 +108,6 @@ def padded_prepare_prefill_inputs(
     )
     for i, req in enumerate(req_objs):
         req.last_kv_mem_index = b_last_mem_index[i].item()
-    g_infer_state_lock.release()
 
     if padded_req_num > 0:
         mem_indexes = F.pad(
@@ -224,10 +223,10 @@ def padded_prepare_decode_inputs(
         b_seq_len.shape[0] - padded_mem_indexes_num,
         b_seq_len[: len(b_last_mem_index)],
         b_last_mem_index=b_last_mem_index,
+        b_req_idx=b_req_idx[: len(b_last_mem_index)] if args_mtp_step > 0 else None,
     )
     for i, req in enumerate(req_objs):
-        req.last_kv_mem_index = mem_indexes[i].item()
-    g_infer_state_lock.release()
+        req.last_kv_mem_index = mem_indexes[i * (args_mtp_step + 1)].item()
 
     if padded_mem_indexes_num > 0:
         mem_indexes = F.pad(

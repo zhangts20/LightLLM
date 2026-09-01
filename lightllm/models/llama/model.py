@@ -83,7 +83,7 @@ class LlamaTpPartModel(TpPartBaseModel):
             scaling_type = rope_scaling["type"]
         else:
             raise ValueError(f"Unknown RoPE scaling format {rope_scaling}")
-        if scaling_type == "default" or "mrope_section" in rope_scaling:
+        if scaling_type == "default":
             self._init_to_get_rotary()
         elif scaling_type == "yarn":
             self._init_to_get_yarn_rotary()
@@ -204,7 +204,7 @@ class LlamaTpPartModel(TpPartBaseModel):
     def _init_to_get_yarn_rotary(self):
         from .yarn_rotary_utils import find_correction_range, linear_ramp_mask, get_mscale
 
-        dim = self.head_dim_
+        dim = int(self.config.get("partial_rotary_factor", 1.0) * self.head_dim_)
         max_position_embeddings = self.config.get("max_position_embeddings", 2048)
         base = self.config.get("rope_theta", 10000.0)
         if self.config.get("rope_scaling", {}) is None:

@@ -12,8 +12,6 @@ logger = init_logger(__name__)
 class SeqLenManager:
 
     def __init__(self, max_batch: int):
-        self.max_batch = max_batch
-
         self.b1_cu_q_seq_len_cpu = torch.empty(max_batch, dtype=torch.int32, device='cpu', pin_memory=True)
         self.b_cu_kv_seq_len_cpu = torch.empty(max_batch, dtype=torch.int32, device='cpu', pin_memory=True)
 
@@ -34,28 +32,24 @@ class SeqLenManager:
         return self.b1_cu_q_seq_len_cpu[:self.n_q], self.b_cu_kv_seq_len_cpu[:self.n_kv]
 
 
-def weak_ref_fia_workspaces() -> None:
-    if ATTN_PARAMS is None:
-        return
-    for bs, ws in list(ATTN_PARAMS.workspaces.items()):
+def weak_ref_fia_workspaces(attn_params: "AclGraphParams") -> None:
+    for bs, ws in list(attn_params.workspaces.items()):
         if ws is None:
             continue
-        ATTN_PARAMS.workspaces[bs] = weak_ref_tensor(ws)
+        attn_params.workspaces[bs] = weak_ref_tensor(ws)
 
 
-def weak_ref_fia_workspace(batch_size: int) -> None:
-    if ATTN_PARAMS is None:
-        return
-    workspace = ATTN_PARAMS.workspaces.get(batch_size)
+def weak_ref_fia_workspace(batch_size: int, attn_params: "AclGraphParams") -> None:
+    workspace = attn_params.workspaces.get(batch_size)
     if workspace is not None:
-        ATTN_PARAMS.workspaces[batch_size] = weak_ref_tensor(workspace)
+        attn_params.workspaces[batch_size] = weak_ref_tensor(workspace)
 
 
 @register_decode_graph("ascend")
 class AclGraph(DecodeGraph):
 
     def _init_decode_graph_extra(self):
-        init_attn_params(self.graph_batch_sizes)
+        self.attn_params = init_attn_params(self.graph_batch_sizes)
         self.update_stream = torch.npu.Stream()
         logger.info("AclGraph: weak_ref_fia_workspace enabled after capture")
 
@@ -63,17 +57,17 @@ class AclGraph(DecodeGraph):
         return self.graph_max_len_in_batch
 
     def _after_capture_batch(self, batch_size: int) -> None:
-        weak_ref_fia_workspace(batch_size)
+        weak_ref_fia_workspace(batch_size, self.attn_params)
         logger.info("AclGraph: batch_size=%s FIA workspace weak-ref'd", batch_size)
 
     def warmup(self, model):
         super().warmup(model)
-        weak_ref_fia_workspaces()
+        weak_ref_fia_workspaces(self.attn_params)
         logger.info("AclGraph: FIA workspaces weak-ref'd after capture")
 
     def warmup_overlap(self, model):
         super().warmup_overlap(model)
-        weak_ref_fia_workspaces()
+        weak_ref_fia_workspaces(self.attn_params)
         logger.info("AclGraph: FIA workspaces weak-ref'd after overlap capture")
 
     def _sync_attn(self, batch_size: int, *graph_states: InferStateInfo):
@@ -83,6 +77,7 @@ class AclGraph(DecodeGraph):
                 (st.b1_cu_q_seq_len_cpu, st.b_cu_kv_seq_len_cpu) for st in graph_states
             ),
             update_stream=self.update_stream,
+            attn_params=self.attn_params,
         )
 
     def _replay(self, infer_state: InferStateInfo):
@@ -139,6 +134,7 @@ def init_attn_params(batch_sizes: list[int]):
         workspaces={bs: None for bs in batch_sizes},
         attn_params={bs: _microbatch_buckets() for bs in batch_sizes},
     )
+    return ATTN_PARAMS
 
 
 def get_attn_params():
