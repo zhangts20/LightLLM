@@ -15,6 +15,7 @@ from lightllm.utils.vllm_utils import HAS_VLLM, vllm_ops, cutlass_scaled_mm
 from lightllm.utils.sgl_utils import HAS_SGL_KERNEL, sgl_ops
 
 _HAS_SGL_FP8 = HAS_SGL_KERNEL and sgl_ops is not None and hasattr(sgl_ops, "fp8_scaled_mm")
+ACL_FORMAT_FRACTAL_NZ = 29
 
 
 if HAS_VLLM:
@@ -56,6 +57,22 @@ class BaseQuantizationMethod(QuantizationMethod):
         self, out_dims: Union[int, List[int]], in_dim: int, dtype: torch.dtype, device_id: int, num_experts: int = 1
     ) -> Tuple[WeightPack, List[WeightPack]]:
         raise NotImplementedError("Not implemented")
+
+
+class _NPUW8A8WeightGroup:
+
+    def __init__(
+        self,
+        full_weight_pack: WeightPack,
+        split_weight_packs: List[WeightPack],
+        num_experts: int,
+    ):
+        self.full_weight_pack = full_weight_pack
+        self.split_weight_packs = split_weight_packs
+        self.num_experts = num_experts
+        self.expected_load_pack_num = len(split_weight_packs) * num_experts
+        self.load_weight_packs = list(split_weight_packs) if num_experts == 1 else []
+        self.expert_weight_packs = {}
 
 
 @QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="cuda")
@@ -119,6 +136,211 @@ class w8a8QuantizationMethod(BaseQuantizationMethod):
             weight_scale_split_dim=-1,
         )
         return mm_param, mm_param_list
+
+
+@QUANTMETHODS.register(["w8a8", "w8a8-ascend"], platform="ascend")
+class w8a8NPUQuantizationMethod(BaseQuantizationMethod):
+
+    def __init__(self):
+        super().__init__()
+        self.has_weight_scale = True
+        self.has_weight_zero_point = False
+
+        # A fused MoE creates both w13 and w2 through one quantization-method
+        # instance. Track finalization per full weight instead of keeping one
+        # global pending pack.
+        self._weight_group_by_pack_id = {}
+
+    @property
+    def method_name(self):
+        return "w8a8-ascend"
+
+    def quantize(self, weight: torch.Tensor, output: WeightPack) -> None:
+        import torch_npu
+
+        quant_dtype = weight.dtype
+        if quant_dtype not in (torch.float16, torch.bfloat16):
+            quant_dtype = torch.bfloat16
+        weight = weight.to(device=self.target_device, dtype=quant_dtype)
+
+        q_weight, weight_scale = torch_npu.npu_dynamic_quant(weight, dst_type=torch.int8)
+        q_weight = q_weight.transpose(-1, -2).contiguous()
+
+        output.weight.copy_(q_weight)
+        output.weight_scale.copy_(weight_scale.reshape_as(output.weight_scale))
+
+    def load_weight(self, weight: torch.Tensor, weight_pack: WeightPack) -> None:
+        if getattr(weight_pack, "_npu_w8a8_format_finalized", False):
+            raise RuntimeError("Cannot load Ascend W8A8 weight after it has been converted to FRACTAL_NZ")
+
+        if not self._check_weight_need_quanted(weight):
+            raise NotImplementedError("Loading pre-quantized Ascend W8A8 weights is not supported")
+
+        super().load_weight(weight, weight_pack)
+
+        group_entry = self._weight_group_by_pack_id.get(id(weight_pack))
+        if group_entry is None:
+            return
+        weight_group, _ = group_entry
+        self._try_finalize_weight_group(weight_group)
+
+    def get_expert_weight_pack(self, weight_pack: WeightPack, expert_idx: int) -> WeightPack:
+        if getattr(weight_pack, "_npu_w8a8_format_finalized", False):
+            raise RuntimeError("Cannot create an expert view after the Ascend W8A8 weight has been finalized")
+
+        group_entry = self._weight_group_by_pack_id.get(id(weight_pack))
+        if group_entry is None:
+            return super().get_expert_weight_pack(weight_pack, expert_idx)
+
+        weight_group, split_index = group_entry
+        if weight_group.num_experts == 1:
+            return super().get_expert_weight_pack(weight_pack, expert_idx)
+        if split_index is None:
+            if len(weight_group.split_weight_packs) != 1:
+                raise RuntimeError("A full multi-output MoE weight cannot be loaded as one expert pack")
+            split_index = 0
+
+        expert_pack_key = (split_index, expert_idx)
+        cached_expert_pack = weight_group.expert_weight_packs.get(expert_pack_key)
+        if cached_expert_pack is not None:
+            return cached_expert_pack
+
+        expert_pack = super().get_expert_weight_pack(weight_pack, expert_idx)
+        weight_group.expert_weight_packs[expert_pack_key] = expert_pack
+        weight_group.load_weight_packs.append(expert_pack)
+        self._weight_group_by_pack_id[id(expert_pack)] = (weight_group, split_index)
+        return expert_pack
+
+    def _try_finalize_weight_group(self, weight_group: _NPUW8A8WeightGroup) -> None:
+        if len(weight_group.load_weight_packs) != weight_group.expected_load_pack_num:
+            return
+        if not all(all(weight_pack.load_ok) for weight_pack in weight_group.load_weight_packs):
+            return
+
+        self._finalize_weight_group(weight_group)
+
+    def _finalize_weight_group(self, weight_group: _NPUW8A8WeightGroup) -> None:
+        import torch_npu
+
+        full_weight_pack = weight_group.full_weight_pack
+        split_weight_packs = weight_group.split_weight_packs
+        split_sizes = [split_pack.weight.shape[-1] for split_pack in split_weight_packs]
+
+        full_weight_pack.weight = torch_npu.npu_format_cast(
+            full_weight_pack.weight,
+            ACL_FORMAT_FRACTAL_NZ,
+        )
+        nz_weight_views = torch.split(full_weight_pack.weight, split_sizes, dim=-1)
+        for split_pack, nz_weight_view in zip(split_weight_packs, nz_weight_views):
+            split_pack.weight = nz_weight_view
+
+        # Per-expert packs are used only while loading and verifying weights,
+        # but rebinding them releases their old ND views immediately and keeps
+        # their load state usable by FusedMoeWeight.verify_load().
+        for (split_index, expert_idx), expert_pack in weight_group.expert_weight_packs.items():
+            expert_pack.weight = nz_weight_views[split_index][expert_idx]
+
+        all_weight_packs = [full_weight_pack, *split_weight_packs]
+        if weight_group.num_experts > 1:
+            all_weight_packs.extend(weight_group.load_weight_packs)
+        for weight_pack in all_weight_packs:
+            weight_pack._npu_w8a8_format_finalized = True
+            self._weight_group_by_pack_id.pop(id(weight_pack), None)
+
+    def apply(
+        self,
+        input_tensor: torch.Tensor,
+        weight_pack: WeightPack,
+        out: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
+        use_custom_tensor_mananger: bool = True,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        original_shape = input_tensor.shape
+        x = input_tensor.reshape(-1, original_shape[-1])
+
+        x_q, x_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
+
+        result = self.apply_quantized(
+            x_q,
+            x_scale,
+            weight_pack,
+            output_dtype=input_tensor.dtype,
+            bias=bias,
+        )
+        result = result.reshape(*original_shape[:-1], weight_pack.weight.shape[-1])
+
+        if out is not None:
+            out.copy_(result)
+            return out
+
+        return result
+
+    def apply_quantized(
+        self,
+        input_tensor: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_pack: WeightPack,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        return torch_npu.npu_quant_matmul(
+            input_tensor,
+            weight_pack.weight,
+            weight_pack.weight_scale,
+            pertoken_scale=input_scale,
+            bias=bias,
+            output_dtype=output_dtype,
+        )
+
+    def _create_weight(
+        self,
+        out_dims: Union[int, List[int]],
+        in_dim: int,
+        dtype: torch.dtype,
+        device_id: int,
+        num_experts: int = 1,
+    ) -> Tuple[WeightPack, List[WeightPack]]:
+        weight_out_dims = out_dims if isinstance(out_dims, list) else [out_dims]
+        out_dim = sum(weight_out_dims)
+        expert_prefix = (num_experts,) if num_experts > 1 else ()
+
+        # Dense: [K, N], MoE: [E, K, N]
+        weight = torch.empty(
+            expert_prefix + (in_dim, out_dim),
+            dtype=torch.int8,
+            device=self.target_device,
+        )
+        # Dense: [N], MoE: [E, N]
+        weight_scale = torch.empty(
+            expert_prefix + (out_dim,),
+            dtype=torch.float32,
+            device=self.target_device,
+        )
+
+        pack = WeightPack(weight=weight, weight_scale=weight_scale)
+        pack_list = self._split_weight_pack(
+            pack,
+            weight_out_dims=weight_out_dims,
+            weight_split_dim=-1,
+            weight_scale_out_dims=weight_out_dims,
+            weight_scale_split_dim=-1,
+        )
+
+        weight_group = _NPUW8A8WeightGroup(
+            full_weight_pack=pack,
+            split_weight_packs=pack_list,
+            num_experts=num_experts,
+        )
+        self._weight_group_by_pack_id[id(pack)] = (weight_group, None)
+        for split_index, split_pack in enumerate(pack_list):
+            self._weight_group_by_pack_id[id(split_pack)] = (weight_group, split_index)
+
+        return pack, pack_list
 
 
 @QUANTMETHODS.register(["fp8w8a8-vllm", "fp8w8a8"], platform="cuda")

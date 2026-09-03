@@ -92,6 +92,9 @@ class QuantizationMethod(ABC):
             num_experts=num_experts,
         )
 
+    def get_expert_weight_pack(self, weight_pack: WeightPack, expert_idx: int) -> WeightPack:
+        return weight_pack.get_expert(expert_idx)
+
     def load_weight(self, weight: torch.Tensor, weight_pack: WeightPack) -> None:
         if self._check_weight_need_quanted(weight):
             self.quantize(weight, weight_pack)

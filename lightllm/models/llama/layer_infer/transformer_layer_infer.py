@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import torch.distributed as dist
@@ -7,13 +8,18 @@ from lightllm.models.llama.infer_struct import LlamaInferStateInfo
 from lightllm.common.basemodel import TransformerLayerInferTpl
 from lightllm.distributed.npu_mm_all_reduce import (
     can_use_npu_mm_all_reduce,
+    can_use_npu_w8a8_mm_all_reduce,
     is_plain_mm_weight,
+    is_npu_w8a8_weight,
     npu_mm_all_reduce,
+    npu_w8a8_mm_all_reduce,
 )
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
+
+NPU_SWIGLU_QUANT_MAX_TOKENS = int(os.getenv("LIGHTLLM_NPU_SWIGLU_QUANT_MAX_TOKENS", "64"))
 
 
 def npu_silu_and_mul_fwd(
@@ -63,6 +69,28 @@ def npu_ffn_fwd(
     import torch.nn.functional as F
 
     input = input.view(-1, embed_dim)
+    down_quant_method = layer_weight.down_proj.quant_method
+
+    if down_quant_method.method_name == "w8a8-ascend":
+        up_gate_out = layer_weight.gate_up_proj.mm(input)
+        if input.shape[0] <= NPU_SWIGLU_QUANT_MAX_TOKENS:
+            import torch_npu
+
+            ffn1_out, ffn1_scale = torch_npu.npu_dequant_swiglu_quant(
+                up_gate_out,
+                activate_left=True,
+                quant_mode=1,
+            )
+            return down_quant_method.apply_quantized(
+                ffn1_out,
+                ffn1_scale,
+                layer_weight.down_proj.mm_param,
+                output_dtype=input.dtype,
+                bias=layer_weight.down_proj.bias,
+            )
+
+        return layer_weight.down_proj.mm(npu_silu_and_mul_fwd(up_gate_out))
+
     # up
     gate_up_proj_bias = [layer_weight.gate_up_proj.bias] if layer_weight.gate_up_proj.bias is not None else None
     weight = layer_weight.gate_up_proj.mm_param.weight
@@ -110,6 +138,18 @@ def npu_ffn_fwd_mm_ar(
     ffn1_out = npu_silu_and_mul_fwd(up_gate_out)
 
     return npu_mm_all_reduce(ffn1_out, layer_weight.down_proj, infer_state)
+
+
+def npu_w8a8_ffn_fwd_mm_ar(
+    input: torch.Tensor,
+    layer_weight: LlamaTransformerLayerWeight,
+    embed_dim: int,
+    infer_state: LlamaInferStateInfo,
+) -> torch.Tensor:
+    input = input.view(-1, embed_dim)
+    up_gate_out = layer_weight.gate_up_proj.mm(input)
+    ffn1_out = npu_silu_and_mul_fwd(up_gate_out)
+    return npu_w8a8_mm_all_reduce(ffn1_out, layer_weight.down_proj, infer_state)
 
 
 class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
@@ -205,11 +245,12 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
 
         input = input.view(-1, self.tp_o_head_num_ * self.head_dim_)
 
-        if (
-            can_use_npu_mm_all_reduce(input.shape[0], infer_state)
-            and is_plain_mm_weight(layer_weight.o_proj)
-        ):
+        if is_plain_mm_weight(layer_weight.o_proj) and can_use_npu_mm_all_reduce(input.shape[0], infer_state):
             return npu_mm_all_reduce(input, layer_weight.o_proj, infer_state)
+        if is_npu_w8a8_weight(layer_weight.o_proj) and can_use_npu_w8a8_mm_all_reduce(
+            input.shape[0], infer_state
+        ):
+            return npu_w8a8_mm_all_reduce(input, layer_weight.o_proj, infer_state)
 
         o_tensor = layer_weight.o_proj.mm(input)
 
@@ -220,12 +261,20 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         input = input.view(-1, self.embed_dim_)
         input = self._tpsp_allgather(input=input, infer_state=infer_state)
 
-        if (
-            can_use_npu_mm_all_reduce(input.shape[0], infer_state)
-            and is_plain_mm_weight(layer_weight.down_proj)
-            and input.device.type == "npu"
-        ):
+        if input.device.type == "npu" and is_plain_mm_weight(
+            layer_weight.down_proj
+        ) and can_use_npu_mm_all_reduce(input.shape[0], infer_state):
             return npu_ffn_fwd_mm_ar(
+                input=input,
+                layer_weight=layer_weight,
+                embed_dim=self.embed_dim_,
+                infer_state=infer_state,
+            )
+
+        if input.device.type == "npu" and is_npu_w8a8_weight(
+            layer_weight.down_proj
+        ) and can_use_npu_w8a8_mm_all_reduce(input.shape[0], infer_state):
+            return npu_w8a8_ffn_fwd_mm_ar(
                 input=input,
                 layer_weight=layer_weight,
                 embed_dim=self.embed_dim_,

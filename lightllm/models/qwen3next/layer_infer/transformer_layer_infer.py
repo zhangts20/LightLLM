@@ -7,8 +7,11 @@ from lightllm.models.qwen3next.layer_weights.transformer_layer_weight import (
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.distributed.npu_mm_all_reduce import (
     can_use_npu_mm_all_reduce,
+    can_use_npu_w8a8_mm_all_reduce,
     is_plain_mm_weight,
+    is_npu_w8a8_weight,
     npu_mm_all_reduce,
+    npu_w8a8_mm_all_reduce,
 )
 from lightllm.models.qwen3next.infer_struct import Qwen3NextInferStateInfo
 from lightllm.utils.log_utils import init_logger
@@ -181,12 +184,15 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         sigmoid_mul_(input, infer_state.gate_logics_value)
         infer_state.gate_logics_value = None
 
-        if (
-            input.device.type == "npu"
-            and can_use_npu_mm_all_reduce(input.shape[0], infer_state)
-            and is_plain_mm_weight(layer_weight.o_proj)
-        ):
+        if input.device.type == "npu" and is_plain_mm_weight(
+            layer_weight.o_proj
+        ) and can_use_npu_mm_all_reduce(input.shape[0], infer_state):
             return npu_mm_all_reduce(input, layer_weight.o_proj, infer_state)
+
+        if input.device.type == "npu" and is_npu_w8a8_weight(
+            layer_weight.o_proj
+        ) and can_use_npu_w8a8_mm_all_reduce(input.shape[0], infer_state):
+            return npu_w8a8_mm_all_reduce(input, layer_weight.o_proj, infer_state)
 
         o_tensor = layer_weight.o_proj.mm(input)
         o_tensor = self._tpsp_reduce(input=o_tensor, infer_state=infer_state)

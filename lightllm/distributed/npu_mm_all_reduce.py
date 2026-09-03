@@ -2,12 +2,10 @@ import torch
 from typing import Any
 from lightllm.utils.dist_utils import get_current_rank_in_dp
 from lightllm.utils.envs_utils import get_env_start_args
-from lightllm.utils.log_utils import init_logger
-
-logger = init_logger(__name__)
 
 # The minimum number of tokens to use npu_mm_all_reduce.
-NPU_MM_ALL_REDUCE_MIN_TOKENS = 512
+NPU_MM_ALL_REDUCE_MIN_TOKENS = 288
+NPU_W8A8_MM_ALL_REDUCE_MIN_TOKENS = 288
 
 # ProcessGroup -> hcom name
 _HCOM_CACHE: dict = {}
@@ -33,7 +31,6 @@ def get_hccl_comm_name(group: Any) -> str:
         rank = get_current_rank_in_dp()
     name = backend.get_hccl_comm_name(rank)
     _HCOM_CACHE[key] = name
-    logger.info(f"npu_mm_all_reduce hcom={name} min_tokens={NPU_MM_ALL_REDUCE_MIN_TOKENS}")
 
     return name
 
@@ -49,7 +46,11 @@ def get_mm_ar_weight(mm_weight) -> torch.Tensor:
     return mm_weight._npu_mm_ar_weight
 
 
-def can_use_npu_mm_all_reduce(token_num: int, infer_state) -> bool:
+def can_use_npu_mm_all_reduce(
+    token_num: int,
+    infer_state,
+    min_tokens: int = NPU_MM_ALL_REDUCE_MIN_TOKENS,
+) -> bool:
     # Check whether to fuse matmul and all_reduce into a single operation.
     args = get_env_start_args()
     if getattr(args, "disable_npu_mm_all_reduce", False):
@@ -64,7 +65,7 @@ def can_use_npu_mm_all_reduce(token_num: int, infer_state) -> bool:
     if not getattr(infer_state, "is_prefill", False):
         return False
 
-    if token_num < NPU_MM_ALL_REDUCE_MIN_TOKENS:
+    if token_num < min_tokens:
         return False
 
     tp_world_size = getattr(args, "tp", 1) // max(getattr(args, "dp", 1), 1)
@@ -72,6 +73,14 @@ def can_use_npu_mm_all_reduce(token_num: int, infer_state) -> bool:
         return False
 
     return True
+
+
+def can_use_npu_w8a8_mm_all_reduce(token_num: int, infer_state) -> bool:
+    return can_use_npu_mm_all_reduce(
+        token_num,
+        infer_state,
+        min_tokens=NPU_W8A8_MM_ALL_REDUCE_MIN_TOKENS,
+    )
 
 
 def is_plain_mm_weight(mm_weight) -> bool:
@@ -87,6 +96,18 @@ def is_plain_mm_weight(mm_weight) -> bool:
         if getattr(mm_weight.mm_param, "weight_scale", None) is not None:
             return False
         return True
+    except Exception:
+        return False
+
+
+def is_npu_w8a8_weight(mm_weight) -> bool:
+    try:
+        return (
+            mm_weight.quant_method.method_name == "w8a8-ascend"
+            and mm_weight.mm_param.weight.dtype == torch.int8
+            and mm_weight.mm_param.weight_scale is not None
+            and mm_weight.bias is None
+        )
     except Exception:
         return False
 
@@ -109,3 +130,31 @@ def npu_mm_all_reduce(
         out = out + bias
 
     return out
+
+
+def npu_w8a8_mm_all_reduce(
+    x: torch.Tensor,
+    mm_weight,
+    infer_state,
+    *,
+    reduce_op: str = "sum",
+) -> torch.Tensor:
+    import torch_npu
+
+    hcom = get_hccl_comm_name(infer_state.dist_group)
+    x_q, x_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
+
+    dequant_scale = getattr(mm_weight, "_npu_mm_ar_dequant_scale", None)
+    expected_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float32
+    if dequant_scale is None or dequant_scale.dtype != expected_dtype:
+        dequant_scale = mm_weight.mm_param.weight_scale.to(expected_dtype)
+        mm_weight._npu_mm_ar_dequant_scale = dequant_scale
+
+    return torch_npu.npu_mm_all_reduce_base(
+        x_q,
+        mm_weight.mm_param.weight,
+        hcom,
+        reduce_op=reduce_op,
+        dequant_scale=dequant_scale,
+        pertoken_scale=x_scale,
+    )
