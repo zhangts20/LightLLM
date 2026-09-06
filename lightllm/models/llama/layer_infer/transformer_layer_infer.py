@@ -183,7 +183,10 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         infer_state: LlamaInferStateInfo,
         layer_weight: LlamaTransformerLayerWeight,
     ) -> torch.Tensor:
-        _k, _v = infer_state.mem_manager.get_att_input_params(layer_index=self.layer_num_)
+        if hasattr(infer_state.mem_manager, "get_prefill_att_input_params"):
+            _k, _v = infer_state.mem_manager.get_prefill_att_input_params(kv, layer_index=self.layer_num_)
+        else:
+            _k, _v = infer_state.mem_manager.get_att_input_params(layer_index=self.layer_num_)
         _q = q.view(-1, self.tp_q_head_num_, self.head_dim_)
         o_tensor = infer_state.prefill_att_state.prefill_att(
             q=_q,

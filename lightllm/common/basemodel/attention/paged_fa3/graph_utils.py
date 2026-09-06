@@ -51,6 +51,7 @@ def update_attn_params(
                     atten_mask,
                     input_layout,
                     sparse_mode,
+                    kv_cache_args,
                 ) = attn_param
                 torch.npu.graph_task_update_begin(update_stream, handle)
                 torch_npu.npu_fused_infer_attention_score.out(
@@ -70,6 +71,7 @@ def update_attn_params(
                     block_size=block_size,
                     workspace=workspace,
                     out=[output, softmax_lse],
+                    **kv_cache_args,
                 )
                 torch.npu.graph_task_update_end(update_stream)
                 event.record(update_stream)

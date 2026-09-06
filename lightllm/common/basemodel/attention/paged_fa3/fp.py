@@ -1,4 +1,6 @@
 import dataclasses
+from typing import Any
+
 import torch
 import triton
 from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, AttControl
@@ -214,6 +216,14 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
         assert att_control.use_alibi is False
         return self._normal_decode_att(q=q, k=k, v=v, att_control=att_control, alloc_func=alloc_func)
 
+    def _prepare_npu_kv_cache(
+        self, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, int, dict[str, Any]]:
+        N_KV, HEAD_DIM = k.shape[-2:]
+        k = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
+        v = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
+        return k, v, N_KV, {}
+
     def _normal_decode_att(self, q, k, v, att_control: AttControl, alloc_func=torch.empty):
         if att_control.use_sliding_window:
             window_size = att_control.sliding_window
@@ -230,10 +240,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             import torch_npu
 
             N_Q = q.shape[-2]
-            N_KV, HEAD_DIM = k.shape[-2:]
-
-            k = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
-            v = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
+            k, v, N_KV, kv_cache_args = self._prepare_npu_kv_cache(k, v)
 
             if self.decode_max_q_seq_len == 1 or self.use_mtp_bnsd:
                 input_layout = "BNSD"
@@ -276,6 +283,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         num_key_value_heads=N_KV,
                         block_table=self.page_table,
                         block_size=self.backend.page_size,
+                        **kv_cache_args,
                     )
                     attn_params.workspaces[batch_size] = workspace
 
@@ -297,6 +305,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     block_size=self.backend.page_size,
                     workspace=workspace,
                     out=[output, softmax_lse],
+                    **kv_cache_args,
                 )
                 handle = torch.npu.graph_task_group_end(stream)
 
@@ -320,6 +329,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         weak_ref_tensor(atten_mask),
                         input_layout,
                         sparse_mode,
+                        {name: weak_ref_tensor(value) for name, value in kv_cache_args.items()},
                     ),
                     microbatch_index=self.infer_state.microbatch_index,
                 )
@@ -340,6 +350,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     block_table=self.page_table,
                     block_size=self.backend.page_size,
                     out=[output, softmax_lse],
+                    **kv_cache_args,
                 )
 
             return output.squeeze(2) if input_layout == "BNSD" else output

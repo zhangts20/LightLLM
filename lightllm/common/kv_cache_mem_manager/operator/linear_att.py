@@ -216,8 +216,8 @@ class LinearAttMemOperator(BaseMemManagerOperator):
 class NpuLinearAttMemOperator(LinearAttMemOperator):
 
     def copy_kv_to_mem_manager(self, layer_index: int, mem_index: torch.Tensor, kv: torch.Tensor):
-        layer_index = layer_index // self.linear_config.full_attention_interval
         mem_manager = self.mem_manager
+        layer_index = mem_manager.get_full_att_cache_layer_index(layer_index)
         k_src = kv[:, : mem_manager.head_num, :]
         v_src = kv[:, mem_manager.head_num :, :]
 

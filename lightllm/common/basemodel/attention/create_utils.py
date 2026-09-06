@@ -22,7 +22,6 @@ def _resolve_registry_name(
     if (
         name == "fa3"
         and category == "standard"
-        and kv_type == "None"
         and get_page_size() > 1
         and att_backend_registry.is_registered(
             category=category,

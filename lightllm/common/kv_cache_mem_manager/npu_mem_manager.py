@@ -1,4 +1,3 @@
-
 from lightllm.common.kv_cache_mem_manager.operator.base import BaseMemManagerOperator
 import torch
 from typing import Any, List, Tuple
@@ -10,6 +9,9 @@ from .mem_manager import MemoryManager
 
 
 logger = init_logger(__name__)
+
+
+NPU_INT8_KV_ALIGNMENT = 32
 
 
 class NPUOperator(BaseMemManagerOperator):
@@ -121,3 +123,166 @@ class NPUMemoryManager(MemoryManager):
         req_idx: int = None,
     ):
         raise NotImplementedError("NPUMemoryManager does not support PD-separated read_page_kv_move_buffer_to_mem")
+
+
+class NPUInt8KVOperator(BaseMemManagerOperator):
+
+    def copy_kv_to_mem_manager(
+        self, layer_index: int, mem_index: torch.Tensor, kv: torch.Tensor
+    ) -> None:
+        import torch_npu
+
+        mem_manager = self.mem_manager
+        token_num = kv.shape[0]
+        if token_num != mem_index.shape[0]:
+            raise ValueError(f"KV token count {token_num} does not match index count {mem_index.shape[0]}")
+        if token_num == 0:
+            return
+
+        expected_shape = (token_num, 2 * mem_manager.head_num, mem_manager.head_dim)
+        if tuple(kv.shape) != expected_shape:
+            raise ValueError(f"Expected KV shape {expected_shape}, got {tuple(kv.shape)}")
+
+        k_src = kv[:, : mem_manager.head_num].reshape(token_num, -1)
+        v_src = kv[:, mem_manager.head_num :].reshape(token_num, -1)
+        k_quant, k_scale = torch_npu.npu_dynamic_quant(k_src, dst_type=torch.int8)
+        v_quant, v_scale = torch_npu.npu_dynamic_quant(v_src, dst_type=torch.int8)
+
+        slot = mem_index.contiguous()
+        if slot.dtype not in (torch.int32, torch.int64):
+            slot = slot.to(torch.int32)
+
+        torch_npu._npu_reshape_and_cache(
+            key=k_quant.view(token_num, mem_manager.head_num, mem_manager.head_dim),
+            value=v_quant.view(token_num, mem_manager.head_num, mem_manager.head_dim),
+            key_cache=mem_manager.k_buffer[layer_index],
+            value_cache=mem_manager.v_buffer[layer_index],
+            slot_indices=slot,
+        )
+
+        mem_manager.k_scale_buffer[layer_index].view(-1).index_copy_(
+            0,
+            slot,
+            k_scale,
+        )
+        mem_manager.v_scale_buffer[layer_index].view(-1).index_copy_(
+            0,
+            slot,
+            v_scale,
+        )
+
+
+class NPUInt8KVMemoryManager(NPUMemoryManager):
+
+    operator_class = NPUInt8KVOperator
+
+    def __init__(
+        self,
+        size: int | None,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        always_copy: bool = True,
+        mem_fraction: float = 0.9,
+    ) -> None:
+        self.kv_dtype = torch.int8
+        self.scale_dtype = torch.float32
+        super().__init__(
+            size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            always_copy=always_copy,
+            mem_fraction=mem_fraction,
+        )
+
+    def get_cell_size(self) -> int:
+        kv_bytes = 2 * self.head_num * self.head_dim * self.layer_num * torch._utils._element_size(self.kv_dtype)
+        scale_bytes = 2 * self.layer_num * torch._utils._element_size(self.scale_dtype)
+        return kv_bytes + scale_bytes
+
+    def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:
+        return (
+            self.k_buffer[layer_index],
+            self.k_scale_buffer[layer_index],
+        ), (
+            self.v_buffer[layer_index],
+            self.v_scale_buffer[layer_index],
+        )
+
+    def get_prefill_att_input_params(
+        self, kv: torch.Tensor, layer_index: int | None = None
+    ) -> Tuple[Any, Any]:
+        k = kv[:, : self.head_num]
+        v = kv[:, self.head_num :]
+        if layer_index is None:
+            return k, v
+
+        return (
+            k,
+            self.k_buffer[layer_index],
+            self.k_scale_buffer[layer_index],
+        ), (
+            v,
+            self.v_buffer[layer_index],
+            self.v_scale_buffer[layer_index],
+        )
+
+    def _init_buffers(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+    ) -> None:
+        page_size = get_page_size()
+        if page_size <= 1 or page_size > 512 or page_size % NPU_INT8_KV_ALIGNMENT != 0:
+            raise ValueError(
+                "Ascend INT8 paged KV cache requires PAGE_SIZE to be a multiple of "
+                f"{NPU_INT8_KV_ALIGNMENT} and no greater than 512, got {page_size}"
+            )
+
+        if head_dim % NPU_INT8_KV_ALIGNMENT != 0:
+            raise ValueError(
+                f"Ascend INT8 paged KV cache requires head_dim to be a multiple of "
+                f"{NPU_INT8_KV_ALIGNMENT}, got {head_dim}"
+            )
+
+        alloc_size = ((size // page_size) + 1) * page_size
+        num_blocks = alloc_size // page_size
+        cache_shape = (layer_num, num_blocks, page_size, head_num, head_dim)
+        scale_shape = (layer_num, num_blocks, page_size)
+        logger.info(
+            f"Total INT8 KV page blocks allocated: {num_blocks} for page_size: {page_size}, "
+            f"cache_shape: {cache_shape}, scale_shape: {scale_shape}"
+        )
+
+        self.k_buffer = torch.empty(cache_shape, dtype=self.kv_dtype, device=self.target_device)
+        self.v_buffer = torch.empty(cache_shape, dtype=self.kv_dtype, device=self.target_device)
+        self.k_scale_buffer = torch.empty(scale_shape, dtype=self.scale_dtype, device=self.target_device)
+        self.v_scale_buffer = torch.empty(scale_shape, dtype=self.scale_dtype, device=self.target_device)
+        # Decode graph warmup maps its dummy sequence to this reserved page.
+        self.k_buffer[:, -1].zero_()
+        self.v_buffer[:, -1].zero_()
+        self.k_scale_buffer[:, -1].fill_(1.0)
+        self.v_scale_buffer[:, -1].fill_(1.0)
+        # Some common code uses kv_buffer only to identify the owning layer.
+        self.kv_buffer = self.k_buffer
+
+    def _free_buffers(self) -> None:
+        self.k_buffer = None
+        self.v_buffer = None
+        self.k_scale_buffer = None
+        self.v_scale_buffer = None
+        self.kv_buffer = None
+
+    def get_index_kv_buffer(self, index: Any) -> dict[str, torch.Tensor]:
+        raise NotImplementedError("Ascend INT8 KV cache does not support prompt-cache export yet")
+
+    def load_index_kv_buffer(
+        self, index: Any, load_tensor_dict: dict[str, torch.Tensor]
+    ) -> None:
+        raise NotImplementedError("Ascend INT8 KV cache does not support prompt-cache import yet")
