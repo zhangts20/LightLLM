@@ -12,13 +12,35 @@ from lightllm.common.basemodel.triton_kernel.gen_prefill_params import gen_cumsu
 from lightllm.platform.base.attention import register_att_backend
 from .graph_utils import weak_ref_tensor
 
+try:
+    from flash_attn import flash_attn_varlen_func as maca_flash_attn_varlen_func
+    from flash_attn import flash_attn_with_kvcache as maca_flash_attn_with_kvcache
+except ImportError:
+    maca_flash_attn_varlen_func = None
+    maca_flash_attn_with_kvcache = None
 
-@register_att_backend(name="paged_fa3", category="standard", platforms=("ascend", "cuda",), validate_name="fa3")
+
+@register_att_backend(name="paged_fa3", category="standard", platforms=("ascend", "cuda", "maca",), validate_name="fa3")
 class PagedFa3AttBackend(BaseAttBackend):
 
     def __init__(self, model, page_size=None):
         super().__init__(model=model)
         self.page_size = page_size or get_page_size()
+        self.is_maca = get_env_start_args().hardware_platform == "maca"
+        if self.is_maca:
+            if self.page_size % 16 != 0:
+                raise ValueError(
+                    "MetaX FlashAttention requires PAGE_SIZE to be a multiple "
+                    f"of 16, but got PAGE_SIZE={self.page_size}"
+                )
+            if (
+                maca_flash_attn_varlen_func is None
+                or maca_flash_attn_with_kvcache is None
+            ):
+                raise RuntimeError(
+                    "MetaX paged FlashAttention requires flash_attn_varlen_func "
+                    "and flash_attn_with_kvcache from the flash_attn package"
+                )
         self.get_page_table_buffer()
 
     def get_page_table_buffer(self):
@@ -95,7 +117,26 @@ class PagedFa3PrefillAttState(BasePrefillAttState):
 
         sm_scale = 1.0 / (q.shape[-1] ** 0.5)
 
-        if q.device.type == "npu":
+        if self.backend.is_maca:
+            if sink_weight is not None:
+                raise NotImplementedError(
+                    "MetaX FlashAttention does not support attention sinks"
+                )
+            return maca_flash_attn_varlen_func(
+                q=q,
+                k=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
+                v=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
+                block_table=self.page_table,
+                cu_seqlens_q=self.cu_seqlens_q,
+                cu_seqlens_k=self.cu_seqlens_k,
+                max_seqlen_q=self.infer_state.max_q_seq_len,
+                max_seqlen_k=self.infer_state.max_kv_seq_len,
+                softmax_scale=sm_scale,
+                causal=True,
+                window_size=window_size,
+                softcap=0.0,
+            )
+        elif q.device.type == "npu":
             import torch_npu
 
             N_Q, HEAD_DIM = q.shape[-2:]
@@ -236,7 +277,36 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             sink_weight = None
 
         sm_scale = 1.0 / (q.shape[-1] ** 0.5)
-        if q.device.type == "npu":
+        if self.backend.is_maca:
+            if sink_weight is not None:
+                raise NotImplementedError(
+                    "MetaX FlashAttention does not support attention sinks"
+                )
+
+            att_batch_size = self.page_table.shape[0]
+            expected_tokens = att_batch_size * self.decode_max_q_seq_len
+            if q.shape[0] != expected_tokens:
+                raise ValueError(
+                    "Unexpected MetaX decode query shape: "
+                    f"q tokens={q.shape[0]}, batch={att_batch_size}, "
+                    f"q_len={self.decode_max_q_seq_len}"
+                )
+            q_bshd = q.view(
+                att_batch_size, self.decode_max_q_seq_len, q.shape[1], q.shape[2]
+            )
+            output = maca_flash_attn_with_kvcache(
+                q=q_bshd,
+                k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
+                v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
+                block_table=self.page_table,
+                cache_seqlens=self.b_att_seq_len,
+                softmax_scale=sm_scale,
+                causal=True,
+                window_size=window_size,
+                softcap=0.0,
+            )
+            return output.view_as(q)
+        elif q.device.type == "npu":
             import torch_npu
 
             N_Q = q.shape[-2]
