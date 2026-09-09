@@ -11,7 +11,13 @@ from lightllm.common.basemodel.layer_weights.meta_weights.mm_weight.mm_slicer im
 from lightllm.common.basemodel.layer_weights.meta_weights.fused_moe.impl import select_fuse_moe_impl
 from lightllm.common.basemodel.moe_route_info_manager import get_moe_capture_callback
 from lightllm.common.quantization.quantize_method import QuantizationMethod
-from lightllm.utils.envs_utils import get_redundancy_expert_ids, get_redundancy_expert_num, get_env_start_args
+from lightllm.common.quantization.no_quant import NoQuantization
+from lightllm.utils.envs_utils import (
+    enable_env_vars,
+    get_redundancy_expert_ids,
+    get_redundancy_expert_num,
+    get_env_start_args,
+)
 from lightllm.utils.dist_utils import get_global_world_size, get_global_rank
 from lightllm.utils.log_utils import init_logger
 
@@ -50,7 +56,10 @@ class FusedMoeWeight(BaseWeightTpl):
         self.global_world_size = get_global_world_size()
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
-        self.quant_method = quant_method
+        if quant_method.method_name == "w8a8-ascend" and not enable_env_vars("LIGHTLLM_NPU_ENABLE_MOE_W8A8"):
+            self.quant_method = NoQuantization()
+        else:
+            self.quant_method = quant_method
         assert num_fused_shared_experts in [0, 1], "num_fused_shared_experts can only support 0 or 1 now."
         self.enable_ep_moe = get_env_start_args().enable_ep_moe
         self.n_routed_experts = n_routed_experts
@@ -84,8 +93,10 @@ class FusedMoeWeight(BaseWeightTpl):
         self.redundancy_expert_num = get_redundancy_expert_num()
         self.redundancy_expert_ids = get_redundancy_expert_ids(self.layer_num_)
         self.auto_update_redundancy_expert: bool = get_env_start_args().auto_update_redundancy_expert
-        self.redundancy_expert_ids_tensor = torch.tensor(self.redundancy_expert_ids, dtype=torch.int64, device="cuda")
-        self.routed_expert_counter_tensor = torch.zeros((self.n_routed_experts,), dtype=torch.int64, device="cuda")
+        self.redundancy_expert_ids_tensor = torch.tensor(
+            self.redundancy_expert_ids, dtype=torch.int64, device=self.target_device)
+        self.routed_expert_counter_tensor = torch.zeros(
+            (self.n_routed_experts,), dtype=torch.int64, device=self.target_device)
         # TODO: find out the reason of failure of deepep when redundancy_expert_num is 1.
         assert self.redundancy_expert_num != 1, "redundancy_expert_num can not be 1 for some unknown hang of deepep."
 
@@ -303,7 +314,7 @@ class FusedMoeWeight(BaseWeightTpl):
             self.e_score_correction_bias = torch.empty(
                 (self.n_routed_experts,),
                 dtype=self.data_type_,
-                device=f"cuda:{self.device_id_}",
+                device=self.target_device,
             )
             self.e_score_correction_bias.load_ok = False
 
@@ -311,7 +322,7 @@ class FusedMoeWeight(BaseWeightTpl):
             self.per_expert_scale = torch.empty(
                 (self.n_routed_experts,),
                 dtype=torch.float32,
-                device=f"cuda:{self.device_id_}",
+                device=self.target_device,
             )
             self.per_expert_scale.load_ok = False
 
@@ -347,7 +358,7 @@ class FusedMoeWeight(BaseWeightTpl):
     def _get_expert_weight_list(self, weight_pack: WeightPack):
         weight_list = []
         for idx in range(self.local_n_routed_experts):
-            expert_weight = weight_pack.get_expert(idx)
+            expert_weight = self.quant_method.get_expert_weight_pack(weight_pack, idx)
             weight_list.append(expert_weight)
         return weight_list
 

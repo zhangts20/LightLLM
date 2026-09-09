@@ -28,6 +28,8 @@ def _fwd_kernel_scatter(
 
     if not HAS_OUT_IS_NONE:
         cur_has_out = tl.load(b_has_out + block_range, mask=block_mask, other=False)
+        # Mask must have boolean scalar type on NPU
+        cur_has_out = cur_has_out.to(tl.int1)
         if OLD_VERSION_TRITON:
             cur_has_out = cur_has_out != 0
         tl.store(
@@ -102,8 +104,8 @@ def _fwd_kernel_gather(
     block_index = tl.program_id(0)
     block_range = block_index * BLOCK + tl.arange(0, BLOCK)
     block_mask = block_range < num_size
-    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask)
-    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask)
+    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask, other=0)
+    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask, other=0)
     cur_next_token_id = tl.load(
         req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + cur_mtp_index, mask=block_mask
     )
@@ -122,7 +124,7 @@ def gather_token(req_to_next_token_ids: torch.Tensor, b_req_idx: torch.Tensor, b
         output: (batch_size,)
     """
     batch_size = b_req_idx.shape[0]
-    output = torch.empty(batch_size, dtype=req_to_next_token_ids.dtype, device="cuda")
+    output = torch.empty(batch_size, dtype=req_to_next_token_ids.dtype, device=b_req_idx.device)
     BLOCK = 256
     grid = (triton.cdiv(batch_size, BLOCK),)
     num_warps = 1
@@ -157,15 +159,17 @@ def _fwd_kernel_gather_prefill_decode_mixed(
     block_index = tl.program_id(0)
     block_range = block_index * BLOCK + tl.arange(0, BLOCK)
     block_mask = block_range < num_size
-    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask)
-    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask)
+    cur_req_idx = tl.load(b_req_idx + block_range, mask=block_mask, other=0)
+    cur_mtp_index = tl.load(b_mtp_index + block_range, mask=block_mask, other=0)
     cur_next_token_id = tl.load(
         req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + cur_mtp_index, mask=block_mask
     )
-    cur_is_decode_req = tl.load(b_is_decode_req + block_range, mask=block_mask, other=False)
-    cur_prefill_start_loc = tl.load(b_prefill_start_loc + block_range, mask=block_mask, other=-1)
-
-    tl.store(input_ids + cur_prefill_start_loc, cur_next_token_id, mask=block_mask & cur_is_decode_req)
+    # Maca: mask must be boolean scalar type
+    cur_is_decode_req = tl.load(b_is_decode_req + block_range, mask=block_mask, other=0)
+    cur_is_decode_req = (cur_is_decode_req != 0).to(tl.int1)
+    cur_prefill_start_loc = tl.load(b_prefill_start_loc + block_range, mask=block_mask, other=0)
+    store_mask = block_mask & cur_is_decode_req
+    tl.store(input_ids + cur_prefill_start_loc, cur_next_token_id, mask=store_mask)
     return
 
 

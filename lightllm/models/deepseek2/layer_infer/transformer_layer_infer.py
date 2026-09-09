@@ -5,7 +5,7 @@ from lightllm.models.deepseek2.layer_weights.transformer_layer_weight import Dee
 from lightllm.common.basemodel.attention.base_att import AttControl
 from lightllm.models.deepseek2.triton_kernel.sample_kv import sample_kv
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
-from lightllm.models.deepseek2.triton_kernel.rotary_emb import rotary_emb_fwd
+from lightllm.models.deepseek2.triton_kernel.rotary_emb import rotary_emb_fwd as ds2_rotary_emb_fwd
 from lightllm.models.deepseek2.infer_struct import Deepseek2InferStateInfo
 from lightllm.common.basemodel.triton_kernel.fused_moe.grouped_fused_moe_ep import (
     use_sm100_mega_moe,
@@ -164,11 +164,14 @@ class Deepseek2TransformerLayerInfer(LlamaTransformerLayerInfer):
             layer_weight.kv_a_layernorm_(
                 cache_kv[:, :, : self.kv_lora_rank], eps=self.eps_, out=cache_kv[:, :, : self.kv_lora_rank]
             )
-            rotary_emb_fwd(
-                q_rope,
-                cache_kv[:, :, self.kv_lora_rank :],
-                infer_state.position_cos,
-                infer_state.position_sin,
+            self.platform_backend.ops.rotary_emb(
+                is_prefill=infer_state.is_prefill,
+                batch_size=infer_state.batch_size,
+                q=q_rope,
+                k=cache_kv[:, :, self.kv_lora_rank :],
+                cos=infer_state.position_cos,
+                sin=infer_state.position_sin,
+                rotary_impl=ds2_rotary_emb_fwd,
             )
             if infer_state.need_dp_prefill_balance:
                 q = infer_state._all_to_all_unbalance_get(data=q)
@@ -193,11 +196,14 @@ class Deepseek2TransformerLayerInfer(LlamaTransformerLayerInfer):
             layer_weight.kv_a_layernorm_(
                 cache_kv[:, :, : self.kv_lora_rank], eps=self.eps_, out=cache_kv[:, :, : self.kv_lora_rank]
             )
-            rotary_emb_fwd(
-                q_rope,
-                cache_kv[:, :, self.kv_lora_rank :],
-                infer_state.position_cos,
-                infer_state.position_sin,
+            self.platform_backend.ops.rotary_emb(
+                is_prefill=infer_state.is_prefill,
+                batch_size=infer_state.batch_size,
+                q=q_rope,
+                k=cache_kv[:, :, self.kv_lora_rank :],
+                cos=infer_state.position_cos,
+                sin=infer_state.position_sin,
+                rotary_impl=ds2_rotary_emb_fwd,
             )
             return q, cache_kv
 

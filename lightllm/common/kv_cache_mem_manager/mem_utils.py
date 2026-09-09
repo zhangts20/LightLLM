@@ -10,6 +10,8 @@ from . import (
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.llm_utils import get_llm_model_class
+from lightllm.common.kv_cache_mem_manager.npu_mem_manager import NPUMemoryManager, NPUInt8KVMemoryManager
+from lightllm.platform import get_backend
 from functools import lru_cache
 
 logger = init_logger(__name__)
@@ -42,7 +44,9 @@ def select_mem_manager_class():
 
     # case normal
     logger.info(f"mode setting params: {get_env_start_args().llm_kv_type}")
-    if get_env_start_args().llm_kv_type == "int8kv":
+    if get_env_start_args().llm_kv_type == "int8kv" and get_backend().name == "ascend":
+        memory_manager_class = NPUInt8KVMemoryManager
+    elif get_env_start_args().llm_kv_type == "int8kv":
         memory_manager_class = PPLINT8KVMemoryManager
     elif get_env_start_args().llm_kv_type == "int4kv":
         memory_manager_class = PPLINT4KVMemoryManager
@@ -51,7 +55,10 @@ def select_mem_manager_class():
     elif get_env_start_args().llm_kv_type == "fp8kv_spt":
         memory_manager_class = FP8StaticPerTensorQuantMemManager
     elif get_env_start_args().llm_kv_type == "None":
-        memory_manager_class = MemoryManager
+        if get_backend().name == "ascend":
+            memory_manager_class = NPUMemoryManager
+        else:
+            memory_manager_class = MemoryManager
 
     logger.info(f"Model kv cache using mem_manager class: {memory_manager_class}")
     return memory_manager_class
@@ -65,4 +72,5 @@ def used_mem_manager_has_scale() -> bool:
         PPLINT4KVMemoryManager,
         FP8StaticPerHeadQuantMemManager,
         FP8StaticPerTensorQuantMemManager,
+        NPUInt8KVMemoryManager,
     ]

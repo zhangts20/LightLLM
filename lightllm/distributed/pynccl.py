@@ -44,14 +44,9 @@ from lightllm.distributed.pynccl_wrapper import (
 
 logger = logging.getLogger(__name__)
 
-_current_stream = None
-
 
 def current_stream() -> torch.cuda.Stream:
-    global _current_stream
-    if _current_stream is None:
-        _current_stream = torch.cuda.current_stream()
-    return _current_stream
+    return torch.cuda.current_stream()
 
 
 @dataclasses.dataclass
@@ -177,7 +172,7 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
-        logger.info("LightLLM is using nccl==%s", self.nccl.ncclGetVersion())
+        logger.info("LightLLM is using collective lib version %s", self.nccl.ncclGetVersion())
 
         if self.rank == 0:
             # get the unique id from NCCL
@@ -222,7 +217,14 @@ class PyNcclCommunicator:
     def destroy(self):
         self.nccl.ncclCommDestroy(self.comm)
 
-    def all_reduce(self, in_tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        in_tensor: torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+        stream=None,
+        *,
+        inplace: bool = False,
+    ) -> torch.Tensor:
         if self.disabled:
             return None
         # nccl communicator created on a specific device
@@ -233,7 +235,10 @@ class PyNcclCommunicator:
             f"but the input tensor is on {in_tensor.device}"
         )
 
-        out_tensor = torch.empty_like(in_tensor)
+        if inplace:
+            out_tensor = in_tensor
+        else:
+            out_tensor = torch.empty_like(in_tensor)
 
         if stream is None:
             stream = current_stream()

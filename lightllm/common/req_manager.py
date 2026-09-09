@@ -1,13 +1,17 @@
 import torch
+import triton
 import collections
+
+from triton.backends import Backend
 from lightllm.common.linear_att_cache_manager.config_objs import LinearAttCacheConfig
 
+from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
 from .kv_cache_mem_manager import MemoryManager
 from typing import List, Optional, TYPE_CHECKING
 from lightllm.common.basemodel.triton_kernel.gen_sampling_params import token_id_counter
 from lightllm.common.basemodel.triton_kernel.gen_sampling_params import update_req_to_token_id_counter
-from lightllm.utils.envs_utils import get_env_start_args
+from lightllm.utils.envs_utils import enable_env_vars, get_env_start_args, get_page_size
 from lightllm.utils.config_utils import get_vocab_size
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
 from lightllm.common.linear_att_cache_manager.layer_cache import LayerCache
@@ -62,21 +66,58 @@ class _ReqLinkedList:
 
 class ReqManager:
     def __init__(self, max_request_num, max_sequence_length, mem_manager: MemoryManager):
+        platform_backend = get_backend()
+        self.target_device = platform_backend.runtime.target_device()
         # 这里对最大请求数量的管理在默认上多申请了一个，主要是 index 为 max_request_num 代表
         # 的这个请求管理 id， 主要是为了兼容 DP 运行模式下，让各个 DP 能 padding 到 DP 中最大
         # 的那个batch size 进行运行，所有 padding 的请求都会使用预留的这个请求管理 id 进行处理
         # 这样让 DP 的实现更为简化一些。
         self.req_list = _ReqLinkedList(max_request_num)
         self.req_to_token_indexs = torch.zeros(
-            (max_request_num + 1, max_sequence_length), dtype=torch.int32, device="cuda"
+            (max_request_num + 1, max_sequence_length), dtype=torch.int32, device=self.target_device
         )
         self.mem_manager = mem_manager
-        self.req_sampling_params_manager = ReqSamplingParamsManager(max_request_num)
+        self.req_sampling_params_manager = ReqSamplingParamsManager(
+            max_request_num, device=self.target_device, platform_backend=platform_backend
+        )
         self.max_request_num = max_request_num
         self.HOLD_REQUEST_ID = max_request_num
 
     def alloc(self):
         return self.req_list.alloc()
+
+    def calc_real_need_token_num(self, need_token_num, b_seq_len, b_ready_cache_len=None):
+        return max(need_token_num, self._get_need_paged_token_num(b_seq_len, b_ready_cache_len))
+
+    def calc_last_mem_index_in_prefill(self, mem_indices, b_seq_len, b_ready_cache_len=None):
+        b_token_len = b_seq_len
+        if b_ready_cache_len is not None:
+            b_token_len = b_seq_len - b_ready_cache_len
+        b_token_len_cumsum = torch.cumsum(b_token_len, dim=0)
+        b_last_mem_index = mem_indices[b_token_len_cumsum - 1]
+        return b_last_mem_index
+
+    def alloc_mem_indices(
+        self,
+        need_size,
+        b_seq_len=None,
+        b_ready_cache_len=None,
+        b_last_mem_index=None,
+        b_req_idx=None
+    ) -> torch.Tensor:
+        page_size = get_page_size()
+        if page_size > 1 and b_seq_len is not None:
+            return self._alloc_paged_mem_indices(
+                page_size, b_seq_len, b_ready_cache_len, b_last_mem_index, b_req_idx
+            )
+        return self.mem_manager.alloc(need_size)
+
+    def get_page_aligned_mem_size(self, need_size: int) -> int:
+        page_size = get_page_size()
+        return ((need_size + page_size - 1) // page_size) * page_size
+
+    def alloc_page_aligned_mem_indices(self, need_size: int) -> torch.Tensor:
+        return self.mem_manager.alloc(self.get_page_aligned_mem_size(need_size))
 
     def free(self, free_req_indexes: List[int], free_token_index):
         for req_index in free_req_indexes:
@@ -84,7 +125,7 @@ class ReqManager:
 
         if self.req_list.is_all_free():
             logger.debug(f"freed all request size {self.req_list.can_alloc_size}")
-        self.mem_manager.free(free_token_index)
+        self.mem_manager.free(self._expand_to_page_mem_indices(free_token_index))
 
     def free_req(self, free_req_index: int):
         self.req_list.free(free_req_index)
@@ -93,12 +134,97 @@ class ReqManager:
         return
 
     def free_token(self, free_token_index):
-        self.mem_manager.free(free_token_index)
+        self.mem_manager.free(self._expand_to_page_mem_indices(free_token_index))
         return
+
+    def get_mtp_rejected_mem_indices_to_free(self, rejected_token_indices: torch.Tensor) -> torch.Tensor:
+        page_size = get_page_size()
+        if page_size > 1:
+            rejected_token_indices = torch.unique(
+                rejected_token_indices[rejected_token_indices % page_size == 0]
+            )
+        return self._expand_to_page_mem_indices(rejected_token_indices)
 
     def free_all(self):
         self.req_list = _ReqLinkedList(self.max_request_num)
         return
+
+    def _expand_to_page_mem_indices(self, free_token_index):
+        page_size = get_page_size()
+        if page_size > 1:
+            if isinstance(free_token_index, list):
+                free_token_index = torch.tensor(free_token_index, dtype=torch.int32)
+            base_indices = free_token_index[free_token_index % page_size == 0]
+            if len(base_indices) == 0:
+                return free_token_index
+            page_offsets = torch.arange(page_size, dtype=base_indices.dtype, device=base_indices.device)
+            return (base_indices[:, None] + page_offsets[None, :]).reshape(-1)
+
+        return free_token_index
+
+    def _expand_by_page_size(self, b_token_len, page_size):
+        b_page_len = triton.cdiv(b_token_len, page_size)
+        need_pages_num = int(b_page_len.sum().item())
+        p_token_len = torch.full((need_pages_num,), page_size, dtype=b_token_len.dtype, device=b_token_len.device)
+        cumsum_pages = torch.cumsum(b_page_len, dim=0)
+        last_page_positions = cumsum_pages - 1
+        remainders = b_token_len - (b_page_len - 1) * page_size
+        p_token_len[last_page_positions] = remainders
+        return need_pages_num, p_token_len
+
+    def _alloc_paged_mem_indices(self, page_size, b_seq_len, b_ready_cache_len, b_last_mem_index, b_req_idx):
+        b_seq_len = b_seq_len.cpu()
+        if b_ready_cache_len is not None:
+            b_ready_cache_len = b_ready_cache_len.cpu()
+            b_token_len = b_seq_len - b_ready_cache_len
+            total_pages_needed, p_token_len = self._expand_by_page_size(b_token_len, page_size)
+            paged_token_idxs = self.mem_manager.alloc(total_pages_needed * page_size)
+            pages = paged_token_idxs.view(-1, page_size)
+            mask = torch.arange(page_size, device=p_token_len.device) < p_token_len.unsqueeze(1)
+            return pages[mask]
+
+        assert b_last_mem_index is not None
+        b_last_mem_index = b_last_mem_index.cpu()
+        need_new_page_mask = (b_seq_len - 1) % page_size == 0
+        new_pages_num = int(need_new_page_mask.sum().item())
+        token_idxs = torch.zeros_like(b_seq_len, device=b_seq_len.device)
+        if new_pages_num > 0:
+            new_pages_tokens = self.mem_manager.alloc(new_pages_num * page_size)
+            token_idxs[need_new_page_mask] = new_pages_tokens[::page_size]
+
+        if b_req_idx is None:
+            mask = ~need_new_page_mask
+            if mask.any():
+                token_idxs[mask] = b_last_mem_index[mask] + 1
+            return token_idxs
+
+        b_req_idx = b_req_idx.cpu()
+        for index in range(len(token_idxs)):
+            if need_new_page_mask[index]:
+                continue
+            continues_previous_req = bool(
+                index > 0
+                and b_req_idx[index] == b_req_idx[index - 1]
+                and b_seq_len[index] == b_seq_len[index - 1] + 1
+            )
+            if continues_previous_req:
+                token_idxs[index] = token_idxs[index - 1] + 1
+            else:
+                token_idxs[index] = b_last_mem_index[index] + 1
+        return token_idxs
+
+    def _get_need_paged_token_num(self, b_seq_len, b_ready_cache_len=None):
+        page_size = get_page_size()
+        if page_size == 1:
+            return 0
+
+        if b_ready_cache_len is not None:
+            need_tokens_array = b_seq_len - b_ready_cache_len
+            need_pages_array = triton.cdiv(need_tokens_array, page_size)
+            need_new_pages = need_pages_array.sum()
+        else:
+            need_new_pages = ((b_seq_len - 1) % page_size == 0).sum()
+        return need_new_pages * page_size
 
 
 class ReqSamplingParamsManager:
@@ -109,25 +235,33 @@ class ReqSamplingParamsManager:
     lightllm/server/router/model_infer/mode_backend/generic_post_process.py 文件中的使用方式。
     """
 
-    def __init__(self, max_request_num):
+    def __init__(self, max_request_num, device: torch.device, platform_backend: Backend):
+        self.target_device = device
+        self.platform_backend = platform_backend
         # mode ["cpu_counter", "pin_mem_counter", "gpu_counter"]
         self.penalty_counter_mode = get_env_start_args().penalty_counter_mode
-        self.vocab_size = get_vocab_size(get_env_start_args().model_dir)
-        self.req_to_presence_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device="cuda")
-        self.req_to_frequency_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device="cuda")
-        self.req_to_repetition_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device="cuda")
+        model_dir = get_env_start_args().model_dir
+        self.vocab_size = get_vocab_size(model_dir)
+        if self.vocab_size <= 0:
+            raise RuntimeError(
+                f"invalid vocab_size={self.vocab_size} from model_dir={model_dir}; "
+                "cannot allocate penalty token counter (check config.json, AutoConfig, or tokenizer)"
+            )
+        self.req_to_presence_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device=self.target_device)
+        self.req_to_frequency_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device=self.target_device)
+        self.req_to_repetition_penalty = torch.zeros(max_request_num + 1, dtype=torch.float32, device=self.target_device)
         self.req_to_next_token_ids = torch.zeros(
             (max_request_num + 1, 8),
             dtype=torch.int64,
-            device="cuda",
+            device=self.target_device,
         )
         self.req_to_exponential_decay_length_penalty = torch.zeros(
-            max_request_num + 1, dtype=torch.float32, device="cuda"
+            max_request_num + 1, dtype=torch.float32, device=self.target_device
         )
 
         if self.penalty_counter_mode == "gpu_counter":
             self.req_to_out_token_id_counter = torch.zeros(
-                (max_request_num + 1, self.vocab_size), dtype=torch.int32, device="cuda"
+                (max_request_num + 1, self.vocab_size), dtype=torch.int32, device=self.target_device
             )
         elif self.penalty_counter_mode == "pin_mem_counter":
             self.req_to_out_token_id_counter = torch.zeros(
@@ -162,11 +296,11 @@ class ReqSamplingParamsManager:
                     key="prompt_ids_for_penalty",
                     data=req.shm_req.get_prompt_ids_numpy(),
                     dtype=torch.int32,
-                ).cuda(non_blocking=True)
+                ).to(device=self.target_device, non_blocking=True)
                 token_id_counter(
                     prompt_ids=prompt_ids, out_token_id_counter=self.req_to_out_token_id_counter[req.req_idx]
                 )
-                torch.cuda.current_stream().synchronize()
+                self.platform_backend.runtime.current_stream().synchronize()
 
         return
 
@@ -176,7 +310,10 @@ class ReqSamplingParamsManager:
         if self.penalty_counter_mode not in ["gpu_counter", "pin_mem_counter"]:
             return
 
-        assert b_req_idx.is_cuda and next_token_ids.is_cuda and b_req_idx.shape[0] == next_token_ids.shape[0]
+        assert b_req_idx.device == next_token_ids.device, \
+            f"b_req_idx.device ({b_req_idx.device}) != next_token_ids.device ({next_token_ids.device})"
+        assert b_req_idx.shape[0] == next_token_ids.shape[0], \
+            f"b_req_idx.shape[0] ({b_req_idx.shape[0]}) != next_token_ids.shape[0] ({next_token_ids.shape[0]})"
 
         update_req_to_token_id_counter(
             b_req_idx=b_req_idx,
@@ -222,9 +359,9 @@ class ReqSamplingParamsManager:
         )
 
         return (
-            p_token_ids_tensor.cuda(non_blocking=True),
-            p_token_counts_tensor.cuda(non_blocking=True),
-            p_cumsum_seq_len_tensor.cuda(non_blocking=True),
+            p_token_ids_tensor.to(device=self.target_device, non_blocking=True),
+            p_token_counts_tensor.to(device=self.target_device, non_blocking=True),
+            p_cumsum_seq_len_tensor.to(device=self.target_device, non_blocking=True),
         )
 
 
@@ -235,7 +372,9 @@ class ReqManagerForMamba(ReqManager):
         # 因为在mtp的推理中，需要标记每个请求对应的mtp index状态(conv state 和 ssm state)，在mtp对应序列中
         # 的真实位置，所以需要需要一个标记来记录，不然算子无法找到真实的处理起点。
         self.req_to_mtp_state_index = (
-            torch.zeros((max_request_num + 1,), dtype=torch.int32, device="cuda") if self.mtp_step > 0 else None
+            torch.zeros((max_request_num + 1,), dtype=torch.int32, device=self.target_device)
+            if self.mtp_step > 0
+            else None
         )
         # 突然想到， 在linear att 开启mtp的模式中，现在的prefill linear att 算子默认是从0的位置读取信息进行操作
         # 所以不能支持 prefill decode mixed 操作了，因为一个decode过的请求，重新用prefill 算子跑，会出现读错linear
@@ -253,14 +392,14 @@ class ReqManagerForMamba(ReqManager):
             dtype=self.linear_config.conv_state_dtype,
             shape=self.linear_config.get_mtp_conv_state_shape(mtp_step=self.mtp_step),
             layer_num=self.linear_config.linear_layer_num,
-            device="cuda",
+            device=self.target_device,
         )
         self.req_to_ssm_state = LayerCache(
             size=(max_request_num + 1) * (self.mtp_step + 1),
             dtype=self.linear_config.ssm_state_dtype,
             shape=self.linear_config.get_ssm_state_shape(),
             layer_num=self.linear_config.linear_layer_num,
-            device="cuda",
+            device=self.target_device,
         )
         return
 

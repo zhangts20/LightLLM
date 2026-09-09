@@ -1,3 +1,4 @@
+import torch
 import triton
 import triton.language as tl
 
@@ -29,13 +30,78 @@ def page_table_copy_kernel(
     tl.store(page_table_ptr + output_pos, mem_index, mask=mask)
 
 
+@triton.jit
+def paged_page_table_copy_kernel(
+    page_table_ptr,
+    req_to_token_indexs_ptr,
+    b_req_idx,
+    num_pages,
+    b_req_idx_stride_0,
+    page_table_stride_0,
+    page_table_stride_1,
+    req_to_token_stride_0,
+    req_to_token_stride_1,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    cur_batch = tl.program_id(axis=0)
+    cur_block = tl.program_id(axis=1)
+    cur_req_idx = tl.load(b_req_idx + cur_batch * b_req_idx_stride_0)
+
+    page_offs = cur_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = page_offs < num_pages
+    token_offs = page_offs * PAGE_SIZE
+
+    input_pos = cur_req_idx * req_to_token_stride_0 + token_offs * req_to_token_stride_1
+    output_pos = cur_batch * page_table_stride_0 + page_offs * page_table_stride_1
+
+    mem_index = tl.load(req_to_token_indexs_ptr + input_pos, mask=mask)
+    tl.store(page_table_ptr + output_pos, mem_index // PAGE_SIZE, mask=mask)
+
+
+@torch.no_grad()
+def paged_page_table_copy(
+    page_table: torch.Tensor,
+    req_to_token_indexs: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    page_size: int,
+) -> None:
+    num_pages = page_table.shape[1]
+    if page_table.device.type == "npu":
+        block_size = 128
+        grid = (page_table.shape[0], triton.cdiv(num_pages, block_size))
+        paged_page_table_copy_kernel[grid](
+            page_table_ptr=page_table,
+            req_to_token_indexs_ptr=req_to_token_indexs,
+            b_req_idx=b_req_idx,
+            num_pages=num_pages,
+            b_req_idx_stride_0=b_req_idx.stride(0),
+            page_table_stride_0=page_table.stride(0),
+            page_table_stride_1=page_table.stride(1),
+            req_to_token_stride_0=req_to_token_indexs.stride(0),
+            req_to_token_stride_1=req_to_token_indexs.stride(1),
+            PAGE_SIZE=page_size,
+            BLOCK_SIZE=block_size,
+        )
+        return
+
+    max_seq_len_k = num_pages * page_size
+    sampled = req_to_token_indexs[b_req_idx, :max_seq_len_k:page_size]
+    page_table.copy_(sampled // page_size)
+
+
 def page_table_copy(
-    page_table,  # destination tensor [batch, seq]
+    page_table,  # destination tensor [batch, seq] or [batch, num_pages]
     req_to_token_indexs,  # source tensor [batch, seq]
     b_req_idx,  # request index to copy from
+    page_size: int = 1,
 ):
     assert page_table.dim() == 2, "page_table should be 2D"
     assert req_to_token_indexs.dim() == 2, "req_to_token_indexs should be 2D"
+
+    if page_size > 1:
+        paged_page_table_copy(page_table, req_to_token_indexs, b_req_idx, page_size)
+        return
 
     max_seq_len_k = page_table.shape[1]
     batch_size = page_table.size(0)

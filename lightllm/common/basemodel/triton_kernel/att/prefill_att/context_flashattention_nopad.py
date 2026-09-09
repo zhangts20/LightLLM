@@ -7,7 +7,27 @@ import triton.language as tl
 import math
 import torch.nn.functional as F
 
+from lightllm.platform import get_backend
 from lightllm.utils.device_utils import is_tesla
+
+
+def _prefill_block_m(head_dim: int | None = None) -> int:
+    backend_name = get_backend().name
+    if backend_name == "maca":
+        if head_dim is not None and head_dim >= 256:
+            return 32
+        return 64
+    if backend_name != "ascend" and is_tesla():
+        return 64
+    return 128
+
+
+def _prefill_block_n(block_m: int, head_dim: int) -> int:
+    if get_backend().name == "maca":
+        if head_dim >= 256:
+            return 64
+        return max(block_m, min(64, block_m * 2))
+    return block_m
 
 
 @triton.jit
@@ -149,11 +169,11 @@ def context_attention_fwd(
     req_to_token_indexs,
     sliding_window=(-1, -1),
 ):
-    BLOCK_M = 128 if not is_tesla() else 64
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128, 256, 512}
+    BLOCK_M = _prefill_block_m(Lk)
     # Larger head_dim needs smaller tiles to fit in SM shared memory.
     # H100/H200 has ~228KB shared memory per SM; a 128x512 bf16 tile already
     # consumes 128KB, leaving no room for K/V/scores buffers.
@@ -170,8 +190,8 @@ def context_attention_fwd(
 
     grid = lambda meta: (triton.cdiv(max_input_len, meta["BLOCK_M"]), batch * head, 1)
 
-    BLOCK_N = BLOCK_M
-    num_warps = 4 if Lk <= 64 else 8
+    BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
+    num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
     num_stages = 1
 
     if sliding_window == (-1, -1):
@@ -330,11 +350,11 @@ def _fwd_kernel_no_prompt_cache(
 @torch.no_grad()
 def context_attention_fwd_no_prompt_cache(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
 
-    BLOCK_M = 128 if not is_tesla() else 64
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128, 256, 512}
+    BLOCK_M = _prefill_block_m(Lk)
     # Larger head_dim needs smaller tiles to fit in SM shared memory.
     # H100/H200 has ~228KB shared memory per SM; a 128x512 bf16 tile already
     # consumes 128KB, leaving no room for K/V/scores buffers.
@@ -350,8 +370,8 @@ def context_attention_fwd_no_prompt_cache(q, k, v, o, b_start_loc, b_seq_len, ma
     kv_group_num = q.shape[1] // k.shape[1]
 
     grid = (triton.cdiv(max_input_len, BLOCK_M), batch * head, 1)
-    BLOCK_N = BLOCK_M
-    num_warps = 4 if Lk <= 64 else 8
+    BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
+    num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
     num_stages = 1
 
     _fwd_kernel_no_prompt_cache[grid](
@@ -509,11 +529,11 @@ def _fwd_kernel_contiguous_kv(
 def context_attention_fwd_contiguous_kv(
     q, k, v, o, b_start_loc, b_kv_start_loc, b_seq_len, max_q_input_len, b_prompt_cache_len
 ):
-    BLOCK_M = 128 if not is_tesla() else 64
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128, 256, 512}
+    BLOCK_M = _prefill_block_m(Lk)
     # Larger head_dim needs smaller tiles to fit in SM shared memory.
     # H100/H200 has ~228KB shared memory per SM; a 128x512 bf16 tile already
     # consumes 128KB, leaving no room for K/V/scores buffers.
@@ -529,8 +549,8 @@ def context_attention_fwd_contiguous_kv(
     kv_group_num = q.shape[1] // k.shape[1]
 
     grid = lambda meta: (triton.cdiv(max_q_input_len, meta["BLOCK_M"]), batch * head, 1)
-    BLOCK_N = BLOCK_M
-    num_warps = 4 if Lk <= 64 else 8
+    BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
+    num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
     num_stages = 1
 
     _fwd_kernel_contiguous_kv[grid](

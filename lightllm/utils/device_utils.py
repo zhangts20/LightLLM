@@ -6,6 +6,8 @@ import subprocess
 from enum import Enum
 from typing import Optional
 from functools import lru_cache
+from lightllm.platform import get_backend
+from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -109,15 +111,17 @@ def is_nvidia():
 def get_current_device_name():
     if torch.cuda.is_available() or is_musa():
         device = torch.cuda.current_device()
-        gpu_name = torch.cuda.get_device_name(device)
+        device_name = torch.cuda.get_device_name(device)
         # 4090 trans to 4090 D
-        if "4090" in gpu_name and "4090 D" not in gpu_name:
-            gpu_name = gpu_name.replace("4090", "4090 D")
-
-        gpu_name = gpu_name.replace(" ", "_")
-        return gpu_name
+        if "4090" in device_name and "4090 D" not in device_name:
+            device_name = device_name.replace("4090", "4090 D")
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        device = torch.npu.current_device()
+        device_name = torch.npu.get_device_name(device)
     else:
-        return None
+        return "unknown_device"
+
+    return device_name.replace(" ", "_")
 
 
 @lru_cache(maxsize=None)
@@ -125,7 +129,7 @@ def init_p2p(device_index):
     """
     torch 调用跨卡的to操作后，triton编译的算子便能自动操作跨卡tensor。
     """
-    num_gpus = torch.cuda.device_count()
+    num_gpus = get_backend().runtime.device_count()
     tensor = torch.zeros((1,))
     tensor = tensor.to(f"cuda:{device_index}")
     for j in range(num_gpus):
@@ -355,3 +359,9 @@ def get_platform(platform_name: Optional[str] = None) -> Platform:
     if platform is None:
         raise ValueError(f"Unknown platform name: {platform_name}")
     return platform
+
+
+def get_target_device(device_id: Optional[int] = None) -> torch.device:
+    if device_id is None:
+        device_id = get_current_device_id()
+    return get_backend().runtime.target_device(device_id)
