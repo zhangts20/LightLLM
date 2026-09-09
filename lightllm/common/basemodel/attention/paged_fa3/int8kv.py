@@ -9,6 +9,7 @@ from lightllm.utils.log_utils import init_logger
 
 from ..base_att import AttControl
 from .fp import PagedFa3AttBackend, PagedFa3DecodeAttState, PagedFa3PrefillAttState
+from .prefix_flash_npu import can_use_prefix_flash, prefix_flash_attention
 
 if TYPE_CHECKING:
     from lightllm.common.basemodel.infer_struct import InferStateInfo
@@ -416,24 +417,27 @@ class PagedFa3Int8KVPrefillAttState(PagedFa3PrefillAttState):
                     torch.index_select(v_scale_cache, 0, indices, out=scale_view)
                     torch.mul(quant_view, scale_view.view(-1, 1, 1), out=v_view)
 
-                    torch_npu.npu_fused_infer_attention_score.out(
-                        query=q_part.unsqueeze(0),
-                        key=k_view.unsqueeze(0),
-                        value=v_view.unsqueeze(0),
-                        input_layout="BSND",
-                        sparse_mode=0,
-                        scale=HEAD_DIM**-0.5,
-                        actual_seq_lengths=[q_len],
-                        actual_seq_lengths_kv=[token_count],
-                        num_heads=N_Q,
-                        num_key_value_heads=N_KV,
-                        softmax_lse_flag=True,
-                        out=[fia_out, fia_lse],
-                    )
-                    # Merge the outputs of the current chunk into the accumulated outputs. 
-                    part_out, part_lse = self._normalize_bsnd_fia_outputs(
-                        fia_out, fia_lse
-                    )
+                    if can_use_prefix_flash(q_part, k_view):
+                        part_out, part_lse = prefix_flash_attention(q_part, k_view, v_view)
+                    else:
+                        torch_npu.npu_fused_infer_attention_score.out(
+                            query=q_part.unsqueeze(0),
+                            key=k_view.unsqueeze(0),
+                            value=v_view.unsqueeze(0),
+                            input_layout="BSND",
+                            sparse_mode=0,
+                            scale=HEAD_DIM**-0.5,
+                            actual_seq_lengths=[q_len],
+                            actual_seq_lengths_kv=[token_count],
+                            num_heads=N_Q,
+                            num_key_value_heads=N_KV,
+                            softmax_lse_flag=True,
+                            out=[fia_out, fia_lse],
+                        )
+                        # Merge the outputs of the current chunk into the accumulated outputs.
+                        part_out, part_lse = self._normalize_bsnd_fia_outputs(
+                            fia_out, fia_lse
+                        )
                     self._merge_fia_part(
                         acc_out,
                         acc_lse,

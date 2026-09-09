@@ -192,6 +192,15 @@ def mrope_triton_fused(
     partial_rotary_factor: float = 1.0,
     run_config: Optional[dict] = None,
 ):
+    if q.device.type == "npu":
+        from .mrope_npu import can_use_mrope_prefill, mrope_prefill, mrope_small
+
+        if can_use_mrope_prefill(q, k, cos, sin, partial_rotary_factor):
+            mrope_prefill(q, k, cos, sin, mrope_section, is_interleaved, partial_rotary_factor)
+        else:
+            mrope_small(q, k, cos, sin, mrope_section, is_interleaved, partial_rotary_factor)
+        return
+
     head_num_q, head_num_k = q.shape[1], k.shape[1]
     head_dim = int(q.shape[2] * partial_rotary_factor)
     num_tokens = q.shape[0]

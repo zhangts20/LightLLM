@@ -5,17 +5,10 @@ import torch.nn.functional as F
 from typing import Optional, List, Union, Tuple
 from .quantize_method import QuantizationMethod, WeightPack
 from .registry import QUANTMETHODS
-from lightllm.common.basemodel.triton_kernel.quantization.scaled_mm_per_token_kernel import fp8_scaled_mm_per_token
-from lightllm.common.basemodel.triton_kernel.quantization.fp8act_quant_kernel import (
-    per_token_group_quant_fp8,
-    lightllm_per_token_group_quant_fp8,
-)
-from lightllm.common.basemodel.triton_kernel.quantization.fp8w8a8_block_gemm_kernel import w8a8_block_fp8_matmul
 from lightllm.utils.vllm_utils import HAS_VLLM, vllm_ops, cutlass_scaled_mm
 from lightllm.utils.sgl_utils import HAS_SGL_KERNEL, sgl_ops
 
 _HAS_SGL_FP8 = HAS_SGL_KERNEL and sgl_ops is not None and hasattr(sgl_ops, "fp8_scaled_mm")
-ACL_FORMAT_FRACTAL_NZ = 29
 
 
 if HAS_VLLM:
@@ -220,16 +213,13 @@ class w8a8NPUQuantizationMethod(BaseQuantizationMethod):
         self._finalize_weight_group(weight_group)
 
     def _finalize_weight_group(self, weight_group: _NPUW8A8WeightGroup) -> None:
-        import torch_npu
+        from .ascend_w8a8_layout import format_dense_weight_nz
 
         full_weight_pack = weight_group.full_weight_pack
         split_weight_packs = weight_group.split_weight_packs
         split_sizes = [split_pack.weight.shape[-1] for split_pack in split_weight_packs]
 
-        full_weight_pack.weight = torch_npu.npu_format_cast(
-            full_weight_pack.weight,
-            ACL_FORMAT_FRACTAL_NZ,
-        )
+        full_weight_pack.weight = format_dense_weight_nz(full_weight_pack.weight)
         nz_weight_views = torch.split(full_weight_pack.weight, split_sizes, dim=-1)
         for split_pack, nz_weight_view in zip(split_weight_packs, nz_weight_views):
             split_pack.weight = nz_weight_view
@@ -367,6 +357,10 @@ class FP8w8a8QuantizationMethod(BaseQuantizationMethod):
         use_custom_tensor_mananger: bool = True,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from lightllm.common.basemodel.triton_kernel.quantization.scaled_mm_per_token_kernel import (
+            fp8_scaled_mm_per_token,
+        )
+
         qweight = weight_pack.weight.t()
         weight_scale = weight_pack.weight_scale
         x_q, x_scale = scaled_fp8_quant(input_tensor, scale=None, scale_ub=None, use_per_token_if_dynamic=True)
@@ -495,6 +489,10 @@ class FP8w8a8PerTensorQuantizationMethod(BaseQuantizationMethod):
         use_custom_tensor_mananger: bool = True,
         bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        from lightllm.common.basemodel.triton_kernel.quantization.fp8act_quant_kernel import (
+            lightllm_per_token_group_quant_fp8,
+        )
+
         qweight = weight_pack.weight.t()
         weight_scale = weight_pack.weight_scale
         m = input_tensor.shape[0]
@@ -620,6 +618,10 @@ class FP8w8a8PerTensorTritonQuantizationMethod(FP8w8a8PerTensorQuantizationMetho
         use_custom_tensor_mananger: bool = True,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from lightllm.common.basemodel.triton_kernel.quantization.scaled_mm_per_token_kernel import (
+            fp8_scaled_mm_per_token,
+        )
+
         qweight, weight_scale, x_q, x_scale, m, n = self._dynamic_quant_input(
             input_tensor, weight_pack, use_custom_tensor_mananger, bias
         )
@@ -665,6 +667,8 @@ class FP8w8a8B128QuantizationMethod(BaseQuantizationMethod):
         out: Optional[torch.Tensor] = None,
         use_custom_tensor_mananger: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from lightllm.common.basemodel.triton_kernel.quantization.fp8act_quant_kernel import per_token_group_quant_fp8
+
         qweight = weight_pack.weight.t()
         weight_scale = weight_pack.weight_scale.t()
         input_scale = None  # dynamic quantization for input tensor
@@ -740,6 +744,8 @@ class FP8w8a8B128TritonQuantizationMethod(FP8w8a8B128QuantizationMethod):
         use_custom_tensor_mananger: bool = True,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from lightllm.common.basemodel.triton_kernel.quantization.fp8w8a8_block_gemm_kernel import w8a8_block_fp8_matmul
+
         qinput_tensor, qweight, input_scale, weight_scale, out = self._dynamic_quant_input(
             input_tensor, weight_pack, out, use_custom_tensor_mananger
         )

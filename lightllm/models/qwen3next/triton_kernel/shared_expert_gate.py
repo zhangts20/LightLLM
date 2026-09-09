@@ -28,12 +28,58 @@ def _sigmoid_mul_kernel(
     tl.store(x_ptrs, (x_vals * gate_vals).to(x.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _sigmoid_mul_npu_kernel(
+    x,
+    gate,
+    stride_x_m: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_g_m: tl.constexpr,
+    stride_g_n: tl.constexpr,
+    ROWS: tl.constexpr,
+    N: tl.constexpr,
+    GATE_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Launch only physical programs: auto-blockify can repeat row zero for a partial final group.
+    for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
+        offs = tl.arange(0, BLOCK_N)
+        mask = offs < N
+        x_ptrs = x + row * stride_x_m + offs * stride_x_n
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        if GATE_N == 1:
+            gate_vals = tl.load(gate + row * stride_g_m).to(tl.float32)
+        else:
+            gate_vals = tl.load(gate + row * stride_g_m + offs * stride_g_n, mask=mask, other=0.0).to(tl.float32)
+        gate_vals = tl.sigmoid(gate_vals)
+        tl.store(x_ptrs, (x_vals * gate_vals).to(x.dtype.element_ty), mask=mask)
+
+
 @torch.no_grad()
 def sigmoid_mul_(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     x_arg = x.view(-1, x.shape[-1])
     gate_arg = gate.view(-1, gate.shape[-1])
     assert gate_arg.shape[0] == x_arg.shape[0] and gate_arg.shape[1] in (1, x_arg.shape[1])
-    _, n = x_arg.shape
+    rows, n = x_arg.shape
+    if x.device.type == "npu":
+        if rows == 0:
+            return x
+        from triton.runtime import driver
+
+        cores = driver.active.utils.get_aivector_core_num()
+        _sigmoid_mul_npu_kernel[(min(rows, cores),)](
+            x_arg,
+            gate_arg,
+            x_arg.stride(0),
+            x_arg.stride(1),
+            gate_arg.stride(0),
+            gate_arg.stride(1),
+            rows,
+            n,
+            gate_arg.shape[1],
+            triton.next_power_of_2(n),
+        )
+        return x
     block_n = triton.next_power_of_2(n)
     _sigmoid_mul_kernel[(x_arg.shape[0],)](
         x=x_arg,
