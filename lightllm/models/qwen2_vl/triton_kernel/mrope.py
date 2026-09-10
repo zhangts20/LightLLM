@@ -195,7 +195,7 @@ def mrope_triton_fused(
     if q.device.type == "npu":
         from .mrope_npu import can_use_mrope_prefill, mrope_prefill, mrope_small
 
-        if can_use_mrope_prefill(q, k, cos, sin, partial_rotary_factor):
+        if can_use_mrope_prefill(q, partial_rotary_factor):
             mrope_prefill(q, k, cos, sin, mrope_section, is_interleaved, partial_rotary_factor)
         else:
             mrope_small(q, k, cos, sin, mrope_section, is_interleaved, partial_rotary_factor)

@@ -235,8 +235,13 @@ class Autotuner:
 
     def kernel_warmup(self, static_key, *args, **kwargs):
         new_args, new_kwargs, origin_list, new_list = self._mutate_args_clone(args, kwargs)
-        run_config = kwargs.get("run_config", {})
-        hash_key = str(frozendict(run_config)) + str(static_key)
+        run_config = kwargs.get("run_config")
+        config_key = (
+            ("default",)
+            if run_config is None
+            else ("explicit", frozendict(run_config))
+        )
+        hash_key = str(config_key) + str(static_key)
         if hash_key in self.warmuped_configs_set:
             return
         try:
