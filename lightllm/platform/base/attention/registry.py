@@ -34,21 +34,31 @@ class AttBackendSpec:
         return platform in self.platforms
 
 
+def _platforms_overlap(left: AttBackendSpec, right: AttBackendSpec) -> bool:
+    if left.platforms is None or right.platforms is None:
+        return True
+    return bool(set(left.platforms) & set(right.platforms))
+
+
 class AttBackendRegistry:
 
     def __init__(self) -> None:
-        self._specs: dict[tuple[AttCategory, str, str], AttBackendSpec] = {}
+        self._specs: dict[tuple[AttCategory, str, str], list[AttBackendSpec]] = {}
 
     def register_spec(self, spec: AttBackendSpec, *, allow_override: bool = False) -> None:
-        if spec.key in self._specs:
+        existing_list = self._specs.setdefault(spec.key, [])
+        for index, existing in enumerate(existing_list):
+            if not _platforms_overlap(existing, spec):
+                continue
             if not allow_override:
-                existing = self._specs[spec.key]
                 raise ValueError(
                     f"Attention backend {spec.name!r} already registered for "
                     f"category={spec.category!r}, kv_type={spec.kv_type!r} "
                     f"as {existing.backend_cls.__module__}.{existing.backend_cls.__qualname__}"
                 )
-        self._specs[spec.key] = spec
+            existing_list[index] = spec
+            return
+        existing_list.append(spec)
 
     def register(
         self,
@@ -80,8 +90,17 @@ class AttBackendRegistry:
         category: AttCategory,
         name: str,
         kv_type: str,
+        platform: str | None = None,
     ) -> AttBackendSpec | None:
-        return self._specs.get((category, name, kv_type))
+        specs = self._specs.get((category, name, kv_type), [])
+        if not specs:
+            return None
+        if platform is None:
+            return specs[0]
+        for spec in specs:
+            if spec.supports_platform(platform):
+                return spec
+        return None
 
     def get_backend_cls(
         self,
@@ -92,10 +111,8 @@ class AttBackendRegistry:
         platform: str | None = None,
     ) -> type | None:
         """ Get the backend class for the given category, name, kv_type and platform. """
-        spec = self.get_spec(category=category, name=name, kv_type=kv_type)
+        spec = self.get_spec(category=category, name=name, kv_type=kv_type, platform=platform)
         if spec is None:
-            return None
-        if not spec.supports_platform(platform):
             return None
         return spec.backend_cls
 
@@ -139,14 +156,15 @@ class AttBackendRegistry:
     ) -> tuple[AttBackendSpec, ...]:
         """ List the backend specs for the given category, kv_type and platform. """
         specs: list[AttBackendSpec] = []
-        for spec in self._specs.values():
-            if category is not None and spec.category != category:
-                continue
-            if kv_type is not None and spec.kv_type != kv_type:
-                continue
-            if not spec.supports_platform(platform):
-                continue
-            specs.append(spec)
+        for spec_list in self._specs.values():
+            for spec in spec_list:
+                if category is not None and spec.category != category:
+                    continue
+                if kv_type is not None and spec.kv_type != kv_type:
+                    continue
+                if not spec.supports_platform(platform):
+                    continue
+                specs.append(spec)
         return tuple(sorted(specs, key=lambda item: (item.category, item.name, item.kv_type)))
 
     def list_names(

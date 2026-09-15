@@ -7,7 +7,7 @@ from .deepseek3_2mem_manager import Deepseek3_2MemoryManager
 from .fp8_per_token_group_quant_deepseek3_2mem_manager import FP8PerTokenGroupQuantDeepseek3_2MemoryManager
 from .fp8_static_per_head_quant_mem_manager import FP8StaticPerHeadQuantMemManager
 from .fp8_static_per_tensor_quant_mem_manager import FP8StaticPerTensorQuantMemManager
-from .qwen3next_mem_manager import Qwen3NextMemManager
+from .qwen3next_mem_manager import Qwen3NextMemManager, Qwen3NextInt8KVMemoryManager
 
 __all__ = [
     "KvCacheAllocator",
@@ -21,4 +21,5 @@ __all__ = [
     "FP8StaticPerHeadQuantMemManager",
     "FP8StaticPerTensorQuantMemManager",
     "Qwen3NextMemManager",
+    "Qwen3NextInt8KVMemoryManager",
 ]

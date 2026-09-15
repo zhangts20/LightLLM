@@ -126,6 +126,7 @@ def _auto_select_backend(
             category=category,
             name=resolved_name,
             kv_type=kv_type,
+            platform=platform,
         )
         validate_name = spec.effective_validate_name() if spec is not None else backend_name
         if validate(validate_name):

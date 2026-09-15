@@ -5,11 +5,23 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 
 from lightllm.platform.base.attention import register_att_backend
+from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.log_utils import init_logger
 
 from ..base_att import AttControl
-from .fp import PagedFa3AttBackend, PagedFa3DecodeAttState, PagedFa3PrefillAttState
+from .fp import (
+    PagedFa3AttBackend,
+    PagedFa3DecodeAttState,
+    PagedFa3PrefillAttState,
+    maca_flash_attn_varlen_func,
+)
 from .prefix_flash_npu import can_use_prefix_flash, prefix_flash_attention
+from lightllm.common.basemodel.triton_kernel.kv_copy.ppl_int8kv_copy_kv import gather_dequant_int8kv
+
+try:
+    from flash_attn import flash_attn_func as maca_flash_attn_func
+except ImportError:
+    maca_flash_attn_func = None
 
 if TYPE_CHECKING:
     from lightllm.common.basemodel.infer_struct import InferStateInfo
@@ -18,7 +30,28 @@ if TYPE_CHECKING:
 NPU_PAGED_PER_TOKEN_ANTIQUANT_MODE = 4
 DEFAULT_DEQUANT_CHUNK_TOKENS = 65536
 DEFAULT_DEQUANT_RESERVE_MIB = 512
+DEFAULT_MACA_DEQUANT_CHUNK_TOKENS = 16384
 logger = init_logger(__name__)
+
+
+def _merge_attn_lse(
+    acc_out: torch.Tensor,
+    acc_lse: torch.Tensor,
+    part_out: torch.Tensor,
+    part_lse: torch.Tensor,
+    weighted_part: torch.Tensor,
+    initialized: bool,
+) -> None:
+    if not initialized:
+        acc_out.copy_(part_out)
+        acc_lse.copy_(part_lse)
+        return
+
+    merged_lse = torch.logaddexp(acc_lse, part_lse)
+    acc_out.mul_(torch.exp(acc_lse - merged_lse))
+    torch.mul(part_out, torch.exp(part_lse - merged_lse), out=weighted_part)
+    acc_out.add_(weighted_part)
+    acc_lse.copy_(merged_lse)
 
 
 @register_att_backend(
@@ -28,21 +61,21 @@ logger = init_logger(__name__)
     platforms=("ascend",),
     validate_name="fa3",
 )
-class PagedFa3Int8KVAttBackend(PagedFa3AttBackend):
+class PagedFa3Int8KVAscendAttBackend(PagedFa3AttBackend):
 
     def create_att_prefill_state(
         self, infer_state: "InferStateInfo"
-    ) -> "PagedFa3Int8KVPrefillAttState":
-        return PagedFa3Int8KVPrefillAttState(backend=self, infer_state=infer_state)
+    ) -> "PagedFa3Int8KVAscendPrefillAttState":
+        return PagedFa3Int8KVAscendPrefillAttState(backend=self, infer_state=infer_state)
 
     def create_att_decode_state(
         self, infer_state: "InferStateInfo"
-    ) -> "PagedFa3Int8KVDecodeAttState":
-        return PagedFa3Int8KVDecodeAttState(backend=self, infer_state=infer_state)
+    ) -> "PagedFa3Int8KVAscendDecodeAttState":
+        return PagedFa3Int8KVAscendDecodeAttState(backend=self, infer_state=infer_state)
 
 
 @dataclasses.dataclass
-class PagedFa3Int8KVPrefillAttState(PagedFa3PrefillAttState):
+class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
     # The request info for each prefill request, as a tuple of (q_start, q_end, req_id, prefix_len).
     # Then use req_id to index stored K/V cache and prefix_len to determine how many tokens to 
     # dequantize in chunks.
@@ -500,7 +533,7 @@ class PagedFa3Int8KVPrefillAttState(PagedFa3PrefillAttState):
 
 
 @dataclasses.dataclass
-class PagedFa3Int8KVDecodeAttState(PagedFa3DecodeAttState):
+class PagedFa3Int8KVAscendDecodeAttState(PagedFa3DecodeAttState):
 
     def _normal_decode_att(
         self,
@@ -541,3 +574,442 @@ class PagedFa3Int8KVDecodeAttState(PagedFa3DecodeAttState):
                 "value_antiquant_mode": NPU_PAGED_PER_TOKEN_ANTIQUANT_MODE,
             },
         )
+
+
+@register_att_backend(
+    name="paged_fa3",
+    category="standard",
+    kv_types=("int8kv",),
+    platforms=("maca",),
+    validate_name="fa3",
+)
+class PagedFa3Int8KVMacaAttBackend(PagedFa3AttBackend):
+
+    def __init__(self, model, page_size=None):
+        super().__init__(model=model, page_size=page_size)
+        self.quant_group_size = get_env_start_args().llm_kv_quant_group_size
+        if maca_flash_attn_func is None or maca_flash_attn_varlen_func is None:
+            raise RuntimeError(
+                "MetaX INT8 KV prefill requires flash_attn_func and "
+                "flash_attn_varlen_func from the flash_attn package"
+            )
+        logger.warning(
+            "MetaX flash_attn_with_kvcache_dequant is not used: it is numerically "
+            "wrong except headdim=128 and requires PAGE_SIZE %% 256 == 0. "
+            "Decode uses the fused Triton int8kv kernel."
+        )
+
+    def create_att_prefill_state(
+        self, infer_state: "InferStateInfo"
+    ) -> "PagedFa3Int8KVMacaPrefillAttState":
+        return PagedFa3Int8KVMacaPrefillAttState(backend=self, infer_state=infer_state)
+
+    def create_att_decode_state(
+        self, infer_state: "InferStateInfo"
+    ) -> "PagedFa3Int8KVMacaDecodeAttState":
+        return PagedFa3Int8KVMacaDecodeAttState(backend=self, infer_state=infer_state)
+
+
+class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
+    request_slices: tuple = None
+    max_prefix_len: int = 0
+    dequant_chunk_tokens: int = DEFAULT_MACA_DEQUANT_CHUNK_TOKENS
+
+    def init_state(self) -> None:
+        infer = self.infer_state
+        self.cu_seqlens_q = infer.b1_cu_q_seq_len.int()
+        # Fresh / packed K is aligned to Q lengths; prefix KV is gathered separately.
+        self.cu_seqlens_k = None
+        # Prefix cache is gathered via req_to_token, not a FA3 page table.
+        self.page_table = None
+        self.atten_mask = None
+        self.request_slices = None
+        self.max_prefix_len = 0
+        self.dequant_chunk_tokens = int(
+            os.getenv(
+                "LIGHTLLM_MACA_INT8KV_DEQUANT_CHUNK_TOKENS",
+                str(DEFAULT_MACA_DEQUANT_CHUNK_TOKENS),
+            )
+        )
+        if self.dequant_chunk_tokens <= 0:
+            raise ValueError(
+                "LIGHTLLM_MACA_INT8KV_DEQUANT_CHUNK_TOKENS must be greater than zero"
+            )
+        if infer.prefix_total_token_num == 0:
+            return
+
+        q_cu = infer.b1_cu_q_seq_len.detach().to("cpu", non_blocking=True)
+        prefix = infer.b_ready_cache_len.detach().to("cpu", non_blocking=True)
+        req_ids = infer.b_req_idx.detach().to("cpu", non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        q_cu = q_cu.tolist()
+        prefix = prefix.tolist()
+        req_ids = req_ids.tolist()
+        slices = []
+        max_prefix_len = 0
+        for i, req_id in enumerate(req_ids):
+            q_start, q_end = int(q_cu[i]), int(q_cu[i + 1])
+            prefix_len = int(prefix[i])
+            if q_end <= q_start or prefix_len < 0:
+                raise ValueError(
+                    f"Invalid prefill lengths: q_len={q_end - q_start}, prefix_len={prefix_len}"
+                )
+            max_prefix_len = max(max_prefix_len, prefix_len)
+            slices.append((q_start, q_end, int(req_id), prefix_len))
+        self.request_slices = tuple(slices)
+        self.max_prefix_len = max_prefix_len
+
+    def _normal_prefill_att(
+        self,
+        q: torch.Tensor,
+        k: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        v: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        att_control: AttControl,
+        alloc_func: Callable[..., torch.Tensor] = torch.empty,
+    ) -> torch.Tensor:
+        if att_control.use_att_sink:
+            raise NotImplementedError("MetaX FlashAttention does not support attention sinks")
+        if att_control.use_sliding_window:
+            window_size = att_control.sliding_window
+        else:
+            window_size = (-1, -1)
+
+        fresh_k, k_cache, k_scale = k
+        fresh_v, v_cache, v_scale = v
+        sm_scale = 1.0 / (q.shape[-1] ** 0.5)
+
+        if self.infer_state.prefix_total_token_num == 0:
+            return maca_flash_attn_varlen_func(
+                q=q,
+                k=fresh_k,
+                v=fresh_v,
+                cu_seqlens_q=self.cu_seqlens_q,
+                cu_seqlens_k=self.cu_seqlens_q,
+                max_seqlen_q=self.infer_state.max_q_seq_len,
+                max_seqlen_k=self.infer_state.max_q_seq_len,
+                softmax_scale=sm_scale,
+                causal=True,
+                window_size=window_size,
+                softcap=0.0,
+            )
+
+        if att_control.use_sliding_window:
+            raise NotImplementedError(
+                "MetaX INT8 KV chunked prefix prefill does not support sliding-window attention"
+            )
+        return self._chunked_prefix_prefill_att(
+            q=q,
+            fresh_k=fresh_k,
+            fresh_v=fresh_v,
+            k_cache=k_cache,
+            k_scale=k_scale,
+            v_cache=v_cache,
+            v_scale=v_scale,
+            sm_scale=sm_scale,
+            alloc_func=alloc_func,
+        )
+
+    def _chunked_prefix_prefill_att(
+        self,
+        q: torch.Tensor,
+        fresh_k: torch.Tensor,
+        fresh_v: torch.Tensor,
+        k_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_cache: torch.Tensor,
+        v_scale: torch.Tensor,
+        sm_scale: float,
+        alloc_func: Callable[..., torch.Tensor],
+    ) -> torch.Tensor:
+        n_q, head_dim = q.shape[-2:]
+        n_kv = k_cache.shape[-2]
+        group_size = self.backend.quant_group_size
+        chunk_tokens = min(self.dequant_chunk_tokens, max(self.max_prefix_len, 1))
+        req_to_token = self.infer_state.req_manager.req_to_token_indexs
+        acc_out = alloc_func(q.shape, dtype=torch.float32, device=q.device)
+        acc_lse = alloc_func((q.shape[0], n_q, 1), dtype=torch.float32, device=q.device)
+        weighted_part = alloc_func(
+            (self.infer_state.max_q_seq_len, n_q, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        n_req = len(self.request_slices)
+        k_scratch = alloc_func(
+            (n_req * chunk_tokens, n_kv, head_dim), dtype=q.dtype, device=q.device
+        )
+        v_scratch = alloc_func(
+            (n_req * chunk_tokens, n_kv, head_dim), dtype=q.dtype, device=q.device
+        )
+        acc_initialized = [False] * n_req
+
+        for chunk_start in range(0, self.max_prefix_len, chunk_tokens):
+            self._prefix_chunk_att(
+                q=q,
+                k_cache=k_cache,
+                k_scale=k_scale,
+                v_cache=v_cache,
+                v_scale=v_scale,
+                req_to_token=req_to_token,
+                chunk_start=chunk_start,
+                chunk_tokens=chunk_tokens,
+                group_size=group_size,
+                sm_scale=sm_scale,
+                k_scratch=k_scratch,
+                v_scratch=v_scratch,
+                acc_out=acc_out,
+                acc_lse=acc_lse,
+                weighted_part=weighted_part,
+                acc_initialized=acc_initialized,
+            )
+
+        fresh_out, fresh_lse = self._flash_varlen_with_lse(
+            q,
+            fresh_k,
+            fresh_v,
+            self.cu_seqlens_q,
+            self.cu_seqlens_q,
+            self.infer_state.max_q_seq_len,
+            self.infer_state.max_q_seq_len,
+            sm_scale,
+            causal=True,
+        )
+        for i, (q_start, q_end, _, _) in enumerate(self.request_slices):
+            q_len = q_end - q_start
+            _merge_attn_lse(
+                acc_out[q_start:q_end],
+                acc_lse[q_start:q_end],
+                fresh_out[q_start:q_end].float(),
+                fresh_lse[q_start:q_end],
+                weighted_part[:q_len],
+                acc_initialized[i],
+            )
+        output = alloc_func(q.shape, dtype=q.dtype, device=q.device)
+        output.copy_(acc_out)
+        return output
+
+    def _prefix_chunk_att(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_cache: torch.Tensor,
+        v_scale: torch.Tensor,
+        req_to_token: torch.Tensor,
+        chunk_start: int,
+        chunk_tokens: int,
+        group_size: int,
+        sm_scale: float,
+        k_scratch: torch.Tensor,
+        v_scratch: torch.Tensor,
+        acc_out: torch.Tensor,
+        acc_lse: torch.Tensor,
+        weighted_part: torch.Tensor,
+        acc_initialized: list[bool],
+    ) -> None:
+        q_parts = []
+        idx_parts = []
+        cu_q = [0]
+        cu_k = [0]
+        active = []
+        max_q = 0
+        max_k = 0
+        for i, (q_start, q_end, req_id, prefix_len) in enumerate(self.request_slices):
+            if chunk_start >= prefix_len:
+                continue
+            chunk_end = min(prefix_len, chunk_start + chunk_tokens)
+            kv_len = chunk_end - chunk_start
+            q_len = q_end - q_start
+            q_parts.append(q[q_start:q_end])
+            idx_parts.append(req_to_token[req_id, chunk_start:chunk_end])
+            cu_q.append(cu_q[-1] + q_len)
+            cu_k.append(cu_k[-1] + kv_len)
+            active.append((i, q_start, q_end, q_len))
+            max_q = max(max_q, q_len)
+            max_k = max(max_k, kv_len)
+        if not active:
+            return
+
+        indices = idx_parts[0] if len(idx_parts) == 1 else torch.cat(idx_parts)
+        gather_dequant_int8kv(
+            k_cache,
+            k_scale,
+            v_cache,
+            v_scale,
+            indices,
+            k_scratch[: cu_k[-1]],
+            v_scratch[: cu_k[-1]],
+            group_size,
+        )
+        if len(active) == 1:
+            i, q_start, q_end, q_len = active[0]
+            part_out, part_lse = self._flash_with_lse(
+                q_parts[0],
+                k_scratch[: cu_k[-1]],
+                v_scratch[: cu_k[-1]],
+                causal=False,
+                sm_scale=sm_scale,
+            )
+            _merge_attn_lse(
+                acc_out[q_start:q_end],
+                acc_lse[q_start:q_end],
+                part_out.float(),
+                part_lse,
+                weighted_part[:q_len],
+                acc_initialized[i],
+            )
+            acc_initialized[i] = True
+            return
+
+        q_pack = torch.cat(q_parts)
+        cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=q.device)
+        cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=q.device)
+        part_out, part_lse = self._flash_varlen_with_lse(
+            q_pack,
+            k_scratch[: cu_k[-1]],
+            v_scratch[: cu_k[-1]],
+            cu_q_t,
+            cu_k_t,
+            max_q,
+            max_k,
+            sm_scale,
+            causal=False,
+        )
+        offset = 0
+        for i, q_start, q_end, q_len in active:
+            _merge_attn_lse(
+                acc_out[q_start:q_end],
+                acc_lse[q_start:q_end],
+                part_out[offset : offset + q_len].float(),
+                part_lse[offset : offset + q_len],
+                weighted_part[:q_len],
+                acc_initialized[i],
+            )
+            acc_initialized[i] = True
+            offset += q_len
+
+    @staticmethod
+    def _flash_with_lse(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool,
+        sm_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_len, n_q, _ = q.shape
+        result = maca_flash_attn_func(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=sm_scale,
+            causal=causal,
+            return_attn_probs=True,
+            softcap=0.0,
+        )
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise RuntimeError("MetaX flash_attn_func did not return softmax LSE")
+        out, lse = result[0].squeeze(0), result[1]
+        return out, PagedFa3Int8KVMacaPrefillAttState._normalize_lse(lse, q_len, n_q)
+
+    @staticmethod
+    def _flash_varlen_with_lse(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        sm_scale: float,
+        causal: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        result = maca_flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=sm_scale,
+            causal=causal,
+            return_attn_probs=True,
+            softcap=0.0,
+        )
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise RuntimeError("MetaX flash_attn_varlen_func did not return softmax LSE")
+        n_q = q.shape[1]
+        return result[0], PagedFa3Int8KVMacaPrefillAttState._normalize_lse(result[1], q.shape[0], n_q)
+
+    @staticmethod
+    def _normalize_lse(lse: torch.Tensor, q_len: int, n_q: int) -> torch.Tensor:
+        if lse.dim() == 3 and lse.shape[0] == 1:
+            lse = lse.squeeze(0)
+        if lse.dim() != 2:
+            raise RuntimeError(f"Unexpected softmax_lse shape {tuple(lse.shape)}")
+        if lse.shape[0] == n_q and lse.shape[-1] >= q_len:
+            lse = lse[:, :q_len].transpose(0, 1)
+        elif lse.shape[0] >= q_len and lse.shape[1] == n_q:
+            lse = lse[:q_len]
+        else:
+            raise RuntimeError(
+                f"Unexpected softmax_lse shape {tuple(lse.shape)} for q_len={q_len}, n_q={n_q}"
+            )
+        return lse.unsqueeze(-1).contiguous()
+
+
+class PagedFa3Int8KVMacaDecodeAttState(PagedFa3DecodeAttState):
+
+    def _normal_decode_att(
+        self,
+        q: torch.Tensor,
+        k: tuple[torch.Tensor, torch.Tensor],
+        v: tuple[torch.Tensor, torch.Tensor],
+        att_control: AttControl,
+        alloc_func: Callable[..., torch.Tensor] = torch.empty,
+    ) -> torch.Tensor:
+        if att_control.use_alibi:
+            raise NotImplementedError("MetaX INT8 KV decode does not support ALiBi")
+        if att_control.use_att_sink:
+            raise NotImplementedError("MetaX FlashAttention does not support attention sinks")
+        if att_control.use_sliding_window:
+            window_size = att_control.sliding_window
+        else:
+            window_size = (-1, -1)
+
+        k_cache, k_scale = k
+        v_cache, v_scale = v
+        head_dim = k_cache.shape[-1]
+        page_size = self.backend.page_size
+        group_size = self.backend.quant_group_size
+
+        att_batch_size = self.page_table.shape[0]
+        expected_tokens = att_batch_size * self.decode_max_q_seq_len
+        if q.shape[0] != expected_tokens:
+            raise ValueError(
+                "Unexpected MetaX INT8 KV decode query shape: "
+                f"q tokens={q.shape[0]}, batch={att_batch_size}, "
+                f"q_len={self.decode_max_q_seq_len}"
+            )
+
+        q_bshd = q.view(att_batch_size, self.decode_max_q_seq_len, q.shape[1], q.shape[2])
+        from lightllm.common.basemodel.triton_kernel.att.decode_att.int8kv.maca_int8kv_flash_decoding import (
+            int8kv_flash_decode,
+        )
+
+        output = int8kv_flash_decode(
+            q=q_bshd,
+            k=k_cache,
+            k_scale=k_scale,
+            v=v_cache,
+            v_scale=v_scale,
+            cache_seqlens=self.b_att_seq_len,
+            page_table=self.page_table,
+            page_size=page_size,
+            sm_scale=1.0 / (head_dim ** 0.5),
+            causal=True,
+            sliding_window=window_size,
+            quant_group_size=group_size,
+            max_kv_len=int(self.infer_state.max_kv_seq_len),
+            alloc_func=alloc_func,
+        )
+        return output.view_as(q)

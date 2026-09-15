@@ -11,6 +11,7 @@ from lightllm.utils.log_utils import init_logger
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.llm_utils import get_llm_model_class
 from lightllm.common.kv_cache_mem_manager.npu_mem_manager import NPUMemoryManager, NPUInt8KVMemoryManager
+from lightllm.common.kv_cache_mem_manager.qwen3next_mem_manager import Qwen3NextInt8KVMemoryManager
 from lightllm.platform import get_backend
 from functools import lru_cache
 
@@ -73,4 +74,5 @@ def used_mem_manager_has_scale() -> bool:
         FP8StaticPerHeadQuantMemManager,
         FP8StaticPerTensorQuantMemManager,
         NPUInt8KVMemoryManager,
+        Qwen3NextInt8KVMemoryManager,
     ]

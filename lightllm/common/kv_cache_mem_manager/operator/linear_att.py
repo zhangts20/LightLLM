@@ -213,6 +213,42 @@ class LinearAttMemOperator(BaseMemManagerOperator):
         return
 
 
+class Int8KVLinearAttMemOperator(LinearAttMemOperator):
+
+    def copy_kv_to_mem_manager(self, layer_index: int, mem_index: torch.Tensor, kv: torch.Tensor):
+        mem_manager = self.mem_manager
+        layer_index = mem_manager.get_full_att_cache_layer_index(layer_index)
+        if kv.shape[0] == 0:
+            return
+        from lightllm.common.basemodel.triton_kernel.kv_copy.ppl_int8kv_copy_kv import (
+            destindex_copy_quantize_kv,
+        )
+
+        destindex_copy_quantize_kv(
+            kv,
+            mem_index,
+            mem_manager.kv_buffer[layer_index],
+            mem_manager.scale_buffer[layer_index],
+            quant_group_dim=mem_manager.group_quant_size,
+        )
+        return
+
+    def copy_mem_to_mem(self, src_mem_index: torch.Tensor, dst_mem_index: torch.Tensor):
+        from lightllm.common.basemodel.triton_kernel.kv_move import copy_kv_buffer_to_kv_buffer
+
+        src_mem_index = src_mem_index.to(device=self.mem_manager.target_device, non_blocking=True)
+        dst_mem_index = dst_mem_index.to(device=self.mem_manager.target_device, non_blocking=True)
+        copy_kv_buffer_to_kv_buffer(src_mem_index, dst_mem_index, self.mem_manager.kv_buffer)
+        copy_kv_buffer_to_kv_buffer(src_mem_index, dst_mem_index, self.mem_manager.scale_buffer)
+        return
+
+    def load_cpu_cache_to_gpu(self, *args, **kwargs):
+        raise NotImplementedError("CPU KV cache is not implemented for Qwen3.6 INT8 KV")
+
+    def offload_gpu_kv_to_cpu_cache(self, *args, **kwargs):
+        raise NotImplementedError("CPU KV cache is not implemented for Qwen3.6 INT8 KV")
+
+
 class NpuLinearAttMemOperator(LinearAttMemOperator):
 
     def copy_kv_to_mem_manager(self, layer_index: int, mem_index: torch.Tensor, kv: torch.Tensor):

@@ -89,8 +89,6 @@ class Qwen3NextTpPartModel(Qwen3MOEModel):
         )
 
         if start_args.llm_kv_type == "int8kv":
-            if start_args.hardware_platform != "ascend":
-                raise NotImplementedError("Qwen3.5 INT8 KV cache is currently supported only on Ascend")
             mem_manager_class = Qwen3NextInt8KVMemoryManager
         else:
             mem_manager_class = Qwen3NextMemManager
