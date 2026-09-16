@@ -38,7 +38,7 @@ class DiversehBackend(ChunkedPrefillBackend):
             group_reqs, is_chuncked_mode=not self.disable_chunked_prefill
         )
 
-        with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+        with self.backend_runtime.stream(g_infer_context.get_overlap_stream()):
 
             model_output = self.model.forward(model_input)
             logits = model_output.logits
@@ -49,14 +49,14 @@ class DiversehBackend(ChunkedPrefillBackend):
             b_req_idx = [req.req_idx for req in run_reqs]
             b_has_out = [model_input.b_prefill_has_output_cpu[i] for i in batch_idx]
 
-            batch_idx = g_pin_mem_manager.gen_from_list(key="batch_idx_", data=batch_idx, dtype=torch.int64).cuda(
-                non_blocking=True
+            batch_idx = g_pin_mem_manager.gen_from_list(key="batch_idx_", data=batch_idx, dtype=torch.int64).to(
+                device=self.backend_runtime.target_device(), non_blocking=True
             )
-            b_req_idx = g_pin_mem_manager.gen_from_list(key="b_req_idx_", data=b_req_idx, dtype=torch.int32).cuda(
-                non_blocking=True
+            b_req_idx = g_pin_mem_manager.gen_from_list(key="b_req_idx_", data=b_req_idx, dtype=torch.int32).to(
+                device=self.backend_runtime.target_device(), non_blocking=True
             )
-            b_has_out = g_pin_mem_manager.gen_from_list(key="b_has_out_", data=b_has_out, dtype=torch.bool).cuda(
-                non_blocking=True
+            b_has_out = g_pin_mem_manager.gen_from_list(key="b_has_out_", data=b_has_out, dtype=torch.bool).to(
+                device=self.backend_runtime.target_device(), non_blocking=True
             )
 
             logits = logits[batch_idx]
@@ -83,7 +83,7 @@ class DiversehBackend(ChunkedPrefillBackend):
                 next_token_ranks=next_token_ranks,
             )
 
-            sync_event = torch.cuda.Event()
+            sync_event = self.backend_runtime.create_event()
             sync_event.record()
 
         # 第二阶段
@@ -170,7 +170,7 @@ class DiversehBackend(ChunkedPrefillBackend):
                 pack = InferReqUpdatePack(req_obj=req_obj, output_len=pre_master_req_pack.output_len)
                 update_func_objs.append(pack)
 
-        torch.cuda.current_stream().synchronize()
+        self.backend_runtime.current_stream().synchronize()
         return update_func_objs
 
     def _master_req_to_radix_cache(self, master_req: InferReq):

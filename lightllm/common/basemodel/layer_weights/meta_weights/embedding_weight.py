@@ -1,13 +1,12 @@
 import torch
 import numpy as np
 from typing import Dict, Optional
+
 from .base_weight import BaseWeightTpl
-from .platform_op import PlatformAwareOp
 from lightllm.common.basemodel.triton_kernel.embedding import embedding as embedding_kernel
-from lightllm.utils.dist_utils import get_dp_world_size, get_current_rank_in_dp
 
 
-class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
+class EmbeddingWeight(BaseWeightTpl):
     def __init__(self, dim: int, vocab_size: int, weight_name: str, data_type: torch.dtype):
         super().__init__()
         self.dim = dim
@@ -81,7 +80,14 @@ class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
     def __call__(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
     ) -> torch.Tensor:
-        return self._forward(input_ids=input_ids, out=out, alloc_func=alloc_func)
+        return self.platform_backend.ops.embedding(
+            input_ids=input_ids,
+            weight=self.weight,
+            out=out,
+            alloc_func=alloc_func,
+            vob_start_id=self.tp_vocab_start_id,
+            vob_end_id=self.tp_vocab_end_id,
+        )
 
 
 class LMHeadWeight(EmbeddingWeight):
@@ -143,10 +149,15 @@ class LMHeadWeight(EmbeddingWeight):
         return out
 
     def __call__(self, input: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty) -> torch.Tensor:
-        return self._forward(input=input, out=out, alloc_func=alloc_func)
+        return self.platform_backend.ops.lm_head(
+            input=input,
+            weight=self.weight,
+            out=out,
+            alloc_func=alloc_func,
+        )
 
 
-class NoTpPosEmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
+class NoTpPosEmbeddingWeight(BaseWeightTpl):
     def __init__(self, dim: int, max_position_embeddings: int, weight_name: str, data_type: torch.dtype):
         super().__init__()
         self.dim = dim
@@ -206,4 +217,11 @@ class NoTpPosEmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
     def __call__(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None, alloc_func=torch.empty
     ) -> torch.Tensor:
-        return self._forward(input_ids=input_ids, out=out, alloc_func=alloc_func)
+        return self.platform_backend.ops.embedding(
+            input_ids=input_ids,
+            weight=self.weight,
+            out=out, 
+            alloc_func=alloc_func, 
+            vob_start_id=0, 
+            vob_end_id=self.max_position_embeddings,
+        )

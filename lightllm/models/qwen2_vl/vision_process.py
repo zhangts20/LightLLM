@@ -22,6 +22,8 @@ from transformers.image_utils import (
 )
 from torchvision.transforms.v2 import functional as F
 
+from lightllm.platform import get_backend
+from lightllm.utils.device_utils import get_target_device
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
@@ -77,6 +79,73 @@ def resize_image(
     return image
 
 
+def _flatten_patches_qwen2vl_npu(
+    patches: torch.Tensor,
+    batch_size: int,
+    grid_t: int,
+    temporal_patch_size: int,
+    channel: int,
+    grid_h: int,
+    grid_w: int,
+    merge_size: int,
+    patch_size: int,
+) -> torch.Tensor:
+    """
+    Current NPU runtime doesn't support tensors with more than 8 dims. So we need to flatten the patches to 8D.
+    The original code is:
+        patches = (
+            patches.view(
+                batch_size,
+                grid_t,
+                self.temporal_patch_size,
+                channel,
+                grid_h // self.merge_size,
+                self.merge_size,
+                self.patch_size,
+                grid_w // self.merge_size,
+                self.merge_size,
+                self.patch_size,
+            )
+            .permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+            .contiguous()
+        )
+        flatten_patches = patches.view(
+            batch_size,
+            grid_t * grid_h * grid_w,
+            channel * self.temporal_patch_size * self.patch_size * self.patch_size,
+        )
+    """
+    gh_ms = grid_h // merge_size
+    gw_ms = grid_w // merge_size
+    patches = patches.view(
+        batch_size,
+        grid_t,
+        temporal_patch_size,
+        channel,
+        gh_ms,
+        merge_size * patch_size,
+        gw_ms,
+        merge_size * patch_size,
+    )
+    patches = patches.permute(0, 1, 4, 6, 5, 7, 3, 2).contiguous()
+    patches = patches.view(
+        batch_size * grid_t * gh_ms * gw_ms,
+        merge_size,
+        patch_size,
+        merge_size,
+        patch_size,
+        channel,
+        temporal_patch_size,
+    )
+    patches = patches.permute(0, 1, 3, 2, 4, 5, 6).contiguous()
+    patches = patches.permute(0, 1, 2, 5, 6, 3, 4).contiguous()
+    return patches.view(
+        batch_size,
+        grid_t * grid_h * grid_w,
+        channel * temporal_patch_size * patch_size * patch_size,
+    )
+
+
 class Qwen2VLImageProcessor(BaseImageProcessorFast):
     def __init__(
         self,
@@ -99,6 +168,10 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+
+        self.platform_backend = get_backend()
+        self.target_device = get_target_device()
+
         self.size = size
         self.do_resize = do_resize
         self.resample = resample
@@ -177,13 +250,13 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
     @torch.inference_mode()
     def preprocess(self, image) -> Tuple[torch.Tensor, torch.Tensor]:
         try:
-            return self._preprocess_bydevice(image, device="cuda")
+            return self._preprocess_bydevice(image, device=self.target_device)
         except Exception as e:
             logger.warning(f"Exception during image preprocessing on CUDA: {str(e)}")
-            torch.cuda.current_stream().synchronize()
+            self.platform_backend.runtime.current_stream().synchronize()
             return self._preprocess_bydevice(image, device="cpu")
 
-    def _preprocess_bydevice(self, image, device="cuda") -> Tuple[torch.Tensor, torch.Tensor]:
+    def _preprocess_bydevice(self, image, device) -> Tuple[torch.Tensor, torch.Tensor]:
         if image.mode != "RGB":
             image = image.convert("RGB")
         image_arr = np.asarray(image, dtype=np.uint8)
@@ -226,7 +299,7 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
         processed_grids = {}
 
         for shape, stacked_images in grouped_images.items():
-            stacked_images = stacked_images.to("cuda", non_blocking=True)
+            stacked_images = stacked_images.to(device=device, non_blocking=True)
 
             resized_height, resized_width = stacked_images.shape[-2:]
 
@@ -249,28 +322,41 @@ class Qwen2VLImageProcessor(BaseImageProcessorFast):
             grid_t = grid_t // self.temporal_patch_size
             grid_h, grid_w = resized_height // self.patch_size, resized_width // self.patch_size
 
-            patches = (
-                patches.view(
-                    batch_size,
-                    grid_t,
-                    self.temporal_patch_size,
-                    channel,
-                    grid_h // self.merge_size,
-                    self.merge_size,
-                    self.patch_size,
-                    grid_w // self.merge_size,
-                    self.merge_size,
-                    self.patch_size,
+            if self.platform_backend.name == "ascend":
+                flatten_patches = _flatten_patches_qwen2vl_npu(
+                    patches=patches,
+                    batch_size=batch_size,
+                    grid_t=grid_t,
+                    temporal_patch_size=self.temporal_patch_size,
+                    channel=channel,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    merge_size=self.merge_size,
+                    patch_size=self.patch_size,
                 )
-                .permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
-                .contiguous()
-            )
+            else:
+                patches = (
+                    patches.view(
+                        batch_size,
+                        grid_t,
+                        self.temporal_patch_size,
+                        channel,
+                        grid_h // self.merge_size,
+                        self.merge_size,
+                        self.patch_size,
+                        grid_w // self.merge_size,
+                        self.merge_size,
+                        self.patch_size,
+                    )
+                    .permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+                    .contiguous()
+                )
 
-            flatten_patches = patches.view(
-                batch_size,
-                grid_t * grid_h * grid_w,
-                channel * self.temporal_patch_size * self.patch_size * self.patch_size,
-            )
+                flatten_patches = patches.view(
+                    batch_size,
+                    grid_t * grid_h * grid_w,
+                    channel * self.temporal_patch_size * self.patch_size * self.patch_size,
+                )
 
             processed_images_grouped[shape] = flatten_patches
             processed_grids[shape] = [[grid_t, grid_h, grid_w]] * batch_size

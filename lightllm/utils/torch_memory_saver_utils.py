@@ -1,6 +1,7 @@
 import torch
 from contextlib import contextmanager
 from enum import Enum
+from typing import Any
 from lightllm.utils.log_utils import init_logger
 
 try:
@@ -89,8 +90,10 @@ class _TorchMemorySaverFake:
     def region(self, tag: MemoryTag, enable_cpu_backup: bool = False):
         yield
 
-    def cuda_graph(self, graph_obj: torch.cuda.CUDAGraph, **kwargs):
-        return torch.cuda.graph(graph_obj, **kwargs)
+    def cuda_graph(self, graph_obj: Any, **kwargs):
+        from lightllm.platform import get_backend
+
+        return get_backend().graph.graph(graph_obj, **kwargs)
 
     @contextmanager
     def disable(self):

@@ -7,6 +7,9 @@ from lightllm.models.vit.layer_infer.transformer_layer_infer import ViTTransform
 from lightllm.models.vit.layer_weights.pre_and_post_layer_weight import ViTPreAndPostLayerWeight
 from lightllm.models.vit.layer_weights.transformer_layer_weight import ViTTransformerLayerWeight
 from lightllm.models.vit.layer_weights.hf_load_utils import load_hf_weights
+from lightllm.models.visual_utils import VisualDeviceMixin
+from lightllm.utils.device_utils import get_target_device
+from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.server.multimodal_params import MultimodalParams, ImageItem
 from lightllm.common.build_utils import repair_config
 from lightllm.utils.log_utils import init_logger
@@ -25,7 +28,8 @@ from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_m
 logger = init_logger(__name__)
 
 
-class VisionTransformer:
+class VisionTransformer(VisualDeviceMixin):
+
     # weight class
     pre_and_post_weight_class = ViTPreAndPostLayerWeight
     transformer_weight_class = ViTTransformerLayerWeight
@@ -45,6 +49,10 @@ class VisionTransformer:
         self.quant_cfg_path = kvargs.get("quant_cfg", None)
         self.load_image_func = get_load_image_func(self.weight_dir_)
         self.max_batch_size = kvargs.get("max_batch_size", 1)
+        self.device_id = kvargs.get("device_id")
+        if self.device_id is None:
+            self.device_id = get_current_device_id()
+        self.target_device = get_target_device(self.device_id)
 
         self._init_datatype()
         self._init_config()
@@ -162,8 +170,7 @@ class VisionTransformer:
             return None
 
         imgs = torch.cat(img_tensors, dim=0)
-        pixel_values = imgs.cuda().to(dtype=self.data_type)
-        # [total_patches, tokens_per_patch, hidden]
+        pixel_values = self.move_to_infer_device(imgs, dtype=self.data_type)
         all_img_embeds = self.forward(pixel_values)
         tokens_per_patch = all_img_embeds.shape[1]
         valid_ids = []
@@ -173,9 +180,6 @@ class VisionTransformer:
             valid_ids.append([valid_id, valid_id + cur_num])
             valid_id += cur_num
         return all_img_embeds.view(-1, all_img_embeds.shape[-1]), uuids, valid_ids
-
-    def cuda(self):
-        return self
 
     def load_model(self, weight_dir):
         pass

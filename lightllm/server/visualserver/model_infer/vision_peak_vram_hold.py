@@ -10,6 +10,7 @@ import torch.distributed as dist
 from io import BytesIO
 from typing import List, Tuple
 from PIL import Image
+from lightllm.platform import get_backend
 from lightllm.server.embed_cache.utils import create_shm, free_shm, get_shm_name_data
 from lightllm.server.multimodal_params import ImageItem
 from lightllm.utils.envs_utils import get_unique_server_name
@@ -32,6 +33,7 @@ class VisionPeakVramHolder:
 
     def __init__(self, model):
         self.model = model
+        self.platform_backend = get_backend()
 
     @torch.no_grad()
     def hold(
@@ -44,9 +46,10 @@ class VisionPeakVramHolder:
         vit_tp: int = 1,
         dp_rank_id: int = 0,
     ) -> int:
-        torch.cuda.set_device(device_id)
-        baseline_reserved = torch.cuda.memory_reserved(device_id)
-        torch.cuda.reset_peak_memory_stats(device_id)
+        self.platform_backend.runtime.set_device(device_id)
+        mem_mod = getattr(torch, self.platform_backend.runtime.device_type)
+        baseline_reserved = mem_mod.memory_reserved(device_id)
+        mem_mod.reset_peak_memory_stats(device_id)
 
         gloo_group = dist.new_group(ranks=list(range(vit_tp)), backend="gloo")
 
@@ -72,7 +75,7 @@ class VisionPeakVramHolder:
             if tp_rank_id == 0:
                 self._free_image_items(image_items)
 
-        peak_reserved = torch.cuda.max_memory_reserved(device_id)
+        peak_reserved = mem_mod.max_memory_reserved(device_id)
         return int(max(0, peak_reserved - baseline_reserved))
 
     def _worst_case_image_size(self, max_image_pixels: int) -> Tuple[int, int]:

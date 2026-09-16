@@ -2,6 +2,7 @@ import torch
 import threading
 import collections
 from typing import List, Dict, Union, Sequence
+from lightllm.utils.device_utils import get_target_device
 
 
 class PinMemTensorManager:
@@ -95,7 +96,7 @@ class PinMemTensorManager:
             buf = self.key_to_const_gpu_tensor.get(key)
             if buf is None or buf.numel() < size:
                 n = max(size, 2048)
-                buf = torch.full((n,), fill_value, dtype=dtype, device="cuda")
+                buf = torch.full((n,), fill_value, dtype=dtype, device=get_target_device())
                 self.key_to_const_gpu_tensor[key] = buf
             else:
                 assert buf.dtype == dtype, f"const gpu tensor key={key!r} dtype mismatch: {buf.dtype} vs {dtype}"

@@ -9,9 +9,8 @@ from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args
 from lightllm.utils.dist_utils import get_dp_rank_in_node
 from lightllm.server.core.objs.shm_array import ShmArray
 from ...infer_batch import InferReq
-from lightllm.utils.dist_utils import get_current_device_id
+from lightllm.utils.dist_utils import get_current_device_id, dist_barrier
 from lightllm.server.router.model_infer.infer_batch import g_infer_context
-import torch.distributed as dist
 
 
 class DPKVSharedMoudle:
@@ -38,7 +37,7 @@ class DPKVSharedMoudle:
         """
         填充请求的 kv 信息到共享内存中
         """
-        dist.barrier(group=self.backend.node_nccl_group)
+        dist_barrier(group=self.backend.node_nccl_group)
         if self.backend.is_master_in_dp:
             self.shared_req_infos.arr[0 : len(reqs), self.dp_rank_in_node, self._KV_LEN_INDEX] = [
                 req.cur_kv_len for req in reqs
@@ -56,7 +55,7 @@ class DPKVSharedMoudle:
         """
         构建共享kv交换信息
         """
-        dist.barrier(group=self.backend.node_nccl_group)
+        dist_barrier(group=self.backend.node_nccl_group)
 
         trans_tasks: List[TransTask] = []
         rank_max_radix_cache_lens = np.max(

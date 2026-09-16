@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
+from lightllm.models.visual_utils import VisualDeviceMixin
 from lightllm.server.multimodal_params import ImageItem
 from lightllm.server.embed_cache.utils import read_shm, get_shm_name_data
 from lightllm.models.qwen2_vl.vision_process import resize_image, Qwen2VLImageProcessor
@@ -73,8 +74,11 @@ class Qwen3VLPatchEmbed(nn.Module):
         hidden_states = hidden_states.view(
             -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
         )
-        # Use channels_last_3d to enable cuDNN optimized Conv3D path
-        hidden_states = hidden_states.contiguous(memory_format=torch.channels_last_3d)
+        if hidden_states.device.type == "cuda":
+            # Use channels_last_3d to enable cuDNN optimized Conv3D path
+            hidden_states = hidden_states.contiguous(memory_format=torch.channels_last_3d)
+        else:
+            hidden_states = hidden_states.contiguous()
         hidden_states = self.proj(hidden_states).view(-1, self.embed_dim)
         return hidden_states
 
@@ -116,7 +120,7 @@ class Qwen3VLVisionBlock(nn.Module):
         return hidden_states
 
 
-class Qwen3VisionTransformerPretrainedModel(nn.Module):
+class Qwen3VisionTransformerPretrainedModel(VisualDeviceMixin, nn.Module):
     def __init__(
         self,
         kvargs,
@@ -161,7 +165,7 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
         self.num_grid_per_side = int(self.num_position_embeddings ** 0.5)
 
         head_dim = self.hidden_size // self.num_heads
-        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2).cuda()
+        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList(
             [
@@ -344,13 +348,12 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
         rotary_cos, rotary_sin = self.rot_pos_emb(grid_thw)
-        rotary_cos = rotary_cos.to("cuda", non_blocking=True)
-        rotary_sin = rotary_sin.to("cuda", non_blocking=True)
+        rotary_cos, rotary_sin = self.move_to_infer_device(rotary_cos, rotary_sin)
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
             dtype=torch.int32,
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0).to("cuda", non_blocking=True)
+        cu_seqlens = self.move_to_infer_device(F.pad(cu_seqlens, (1, 0), value=0))
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
@@ -401,8 +404,9 @@ class Qwen3VisionTransformerPretrainedModel(nn.Module):
         imgs = torch.cat(img_tensors, dim=0)
         grid_thw = torch.cat(img_grids, dim=0)
 
-        pixel_values = imgs.to("cuda", dtype=self.data_type, non_blocking=True)
-        image_grid_thw = grid_thw.to("cuda", non_blocking=True)
+        pixel_values, image_grid_thw = self.move_to_infer_device(
+            imgs, grid_thw, dtype=(self.data_type, None)
+        )
         img_embeds, deepstack_feature_lists = self.forward(pixel_values, grid_thw=image_grid_thw)
         all_img_embeds_df, valid_ids = self.concat_img_embed_and_deepstack_features(
             img_embeds, deepstack_feature_lists, valid_ids

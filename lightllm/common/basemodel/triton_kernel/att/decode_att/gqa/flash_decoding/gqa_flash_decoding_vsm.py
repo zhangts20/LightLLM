@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from lightllm.common.kernel_config import KernelConfigs
+from lightllm.platform import get_backend
 from lightllm.utils.device_utils import calcu_kernel_best_vsm_count
 from frozendict import frozendict
 from functools import lru_cache
@@ -382,7 +383,7 @@ def emstimate_stage1_vsm(
     q_head_num = q_head_num
     batch_size = b_req_idx.shape[0]
     kernel = _kernel_gqa_token_decode_attention_flash_decoding_vsm_stage1.warmup(
-        torch.empty([1], dtype=torch.int64, device="cuda"),
+        torch.empty([1], dtype=torch.int64, device=q.device),
         q,
         k,
         v,
@@ -423,7 +424,7 @@ def gqa_token_decode_attention_flash_decoding_vsm(
     sm_scale = 1.0 / (q_head_dim ** 0.5)
 
     if not run_config:
-        if torch.cuda.is_current_stream_capturing():
+        if get_backend().graph.is_capturing():
             avg_seq_len_in_batch = infer_state.max_kv_seq_len
         else:
             avg_seq_len_in_batch = infer_state.total_token_num // batch_size
@@ -440,6 +441,7 @@ def gqa_token_decode_attention_flash_decoding_vsm(
     if out is None:
         out = alloc_tensor_func(q.shape, dtype=q.dtype, device=q.device)
 
+    device = q.device
     num_vsm = emstimate_stage1_vsm(
         q,
         k,
@@ -450,9 +452,9 @@ def gqa_token_decode_attention_flash_decoding_vsm(
         torch.empty(
             [q_head_num, 0, q_head_dim],
             dtype=torch.float32,
-            device="cuda",
+            device=device,
         ),
-        torch.empty([q_head_num, 0], dtype=torch.float32, device="cuda"),
+        torch.empty([q_head_num, 0], dtype=torch.float32, device=device),
         sm_scale,
         **run_config,
     )
@@ -463,14 +465,14 @@ def gqa_token_decode_attention_flash_decoding_vsm(
                 1,
             ],
             dtype=torch.int64,
-            device="cuda",
+            device=device,
         )
         mid_o_batch_start_index = torch.empty(
             [
                 batch_size,
             ],
             dtype=torch.int64,
-            device="cuda",
+            device=device,
         )
         _fwd_kernel_calcu_index_and_block_seq[(1,)](
             infer_state.b_seq_len,
@@ -493,12 +495,12 @@ def gqa_token_decode_attention_flash_decoding_vsm(
             q_head_dim,
         ],
         dtype=torch.float32,
-        device="cuda",
+        device=device,
     )
     mid_o_logexpsum = torch.empty(
         [q_head_num, num_vsm * 4 + batch_size],
         dtype=torch.float32,
-        device="cuda",
+        device=device,
     )
     gqa_token_decode_attention_flash_decoding_vsm_stage1(
         infer_state.decode_att_block_seq,

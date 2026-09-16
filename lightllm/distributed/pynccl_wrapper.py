@@ -37,10 +37,11 @@
 # recompilation of the code every time we want to switch between different
 # versions. This current implementation, with a **pure** Python wrapper, is
 # more flexible. We can easily switch between different versions of NCCL by
-# changing the environment variable `VLLM_NCCL_SO_PATH`, or the `so_file`
+# changing the environment variable `LIGHTLLM_NCCL_SO_PATH`, or the `so_file`
 # variable in the code.
 
 import ctypes
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -53,27 +54,51 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _is_metax_runtime() -> bool:
+    ver = (getattr(torch, "__version__", "") or "").lower()
+    if "metax" in ver:
+        return True
+    try:
+        from lightllm.utils.envs_utils import get_env_start_args
+
+        return get_env_start_args().hardware_platform == "maca"
+    except Exception:
+        return False
+
+
 def find_nccl_library() -> str:
     """
-    We either use the library file specified by the `VLLM_NCCL_SO_PATH`
-    environment variable, or we find the library file brought by PyTorch.
-    After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
-    found by `ctypes` automatically.
-    """
-    so_file = None
+    Resolve the collective library used by PyNcclCommunicator.
 
+    Prefer ``LIGHTLLM_NCCL_SO_PATH`` if set, then MetaX ``libmccl.so``,
+    then NVIDIA ``libnccl.so.2`` / ROCm ``librccl.so.1``.
+    """
     # manually load the nccl library
+    so_file = os.environ.get("LIGHTLLM_NCCL_SO_PATH")
     if so_file:
-        logger.info("Found nccl from environment variable VLLM_NCCL_SO_PATH=%s", so_file)
+        logger.info("Found collective lib from LIGHTLLM_NCCL_SO_PATH=%s", so_file)
+        return so_file
+
+    if _is_metax_runtime():
+        so_file = "libmccl.so"
+        logger.info("Found MetaX MCCL library %s", so_file)
+        return so_file
+
+    if torch.version.cuda is not None:
+        so_file = "libnccl.so.2"
+    elif torch.version.hip is not None:
+        so_file = "librccl.so.1"
     else:
-        if torch.version.cuda is not None:
-            so_file = "libnccl.so.2"
-        elif torch.version.hip is not None:
-            so_file = "librccl.so.1"
-        else:
-            raise ValueError("NCCL only supports CUDA and ROCm backends.")
-        logger.info("Found nccl from library %s", so_file)
+        raise ValueError("NCCL only supports CUDA, ROCm, and MetaX MACA backends.")
+    logger.info("Found nccl from library %s", so_file)
     return so_file
+
+
+def _symbol_name(api_name: str, so_file: str) -> str:
+    base = os.path.basename(so_file).lower()
+    if "mccl" in base and api_name.startswith("nccl"):
+        return "mccl" + api_name[4:]
+    return api_name
 
 
 # === export types and functions from nccl to Python ===
@@ -258,6 +283,7 @@ class NCCLLibrary:
     def __init__(self, so_file: Optional[str] = None):
 
         so_file = so_file or find_nccl_library()
+        self.so_file = so_file
 
         try:
             if so_file not in NCCLLibrary.path_to_dict_mapping:
@@ -266,13 +292,12 @@ class NCCLLibrary:
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:
             logger.error(
-                "Failed to load NCCL library from %s. "
-                "It is expected if you are not running on NVIDIA/AMD GPUs."
-                "Otherwise, the nccl library might not exist, be corrupted "
+                "Failed to load NCCL/MCCL library from %s. "
+                "It is expected if you are not running on NVIDIA/AMD/MetaX GPUs."
+                "Otherwise, the library might not exist, be corrupted "
                 "or it does not support the current platform %s. "
-                "If you already have the library, please set the "
-                "environment variable VLLM_NCCL_SO_PATH"
-                " to point to the correct nccl library path.",
+                "If you already have the library, please set "
+                "LIGHTLLM_NCCL_SO_PATH to point to the correct path.",
                 so_file,
                 platform.platform(),
             )
@@ -281,7 +306,8 @@ class NCCLLibrary:
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
             for func in NCCLLibrary.exported_functions:
-                f = getattr(self.lib, func.name)
+                sym = _symbol_name(func.name, so_file)
+                f = getattr(self.lib, sym)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
                 _funcs[func.name] = f

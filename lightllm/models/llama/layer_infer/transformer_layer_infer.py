@@ -1,16 +1,155 @@
+import os
 import torch
 import triton
 import torch.distributed as dist
 from functools import partial
 from lightllm.models.llama.layer_weights.transformer_layer_weight import LlamaTransformerLayerWeight
-from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
-from lightllm.common.basemodel.triton_kernel.fused_moe.moe_silu_and_mul import silu_and_mul_fwd
 from lightllm.models.llama.infer_struct import LlamaInferStateInfo
 from lightllm.common.basemodel import TransformerLayerInferTpl
+from lightllm.distributed.npu_mm_all_reduce import (
+    can_use_npu_mm_all_reduce,
+    can_use_npu_w8a8_mm_all_reduce,
+    is_plain_mm_weight,
+    is_npu_w8a8_weight,
+    npu_mm_all_reduce,
+    npu_w8a8_mm_all_reduce,
+)
 from lightllm.distributed.communication_op import all_gather_into_tensor, reduce_scatter_tensor
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
+
+NPU_SWIGLU_QUANT_MAX_TOKENS = int(os.getenv("LIGHTLLM_NPU_SWIGLU_QUANT_MAX_TOKENS", "64"))
+
+
+def npu_silu_and_mul_fwd(
+    input: torch.Tensor,
+    layout="blocked",
+    limit=None,
+    alpha=None,
+) -> torch.Tensor:
+    assert input.is_contiguous()
+    assert input.dim() == 2
+    assert (limit is None and alpha is None) or (limit is not None and alpha is not None)
+    N = input.shape[1] // 2
+
+    if layout == "blocked":
+        gate = input[:, :N]
+        up   = input[:, N:]
+    elif layout == "interleaved":
+        gate = input[:, 0::2]
+        up   = input[:, 1::2]
+    else:
+        raise ValueError(f"unknown layout: {layout}")
+
+    if limit is not None and alpha is not None:
+        gate_fp32_limit = torch.minimum(
+            gate.float(),
+            torch.tensor(limit, device=gate.device, dtype=torch.float32),
+        )
+
+        gate_act = torch.sigmoid(gate_fp32_limit * alpha) * gate_fp32_limit
+        gate_act = gate_act.to(input.dtype)
+
+        up_clip = torch.clamp(up, -limit, limit)
+        out = (up_clip + 1) * gate_act
+    else:
+        import torch_npu
+
+        out = torch_npu.npu_swiglu(input, dim=-1)
+
+    return out
+
+
+def npu_ffn_fwd(
+    input: torch.Tensor,
+    layer_weight: LlamaTransformerLayerWeight,
+    embed_dim: int,
+) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    input = input.view(-1, embed_dim)
+    down_quant_method = layer_weight.down_proj.quant_method
+
+    if down_quant_method.method_name == "w8a8-ascend":
+        up_gate_out = layer_weight.gate_up_proj.mm(input)
+        if input.shape[0] <= NPU_SWIGLU_QUANT_MAX_TOKENS:
+            import torch_npu
+
+            ffn1_out, ffn1_scale = torch_npu.npu_dequant_swiglu_quant(
+                up_gate_out,
+                activate_left=True,
+                quant_mode=1,
+            )
+            return down_quant_method.apply_quantized(
+                ffn1_out,
+                ffn1_scale,
+                layer_weight.down_proj.mm_param,
+                output_dtype=input.dtype,
+                bias=layer_weight.down_proj.bias,
+            )
+
+        return layer_weight.down_proj.mm(npu_silu_and_mul_fwd(up_gate_out))
+
+    # up
+    gate_up_proj_bias = [layer_weight.gate_up_proj.bias] if layer_weight.gate_up_proj.bias is not None else None
+    weight = layer_weight.gate_up_proj.mm_param.weight
+    # up_gate_out = torch_npu.npu_grouped_matmul(
+    #     x=[input],
+    #     weight=[weight],
+    #     bias=gate_up_proj_bias,
+    #     split_item=0,
+    #     group_type=-1,
+    #     group_list=None,
+    # )[0]
+    up_gate_out = F.linear(input, weight, bias=gate_up_proj_bias)
+
+    # activation
+    ffn1_out = npu_silu_and_mul_fwd(up_gate_out)
+
+    # down
+    down_proj_bias = [layer_weight.down_proj.bias] if layer_weight.down_proj.bias is not None else None
+    weight = layer_weight.down_proj.mm_param.weight
+    # ffn2_out = torch_npu.npu_grouped_matmul(
+    #     x=[ffn1_out],
+    #     weight=[weight],
+    #     bias=down_proj_bias,
+    #     split_item=0,
+    #     group_type=-1,
+    #     group_list=None,
+    # )[0]
+    ffn2_out = F.linear(ffn1_out, weight, bias=down_proj_bias)
+
+    return ffn2_out
+
+
+def npu_ffn_fwd_mm_ar(
+    input: torch.Tensor,
+    layer_weight: LlamaTransformerLayerWeight,
+    embed_dim: int,
+    infer_state: LlamaInferStateInfo,
+) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    input = input.view(-1, embed_dim)
+    weight = layer_weight.gate_up_proj.mm_param.weight
+    gate_up_bias = layer_weight.gate_up_proj.bias
+    up_gate_out = F.linear(input, weight, bias=gate_up_bias)
+    ffn1_out = npu_silu_and_mul_fwd(up_gate_out)
+
+    return npu_mm_all_reduce(ffn1_out, layer_weight.down_proj, infer_state)
+
+
+def npu_w8a8_ffn_fwd_mm_ar(
+    input: torch.Tensor,
+    layer_weight: LlamaTransformerLayerWeight,
+    embed_dim: int,
+    infer_state: LlamaInferStateInfo,
+) -> torch.Tensor:
+    input = input.view(-1, embed_dim)
+    up_gate_out = layer_weight.gate_up_proj.mm(input)
+    ffn1_out = npu_silu_and_mul_fwd(up_gate_out)
+    return npu_w8a8_mm_all_reduce(ffn1_out, layer_weight.down_proj, infer_state)
 
 
 class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
@@ -44,7 +183,10 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         infer_state: LlamaInferStateInfo,
         layer_weight: LlamaTransformerLayerWeight,
     ) -> torch.Tensor:
-        _k, _v = infer_state.mem_manager.get_att_input_params(layer_index=self.layer_num_)
+        if hasattr(infer_state.mem_manager, "get_prefill_att_input_params"):
+            _k, _v = infer_state.mem_manager.get_prefill_att_input_params(kv, layer_index=self.layer_num_)
+        else:
+            _k, _v = infer_state.mem_manager.get_att_input_params(layer_index=self.layer_num_)
         _q = q.view(-1, self.tp_q_head_num_, self.head_dim_)
         o_tensor = infer_state.prefill_att_state.prefill_att(
             q=_q,
@@ -83,11 +225,13 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         q = layer_weight.q_proj.mm(input)
         cache_kv = layer_weight.kv_proj.mm(input).view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_), self.head_dim_)
 
-        rotary_emb_fwd(
-            q.view(-1, self.tp_q_head_num_, self.head_dim_),
-            cache_kv[:, 0 : self.tp_k_head_num_, :],
-            infer_state.position_cos,
-            infer_state.position_sin,
+        self.platform_backend.ops.rotary_emb(
+            is_prefill=infer_state.is_prefill,
+            batch_size=infer_state.batch_size,
+            q=q.view(-1, self.tp_q_head_num_, self.head_dim_),
+            k=cache_kv[:, 0 : self.tp_k_head_num_, :],
+            cos=infer_state.position_cos,
+            sin=infer_state.position_sin,
         )
 
         if infer_state.need_dp_prefill_balance:
@@ -103,6 +247,14 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             input = infer_state._all_to_all_balance_get(data=input)
 
         input = input.view(-1, self.tp_o_head_num_ * self.head_dim_)
+
+        if is_plain_mm_weight(layer_weight.o_proj) and can_use_npu_mm_all_reduce(input.shape[0], infer_state):
+            return npu_mm_all_reduce(input, layer_weight.o_proj, infer_state)
+        if is_npu_w8a8_weight(layer_weight.o_proj) and can_use_npu_w8a8_mm_all_reduce(
+            input.shape[0], infer_state
+        ):
+            return npu_w8a8_mm_all_reduce(input, layer_weight.o_proj, infer_state)
+
         o_tensor = layer_weight.o_proj.mm(input)
 
         o_tensor = self._tpsp_reduce(input=o_tensor, infer_state=infer_state)
@@ -111,22 +263,39 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     def _ffn(self, input, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeight) -> torch.Tensor:
         input = input.view(-1, self.embed_dim_)
         input = self._tpsp_allgather(input=input, infer_state=infer_state)
+
+        if input.device.type == "npu" and is_plain_mm_weight(
+            layer_weight.down_proj
+        ) and can_use_npu_mm_all_reduce(input.shape[0], infer_state):
+            return npu_ffn_fwd_mm_ar(
+                input=input,
+                layer_weight=layer_weight,
+                embed_dim=self.embed_dim_,
+                infer_state=infer_state,
+            )
+
+        if input.device.type == "npu" and is_npu_w8a8_weight(
+            layer_weight.down_proj
+        ) and can_use_npu_w8a8_mm_all_reduce(input.shape[0], infer_state):
+            return npu_w8a8_ffn_fwd_mm_ar(
+                input=input,
+                layer_weight=layer_weight,
+                embed_dim=self.embed_dim_,
+                infer_state=infer_state,
+            )
+
         ffn2_out = self._ffn_tp(input=input, infer_state=infer_state, layer_weight=layer_weight)
-        ffn2_out = self._tpsp_reduce(input=ffn2_out, infer_state=infer_state)
-        return ffn2_out
+        return self._tpsp_reduce(input=ffn2_out, infer_state=infer_state)
 
     def _ffn_tp(
         self, input, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeight
     ) -> torch.Tensor:
-        input = input.view(-1, self.embed_dim_)
-        up_gate_out = layer_weight.gate_up_proj.mm(input)
-        ffn1_out = self.alloc_tensor((input.size(0), up_gate_out.size(1) // 2), input.dtype)
-        silu_and_mul_fwd(up_gate_out, ffn1_out)
-        input = None
-        up_gate_out = None
-        ffn2_out = layer_weight.down_proj.mm(ffn1_out)
-        ffn1_out = None
-        return ffn2_out
+        return self.platform_backend.ops.ffn(
+            input=input,
+            layer_weight=layer_weight,
+            alloc_func=self.alloc_tensor,
+            embed_dim=self.embed_dim_,
+        )
 
     # # keep code
     # def _ffn(self, input, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeight)->torch.Tensor:

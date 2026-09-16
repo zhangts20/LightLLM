@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp, ProcessGroup
 from typing import List, Dict, Optional, Set, Union
+from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.device_utils import has_nvlink
 from lightllm.utils.envs_utils import (
@@ -36,6 +37,7 @@ from lightllm.utils.dist_utils import (
     get_dp_world_size,
     create_new_group_for_current_dp,
     create_dp_special_inter_group,
+    dist_barrier,
 )
 from lightllm.utils.device_utils import get_device_sm_count, is_sm100_gpu
 from lightllm.utils.torch_dtype_utils import get_torch_dtype
@@ -56,14 +58,17 @@ class CustomProcessGroup:
     def __init__(self):
         self.symm_mem_reduce = None
         self.flashinfer_reduce = None
+        self.pynccl_reduce = None
         self.dp_world_size = get_dp_world_size()
-        self.device_group = create_new_group_for_current_dp("nccl")
+        dist_backend = get_backend().runtime.dist_backend
+        self.device_group = create_new_group_for_current_dp(dist_backend)
         if get_env_start_args().enable_dp_prefill_balance:
-            self.dp_prefill_balance_group = create_dp_special_inter_group("nccl")
+            self.dp_prefill_balance_group = create_dp_special_inter_group(dist_backend)
         else:
             self.dp_prefill_balance_group = None
 
         self.autotune_group = dist.new_group([i for i in range(get_global_world_size())], backend="gloo")
+        self.backend_runtime = get_backend().runtime
 
     def _support_custom_allreduce(self) -> bool:
         return has_nvlink() and self.dp_world_size in [2, 4, 6, 8]
@@ -74,7 +79,7 @@ class CustomProcessGroup:
         from .symm_mem_all_reduce import SymmMemAllreduce
 
         data_type = get_torch_dtype(get_env_start_args().data_type)
-        symm = SymmMemAllreduce(self.device_group, torch.cuda.current_device(), dtype=data_type)
+        symm = SymmMemAllreduce(self.device_group, self.backend_runtime.current_device(), dtype=data_type)
         if not symm.disabled:
             self.symm_mem_reduce = symm
             logger.info("Enable SymmMem ALLReduce.")
@@ -85,18 +90,47 @@ class CustomProcessGroup:
         from .flashinfer_all_reduce import FlashInferAllReduce
 
         fi_cpu_group = create_new_group_for_current_dp("gloo")
-        fi = FlashInferAllReduce(fi_cpu_group, torch.cuda.current_device())
+        fi = FlashInferAllReduce(fi_cpu_group, self.backend_runtime.current_device())
         if not fi.disabled:
             self.flashinfer_reduce = fi
             logger.info("Enable FlashInfer ALLReduce.")
 
+    def init_pynccl_reduce(self) -> None:
+        if self.dp_world_size <= 1:
+            return
+        try:
+            from .pynccl import PyNcclCommunicator
+        except Exception as e:
+            logger.warning("PyNcclCommunicator import failed: %s", e)
+            return
+
+        # Unique-id exchange must use a non-NCCL group (gloo).
+        cpu_group = create_new_group_for_current_dp("gloo")
+        device = self.backend_runtime.current_device()
+        try:
+            comm = PyNcclCommunicator(cpu_group, device)
+        except Exception as e:
+            logger.warning("PyNcclCommunicator init failed: %s. Falling back to dist.all_reduce.", e)
+            return
+        if comm.disabled:
+            return
+        self.pynccl_reduce = comm
+        logger.info(
+            "Enable PyNccl/MCCL graph-safe ALLReduce (world_size=%d, device=%s).",
+            comm.world_size,
+            device,
+        )
+
     def all_reduce(self, input_: torch.Tensor) -> None:
-        # Dispatch chain: FlashInfer -> SymmMem -> NCCL.
+        # Dispatch chain: FlashInfer -> SymmMem -> PyNccl(MCCL/NCCL) -> dist.
         if self.flashinfer_reduce is not None and self.flashinfer_reduce.should_use(input_):
             input_.data = self.flashinfer_reduce.all_reduce(input_)
             return
         if self.symm_mem_reduce is not None and self.symm_mem_reduce.should_use(input_):
             self.symm_mem_reduce.all_reduce(input_)
+            return
+        if self.pynccl_reduce is not None and not self.pynccl_reduce.disabled:
+            self.pynccl_reduce.all_reduce(input_, inplace=True)
             return
         return dist.all_reduce(input_, group=self.device_group)
 
@@ -123,6 +157,7 @@ class DistributeGroupManager:
                 group.init_symm_mem_reduce()
             if not args.disable_flashinfer_allreduce:
                 group.init_flashinfer_reduce()
+            group.init_pynccl_reduce()
             self.groups.append(group)
         return
 
@@ -185,10 +220,7 @@ class DistributeGroupManager:
         # DeepEP reuses this group's NCCL communicator via _comm_ptr(). Because the
         # group is created without device_id, warm it up first to avoid reading a null
         # communicator. The default process group's warmup does not cover this group.
-        dist.barrier(
-            group=deepep_group,
-            device_ids=[torch.cuda.current_device()],
-        )
+        dist_barrier(group=deepep_group)
         self.ll_num_tokens = prefill_num_max_dispatch_tokens_per_rank
         self.ll_decode_num_tokens = decode_num_max_dispatch_tokens_per_rank
         self.ll_hidden = hidden_size

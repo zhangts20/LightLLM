@@ -9,11 +9,11 @@ from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
 from .allocator import KvCacheAllocator
 from lightllm.utils.profile_max_tokens import get_available_gpu_memory, get_total_gpu_memory
 from lightllm.utils.dist_utils import get_current_rank_in_node, get_node_world_size
-from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args
+from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args, get_page_size
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.utils.config_utils import get_num_key_value_heads
 from lightllm.common.kv_trans_kernel.nixl_kv_trans import page_io
-from lightllm.utils.device_utils import kv_trans_use_p2p
+from lightllm.utils.device_utils import get_target_device, kv_trans_use_p2p
 from lightllm.utils.shm_utils import create_or_link_shm
 from multiprocessing.reduction import ForkingPickler
 from filelock import FileLock
@@ -33,8 +33,12 @@ class MemoryManager:
         self.layer_num = layer_num
         self.always_copy = always_copy
         self.dtype = dtype
+        self.target_device = get_target_device()
         # profile the max total token num if the size is None
         self.profile_size(mem_fraction)
+        page_size = get_page_size()
+        if page_size > 1:
+            self.size = (self.size // page_size) * page_size
 
         self.allocator = KvCacheAllocator(self.size)
 
@@ -68,7 +72,7 @@ class MemoryManager:
         cell_size = self.get_cell_size()
         self.size = int(available_memory * 1024 ** 3 / cell_size)
         if world_size > 1:
-            tensor = torch.tensor(self.size, dtype=torch.int64, device=f"cuda:{get_current_device_id()}")
+            tensor = torch.tensor(self.size, dtype=torch.int64, device=self.target_device)
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
             self.size = tensor.item()
         logger.info(
@@ -83,12 +87,14 @@ class MemoryManager:
         # 分配，内部实际也没有管理，这个token是预留来对一些特殊的运行模式，如多dp下，overlap microbatch
         # 等模式下 padding 一些请求，使推理过程可以正常运行采用的，其索引值为size，存储在HOLD_TOKEN_MEMINDEX
         # 成员变量中，其与 req_manager 中的HOLD_REQUEST_ID具有类似的作用和意义。
-        self.kv_buffer = torch.empty((layer_num, size + 1, 2 * head_num, head_dim), dtype=dtype, device="cuda")
+        page_size = get_page_size()
+        alloc_size = ((size // page_size) + 1) * page_size if page_size > 1 else size + 1
+        self.kv_buffer = torch.empty((layer_num, alloc_size, 2 * head_num, head_dim), dtype=dtype, device=self.target_device)
 
     def alloc_paged_kv_move_buffer(self, page_num, page_size) -> torch.Tensor:
         num_kv_head = get_num_key_value_heads(get_env_start_args().model_dir)
         self.kv_move_buffer = torch.empty(
-            (page_num, page_size, self.layer_num, 2 * num_kv_head, self.head_dim), dtype=self.dtype, device="cuda"
+            (page_num, page_size, self.layer_num, 2 * num_kv_head, self.head_dim), dtype=self.dtype, device=self.target_device
         )
         self._buffer_mem_indexes_tensors = [
             torch.empty((page_size,), dtype=torch.int64, device="cpu", pin_memory=True) for _ in range(page_num)
@@ -109,7 +115,7 @@ class MemoryManager:
         cur_page = self.kv_move_buffer[page_index]
         pin_mem_indexes = self._buffer_mem_indexes_tensors[page_index][0 : len(mem_indexes)]
         pin_mem_indexes.numpy()[:] = mem_indexes
-        mem_indexes_gpu = pin_mem_indexes.cuda(non_blocking=True)
+        mem_indexes_gpu = pin_mem_indexes.to(device=self.target_device, non_blocking=True)
         repeat_count = dp_world_size * self.kv_buffer.shape[2] // self.kv_move_buffer.shape[3]
         dp_mems = mem_managers[(dp_index * dp_world_size) : ((dp_index + 1) * dp_world_size)]
         for tp_index in range(dp_world_size):
@@ -141,10 +147,10 @@ class MemoryManager:
         cur_page = self.kv_move_buffer[page_index]
         pin_mem_indexes = self._buffer_mem_indexes_tensors[page_index][0 : len(mem_indexes)]
         pin_mem_indexes.numpy()[:] = mem_indexes
-        mem_indexes_gpu = pin_mem_indexes.cuda(non_blocking=True)
+        mem_indexes_gpu = pin_mem_indexes.to(device=self.target_device, non_blocking=True)
         dp_mems = mem_managers[(dp_index * dp_world_size) : ((dp_index + 1) * dp_world_size)]
-        mem_indexes_gpu = torch.tensor(mem_indexes, dtype=torch.int64, device="cpu", pin_memory=True).cuda(
-            non_blocking=True
+        mem_indexes_gpu = torch.tensor(mem_indexes, dtype=torch.int64, device="cpu", pin_memory=True).to(
+            device=self.target_device, non_blocking=True
         )
         for tp_index in range(dp_world_size):
             page_io(

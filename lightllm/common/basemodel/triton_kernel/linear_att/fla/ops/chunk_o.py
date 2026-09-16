@@ -20,8 +20,20 @@ from .op import exp, safe_exp
 from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
 from lightllm.common.triton_utils.autotuner import autotune
 
-BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+def _low_shared_mem() -> bool:
+    try:
+        from lightllm.platform import get_backend
+
+        if get_backend().name == "maca":
+            return True
+    except Exception:
+        pass
+    return not check_shared_mem()
+
+
+BKV_LIST = [16, 32] if _low_shared_mem() else ([64, 128] if check_shared_mem() else [32, 64])
+NUM_WARPS = [2, 4] if (is_nvidia_hopper or _low_shared_mem()) else [2, 4, 8]
 
 
 @triton.heuristics(
@@ -121,12 +133,13 @@ def chunk_fwd_kernel_o(
 
 
 def _get_chunk_o_configs():
+    stages = [1] if _low_shared_mem() else [2, 3, 4]
     return [
         {"BK": BK, "BV": BV, "num_warps": num_warps, "num_stages": num_stages}
         for BK in BKV_LIST
         for BV in BKV_LIST
         for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        for num_stages in stages
     ]
 
 
@@ -172,7 +185,10 @@ def chunk_fwd_o(
 
     # Extract config parameters
     if run_config is None:
-        run_config = {"BK": 64, "BV": 64, "num_warps": 2, "num_stages": 2}
+        if _low_shared_mem():
+            run_config = {"BK": 32, "BV": 32, "num_warps": 2, "num_stages": 1}
+        else:
+            run_config = {"BK": 64, "BV": 64, "num_warps": 2, "num_stages": 2}
 
     BK = run_config.get("BK", 64)
     BV = run_config.get("BV", 64)

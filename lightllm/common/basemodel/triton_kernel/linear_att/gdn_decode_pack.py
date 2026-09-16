@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from lightllm.common.basemodel.triton_kernel.linear_att.causal_conv1d import _causal_conv1d_update_pytorch
+
 
 @triton.jit
 def _conv_pack_gdn_decode_kernel(
@@ -92,6 +94,41 @@ def _conv_pack_gdn_decode_kernel(
     tl.store(b_out + row * gate_dim + offs, b_vals, mask=gate_mask)
 
 
+def _conv_pack_gdn_decode_inputs_pytorch(
+    mixed_qkv: torch.Tensor,
+    z_raw: torch.Tensor,
+    a_raw: torch.Tensor,
+    b_raw: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    activation: str,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+):
+    q_dim = num_k_heads * head_k_dim
+    k_dim = q_dim
+    y = _causal_conv1d_update_pytorch(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        bias=conv_bias,
+        activation=activation,
+        conv_state_indices=conv_state_indices,
+    )
+    batch = y.shape[0]
+    q = y[:, :q_dim].view(batch, 1, num_k_heads, head_k_dim)
+    k = y[:, q_dim : q_dim + k_dim].view(batch, 1, num_k_heads, head_k_dim)
+    v = y[:, q_dim + k_dim :].view(batch, 1, num_v_heads, head_v_dim)
+    z = z_raw.contiguous().view(batch, num_v_heads, head_v_dim)
+    a = a_raw.contiguous().view(batch, num_v_heads)
+    b = b_raw.contiguous().view(batch, num_v_heads)
+    return q, k, v, z, a, b
+
+
 @torch.no_grad()
 def conv_pack_gdn_decode_inputs(
     mixed_qkv: torch.Tensor,
@@ -124,6 +161,23 @@ def conv_pack_gdn_decode_inputs(
     assert (
         conv_state.shape[2] >= conv_size - 1
     ), f"conv_state width must be at least conv_size - 1, got {conv_state.shape[2]} and {conv_size}"
+
+    if mixed_qkv.device.type == "npu":
+        return _conv_pack_gdn_decode_inputs_pytorch(
+            mixed_qkv,
+            z_raw,
+            a_raw,
+            b_raw,
+            conv_state,
+            conv_weight,
+            conv_bias,
+            conv_state_indices,
+            activation,
+            num_k_heads,
+            head_k_dim,
+            num_v_heads,
+            head_v_dim,
+        )
 
     q = torch.empty((batch, 1, num_k_heads, head_k_dim), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
     k = torch.empty_like(q)

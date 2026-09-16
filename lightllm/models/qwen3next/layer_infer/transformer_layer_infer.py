@@ -5,6 +5,14 @@ from lightllm.models.qwen3next.layer_weights.transformer_layer_weight import (
     Qwen3NextTransformerLayerWeight,
 )
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
+from lightllm.distributed.npu_mm_all_reduce import (
+    can_use_npu_mm_all_reduce,
+    can_use_npu_w8a8_mm_all_reduce,
+    is_plain_mm_weight,
+    is_npu_w8a8_weight,
+    npu_mm_all_reduce,
+    npu_w8a8_mm_all_reduce,
+)
 from lightllm.models.qwen3next.infer_struct import Qwen3NextInferStateInfo
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.tensor_utils import tensor_to_no_ref_tensor
@@ -13,7 +21,6 @@ from lightllm.common.basemodel.attention.base_att import AttControl
 from typing import Tuple
 from lightllm.models.qwen3next.triton_kernel.shared_expert_gate import sigmoid_mul_
 from lightllm.distributed import all_reduce
-from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
 from lightllm.utils.envs_utils import get_env_start_args
 from functools import partial
 
@@ -150,11 +157,13 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
             eps=self.eps_,
         )
         cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_), self.head_dim_)
-        rotary_emb_fwd(
-            q.view(-1, self.tp_q_head_num_, self.head_dim_),
-            cache_kv[:, : self.tp_k_head_num_, :],
-            infer_state.position_cos,
-            infer_state.position_sin,
+        self.platform_backend.ops.rotary_emb(
+            is_prefill=infer_state.is_prefill,
+            batch_size=infer_state.batch_size,
+            q=q.view(-1, self.tp_q_head_num_, self.head_dim_),
+            k=cache_kv[:, : self.tp_k_head_num_, :],
+            cos=infer_state.position_cos,
+            sin=infer_state.position_sin,
             partial_rotary_factor=self.partial_rotary_factor,
         )
         if infer_state.need_dp_prefill_balance:
@@ -174,6 +183,17 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         input = input.view(-1, self.tp_o_head_num_ * self.head_dim_)
         sigmoid_mul_(input, infer_state.gate_logics_value)
         infer_state.gate_logics_value = None
+
+        if input.device.type == "npu" and is_plain_mm_weight(
+            layer_weight.o_proj
+        ) and can_use_npu_mm_all_reduce(input.shape[0], infer_state):
+            return npu_mm_all_reduce(input, layer_weight.o_proj, infer_state)
+
+        if input.device.type == "npu" and is_npu_w8a8_weight(
+            layer_weight.o_proj
+        ) and can_use_npu_w8a8_mm_all_reduce(input.shape[0], infer_state):
+            return npu_w8a8_mm_all_reduce(input, layer_weight.o_proj, infer_state)
+
         o_tensor = layer_weight.o_proj.mm(input)
         o_tensor = self._tpsp_reduce(input=o_tensor, infer_state=infer_state)
         return o_tensor
@@ -248,7 +268,7 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         assert isinstance(infer_state.mem_manager, Qwen3NextMemManager)
         mixed_qkvzba = self._linear_in_proj(input_embdings, layer_weight)
 
-        if torch.cuda.is_current_stream_capturing():
+        if self.platform_backend.graph.is_capturing():
             core_attn_out, z = self._linear_prefill_cuda_graph_wrapper(mixed_qkvzba, infer_state, layer_weight)
         else:
             core_attn_out, z = infer_state.prefill_att_state1.prefill_att(

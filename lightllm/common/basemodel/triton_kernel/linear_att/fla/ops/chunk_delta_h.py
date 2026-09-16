@@ -15,9 +15,21 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, safe_exp
+from .utils import check_shared_mem
 from lightllm.common.triton_utils.autotuner import autotune
 
 NUM_WARPS = [2, 4, 8, 16]
+
+
+def _low_shared_mem() -> bool:
+    try:
+        from lightllm.platform import get_backend
+
+        if get_backend().name == "maca":
+            return True
+    except Exception:
+        pass
+    return not check_shared_mem()
 
 
 @triton.heuristics(
@@ -227,6 +239,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
 
 def _get_chunk_delta_h_configs():
+    if _low_shared_mem():
+        return [
+            {"BV": BV, "num_warps": num_warps, "num_stages": 1}
+            for num_warps in [2, 4]
+            for BV in [16, 32]
+        ]
     return [
         {"BV": BV, "num_warps": num_warps, "num_stages": num_stages}
         for num_warps in [2, 4]
@@ -291,7 +309,10 @@ def chunk_gated_delta_rule_fwd_h(
 
     # Extract config parameters
     if run_config is None:
-        run_config = {"BV": 64, "num_warps": 2, "num_stages": 2}
+        if _low_shared_mem():
+            run_config = {"BV": 32, "num_warps": 2, "num_stages": 1}
+        else:
+            run_config = {"BV": 64, "num_warps": 2, "num_stages": 2}
 
     BV = run_config.get("BV", 64)
     num_warps = run_config.get("num_warps", 2)

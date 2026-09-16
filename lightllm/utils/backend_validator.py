@@ -21,9 +21,13 @@ def _compute_ground_truth(q, k, v, is_causal=True):
 def _validate_fa3():
     """Validate FA3 with ground truth."""
     from lightllm.utils.device_utils import is_hopper
-    from lightllm.utils.sgl_utils import flash_attn_varlen_func
 
-    if not is_hopper():
+    device_name = torch.cuda.get_device_name(0)
+    if "MetaX" in device_name:
+        from flash_attn import flash_attn_varlen_func
+    elif is_hopper():
+        from lightllm.utils.sgl_utils import flash_attn_varlen_func
+    else:
         return False, "Not a Hopper GPU"
     if flash_attn_varlen_func is None:
         return False, "flash_attn_varlen_func is None"

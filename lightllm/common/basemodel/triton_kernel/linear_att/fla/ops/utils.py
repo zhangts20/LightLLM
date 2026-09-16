@@ -93,7 +93,11 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
                     break
 
         if tensor is not None:
-            ctx = torch.cuda.device(tensor.device.index)
+            device_mod = getattr(torch, tensor.device.type, None)
+            if device_mod is not None and hasattr(device_mod, "device"):
+                ctx = device_mod.device(tensor.device.index)
+            else:
+                ctx = contextlib.nullcontext()
         else:
             ctx = contextlib.nullcontext()
 

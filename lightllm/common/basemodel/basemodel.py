@@ -19,12 +19,13 @@ from lightllm.common.infer_utils import init_req_to_token_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_manager
-from lightllm.common.basemodel.cuda_graph import CudaGraph
+from lightllm.common.basemodel.graph import CudaGraph, DecodeGraph
 from lightllm.common.basemodel.prefill_cuda_graph import PrefillCudaGraph
 from lightllm.common.quantization import Quantcfg
 from lightllm.common.basemodel.triton_kernel.gather_token_id import gather_token, gather_token_prefill_decode_mixed
+from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.dist_utils import get_dp_world_size
+from lightllm.utils.dist_utils import get_dp_world_size, dist_barrier
 from lightllm.utils.envs_utils import get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num
 from lightllm.distributed.communication_op import dist_group_manager
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
@@ -63,6 +64,10 @@ class TpPartBaseModel:
 
     def __init__(self, kvargs):
         self.args = get_env_start_args()
+
+        self.platform_backend = get_backend()
+        self.target_device = self.platform_backend.runtime.target_device()
+
         self.run_mode = kvargs["run_mode"]
         self.weight_dir_ = kvargs["weight_dir"]
         self.max_total_token_num = kvargs["max_total_token_num"]
@@ -142,7 +147,7 @@ class TpPartBaseModel:
         self._init_cudagraph()
         self._init_prefill_cuda_graph()
         self._check_max_len_infer()
-        torch.cuda.empty_cache()
+        self.platform_backend.runtime.empty_cache()
         set_model_init_status(True)
         return
 
@@ -272,15 +277,15 @@ class TpPartBaseModel:
         return
 
     def _init_cudagraph(self):
-        self.graph = (
-            None
-            if self.disable_cudagraph
-            else CudaGraph(
+        if self.disable_cudagraph:
+            self.graph = None
+        else:
+            self.graph = DecodeGraph(
+                platform_backend=self.platform_backend.name,
                 max_batch_size=self.graph_max_batch_size,
                 max_len_in_batch=self.graph_max_len_in_batch,
                 tp_world_size=self.tp_world_size_,
             )
-        )
         if self.graph is not None:
             if get_env_start_args().enable_decode_microbatch_overlap:
                 self.graph.warmup_overlap(self)
@@ -290,7 +295,7 @@ class TpPartBaseModel:
     def _init_prefill_cuda_graph(self):
         self.prefill_graph = (
             None
-            if not get_env_start_args().enable_prefill_cudagraph
+            if (not get_env_start_args().enable_prefill_cudagraph or self.platform_backend.name == "ascend")
             else PrefillCudaGraph(decode_cuda_graph=self.graph, tp_world_size=self.tp_world_size_)
         )
         if self.prefill_graph is not None:
@@ -350,8 +355,8 @@ class TpPartBaseModel:
 
     @torch.no_grad()
     def forward(self, model_input: ModelInput):
-        model_input.to_cuda()
-        assert model_input.mem_indexes.is_cuda
+        model_input.to_device(self.target_device)
+        assert model_input.mem_indexes.device == self.target_device
 
         if model_input.is_prefill:
             return self._prefill(model_input)
@@ -585,7 +590,7 @@ class TpPartBaseModel:
             alloc_mem_index=infer_state.mem_index,
             max_q_seq_len=infer_state.max_q_seq_len,
         )
-        prefill_mem_indexes_ready_event = torch.cuda.Event()
+        prefill_mem_indexes_ready_event = self.platform_backend.runtime.create_event()
         prefill_mem_indexes_ready_event.record()
 
         infer_state.init_some_extra_state(self)
@@ -637,7 +642,8 @@ class TpPartBaseModel:
             infer_state.init_some_extra_state(self)
             infer_state.init_att_state()
 
-            if need_capture:
+            if self.graph.need_capture(infer_batch_size):
+                infer_state.is_cuda_graph = True
                 model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
             else:
                 model_output: ModelOutput = self.graph.replay(infer_state)
@@ -748,15 +754,15 @@ class TpPartBaseModel:
             model_output.mtp_main_output_hiddens = input_embs.contiguous()
 
         # 在 cuda graph 模式下，输出需要转为 no ref tensor, 加强mem pool 的复用，降低显存的使用。
-        if infer_state.is_cuda_graph:
+        if infer_state.is_cuda_graph and self.platform_backend.name != "ascend":
             model_output.to_no_ref_tensor()
 
         return model_output
 
     @torch.no_grad()
     def microbatch_overlap_prefill(self, model_input0: ModelInput, model_input1: ModelInput):
-        model_input0.to_cuda()
-        model_input1.to_cuda()
+        model_input0.to_device(self.target_device)
+        model_input1.to_device(self.target_device)
 
         if self.args.enable_prefill_decode_mixed and model_input0.b_is_decode_req is not None:
             gather_token_prefill_decode_mixed(
@@ -777,9 +783,6 @@ class TpPartBaseModel:
                 b_is_decode_req=model_input1.b_is_decode_req,
                 b_prefill_start_loc=model_input1.b_prefill_start_loc,
             )
-
-        assert model_input0.mem_indexes.is_cuda
-        assert model_input1.mem_indexes.is_cuda
 
         assert self.args.enable_tpsp_mix_mode
         origin_handle_token_num0 = model_input0.total_token_num - model_input0.prefix_total_token_num
@@ -822,7 +825,7 @@ class TpPartBaseModel:
         infer_state1.init_some_extra_state(self)
         infer_state1.init_att_state()
 
-        prefill_mem_indexes_ready_event = torch.cuda.Event()
+        prefill_mem_indexes_ready_event = self.platform_backend.runtime.create_event()
         prefill_mem_indexes_ready_event.record()
 
         model_output0, model_output1 = self._overlap_tpsp_context_forward(infer_state0, infer_state1=infer_state1)
@@ -846,8 +849,8 @@ class TpPartBaseModel:
 
     @torch.no_grad()
     def microbatch_overlap_decode(self, model_input0: ModelInput, model_input1: ModelInput):
-        model_input0.to_cuda()
-        model_input1.to_cuda()
+        model_input0.to_device(self.target_device)
+        model_input1.to_device(self.target_device)
         assert self.args.enable_tpsp_mix_mode
 
         if model_input0.input_ids is None:
@@ -864,8 +867,8 @@ class TpPartBaseModel:
             )
         # TODO 动态 mtp fix
         assert model_input0.batch_size == model_input1.batch_size
-        assert model_input0.mem_indexes.is_cuda
-        assert model_input1.mem_indexes.is_cuda
+        assert model_input0.mem_indexes.device == self.target_device
+        assert model_input1.mem_indexes.device == self.target_device
 
         origin_batch_size = model_input0.batch_size
         max_len_in_batch = max(model_input0.max_kv_seq_len, model_input1.max_kv_seq_len)
@@ -900,17 +903,17 @@ class TpPartBaseModel:
             infer_state1.init_some_extra_state(self)
             infer_state1.init_att_state()
 
-            if need_capture:
+            if self.graph.need_capture(infer_batch_size):
+                infer_state0.is_cuda_graph = True
+                infer_state1.is_cuda_graph = True
+
                 model_output0, model_output1 = self.graph.capture_decode(
                     self._overlap_tpsp_token_forward,
                     infer_state0,
                     infer_state1=infer_state1,
                 )
             else:
-                model_output0, model_output1 = self.graph.replay(
-                    infer_state0,
-                    infer_state1=infer_state1,
-                )
+                model_output0, model_output1 = self.graph.replay(infer_state0, infer_state1=infer_state1)
 
             # TODO 动态 mtp fix
             model_output0 = self._create_unpad_decode_model_output(model_output0, origin_batch_size=origin_batch_size)
@@ -1030,7 +1033,7 @@ class TpPartBaseModel:
             model_output.mtp_main_output_hiddens = input_embs.contiguous()
             model_output1.mtp_main_output_hiddens = input_embs1.contiguous()
 
-        if infer_state.is_cuda_graph:
+        if infer_state.is_cuda_graph and self.platform_backend.name != "ascend":
             model_output.to_no_ref_tensor()
             model_output1.to_no_ref_tensor()
 
@@ -1045,20 +1048,20 @@ class TpPartBaseModel:
             return
 
         # 做一次 同步
-        torch.distributed.barrier()
+        dist_barrier()
 
         # 模拟最大长度进行 prefill，观察是否出现 OOM
         try:
             logger.info("begin check max_len infer")
-            dummy_input_ids = torch.ones(self.batch_max_tokens, dtype=torch.int64, device="cuda")
-            b_req_idx = torch.tensor([self.req_manager.alloc()], dtype=torch.int32, device="cuda")
-            mem_indexes = self.mem_manager.alloc(len(dummy_input_ids)).cuda()
-            b_seq_len = torch.ones(1, dtype=torch.int32, device="cuda")
+            dummy_input_ids = torch.ones(self.batch_max_tokens, dtype=torch.int64, device=self.target_device)
+            b_req_idx = torch.tensor([self.req_manager.alloc()], dtype=torch.int32, device=self.target_device)
+            mem_indexes = self.mem_manager.alloc(len(dummy_input_ids)).to(device=self.target_device)
+            b_seq_len = torch.ones(1, dtype=torch.int32, device=self.target_device)
             b_seq_len[:] = self.batch_max_tokens
-            b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device="cuda")
-            b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device="cuda")
+            b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device=self.target_device)
+            b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device=self.target_device)
             total_token_num = self.batch_max_tokens
-            b_mtp_index = torch.zeros(1, dtype=torch.int32, device="cuda")
+            b_mtp_index = torch.zeros(1, dtype=torch.int32, device=self.target_device)
             model_input = ModelInput(
                 batch_size=1,
                 total_token_num=total_token_num,
@@ -1096,7 +1099,7 @@ class TpPartBaseModel:
             )
             logger.error(exception_str)
             raise Exception(exception_str)
-        torch.cuda.empty_cache()
+        self.platform_backend.runtime.empty_cache()
         return
 
     def autotune_layers(self):
@@ -1108,7 +1111,7 @@ class TpPartBaseModel:
     @post_empty_cache
     def _autotune_warmup(self):
         Autotuner.start_autotune_warmup()
-        torch.distributed.barrier()
+        dist_barrier()
 
         warmup_lengths = [1, 4, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096]
 
@@ -1123,19 +1126,19 @@ class TpPartBaseModel:
         self.layers_num = self.autotune_layers()
         for input_len in tqdm(warmup_lengths, desc="warming up"):
             try:
-                rand_gen = torch.Generator(device="cuda")
+                rand_gen = torch.Generator(device=self.target_device)
                 rand_gen.manual_seed(input_len)
                 dummy_input_ids = torch.randint(
-                    0, 10000, (input_len,), dtype=torch.int64, device="cuda", generator=rand_gen
+                    0, 10000, (input_len,), dtype=torch.int64, device=self.target_device, generator=rand_gen
                 )
-                b_req_idx = torch.tensor([self.req_manager.alloc()], dtype=torch.int32, device="cuda")
-                mem_indexes = self.mem_manager.alloc(len(dummy_input_ids)).cuda()
-                b_seq_len = torch.ones(1, dtype=torch.int32, device="cuda")
+                b_req_idx = torch.tensor([self.req_manager.alloc()], dtype=torch.int32, device=self.target_device)
+                mem_indexes = self.mem_manager.alloc(len(dummy_input_ids)).to(device=self.target_device)
+                b_seq_len = torch.ones(1, dtype=torch.int32, device=self.target_device)
                 b_seq_len[:] = input_len
-                b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device="cuda")
-                b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device="cuda")
+                b_ready_cache_len = torch.zeros(1, dtype=torch.int32, device=self.target_device)
+                b_prefill_start_loc = torch.zeros(1, dtype=torch.int32, device=self.target_device)
                 total_token_num = input_len
-                b_mtp_index = torch.zeros(1, dtype=torch.int32, device="cuda")
+                b_mtp_index = torch.zeros(1, dtype=torch.int32, device=self.target_device)
                 model_input = ModelInput(
                     batch_size=1,
                     total_token_num=total_token_num,
@@ -1164,16 +1167,16 @@ class TpPartBaseModel:
                 self.req_manager.free_all()
                 self.mem_manager.free_all()
                 gc.collect()
-                torch.cuda.empty_cache()
+                self.platform_backend.runtime.empty_cache()
             except Exception as e:
                 logger.warning(f"autotune warmup for length {input_len} failed: {str(e)}")
                 logger.exception(str(e))
                 self.req_manager.free_all()
                 self.mem_manager.free_all()
                 gc.collect()
-                torch.cuda.empty_cache()
+                self.platform_backend.runtime.empty_cache()
         self.layers_num = layer_num_bak
-        torch.distributed.barrier()
+        dist_barrier()
         Autotuner.end_autotune_warmup()
 
     @final
@@ -1183,24 +1186,24 @@ class TpPartBaseModel:
         对 padded 所使用的req 进行初始化， 目前有非常多的地方需要使用，所以将其初始化固定为固定流程
         """
         # 做一次 同步
-        torch.distributed.barrier()
+        dist_barrier()
 
         # prefill init padding req.
         prefill_input_len = 1
         batch_size = 1
-        dummy_input_ids = torch.ones((batch_size,), dtype=torch.int64, device="cuda")
+        dummy_input_ids = torch.ones((batch_size,), dtype=torch.int64, device=self.target_device)
         b_req_idx = torch.tensor(
-            [self.req_manager.HOLD_REQUEST_ID for _ in range(batch_size)], dtype=torch.int32, device="cuda"
+            [self.req_manager.HOLD_REQUEST_ID for _ in range(batch_size)], dtype=torch.int32, device=self.target_device
         )
         mem_indexes = torch.tensor(
-            [self.mem_manager.HOLD_TOKEN_MEMINDEX for _ in range(batch_size)], dtype=torch.int32, device="cuda"
+            [self.mem_manager.HOLD_TOKEN_MEMINDEX for _ in range(batch_size)], dtype=torch.int32, device=self.target_device
         )
-        b_seq_len = torch.ones(batch_size, dtype=torch.int32, device="cuda")
-        b_ready_cache_len = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+        b_seq_len = torch.ones(batch_size, dtype=torch.int32, device=self.target_device)
+        b_ready_cache_len = torch.zeros(batch_size, dtype=torch.int32, device=self.target_device)
         b_q_seq_len = b_seq_len - b_ready_cache_len
         b_prefill_start_loc = b_q_seq_len.cumsum(dim=0, dtype=torch.int32) - b_q_seq_len
         total_token_num = prefill_input_len * batch_size
-        b_mtp_index = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+        b_mtp_index = torch.zeros(batch_size, dtype=torch.int32, device=self.target_device)
         model_input = ModelInput(
             batch_size=batch_size,
             total_token_num=total_token_num,
@@ -1234,7 +1237,7 @@ class TpPartBaseModel:
         del b_mtp_index
         del b_prefill_start_loc
         del b_q_seq_len
-        torch.cuda.empty_cache()
+        self.platform_backend.runtime.empty_cache()
         return
 
     def _gen_special_model_input(self, token_num: int):
@@ -1243,7 +1246,7 @@ class TpPartBaseModel:
         is_mtp_draft_model = getattr(self, "is_mtp_draft_model", False)
         if is_mtp_draft_model:
             special_model_input["mtp_draft_input_hiddens"] = torch.randn(
-                token_num, self.config["hidden_size"], dtype=self.data_type, device="cuda"
+                token_num, self.config["hidden_size"], dtype=self.data_type, device=self.target_device
             )
         else:
             special_model_input["mtp_draft_input_hiddens"] = None
