@@ -31,6 +31,7 @@ NPU_PAGED_PER_TOKEN_ANTIQUANT_MODE = 4
 DEFAULT_DEQUANT_CHUNK_TOKENS = 65536
 DEFAULT_DEQUANT_RESERVE_MIB = 512
 DEFAULT_MACA_DEQUANT_CHUNK_TOKENS = 16384
+DEFAULT_MACA_ONESHOT_MAX_BYTES = 2 * 1024 ** 3
 logger = init_logger(__name__)
 
 
@@ -614,6 +615,8 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
     request_slices: tuple = None
     max_prefix_len: int = 0
     dequant_chunk_tokens: int = DEFAULT_MACA_DEQUANT_CHUNK_TOKENS
+    oneshot_max_bytes: int = DEFAULT_MACA_ONESHOT_MAX_BYTES
+    force_chunked_prefix: bool = False
 
     def init_state(self) -> None:
         infer = self.infer_state
@@ -635,6 +638,15 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
             raise ValueError(
                 "LIGHTLLM_MACA_INT8KV_DEQUANT_CHUNK_TOKENS must be greater than zero"
             )
+        self.oneshot_max_bytes = int(
+            os.getenv(
+                "LIGHTLLM_MACA_INT8KV_ONESHOT_MAX_BYTES",
+                str(DEFAULT_MACA_ONESHOT_MAX_BYTES),
+            )
+        )
+        self.force_chunked_prefix = os.getenv(
+            "LIGHTLLM_MACA_INT8KV_PREFIX_ONESHOT", "1"
+        ) == "0"
         if infer.prefix_total_token_num == 0:
             return
 
@@ -724,6 +736,24 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
         n_q, head_dim = q.shape[-2:]
         n_kv = k_cache.shape[-2]
         group_size = self.backend.quant_group_size
+        total_kv_tokens = int(self.infer_state.prefix_total_token_num) + int(q.shape[0])
+        oneshot_bytes = total_kv_tokens * n_kv * head_dim * q.element_size() * 2
+        if (
+            not self.force_chunked_prefix
+            and self.oneshot_max_bytes > 0
+            and oneshot_bytes <= self.oneshot_max_bytes
+        ):
+            return self._oneshot_prefix_prefill_att(
+                q=q,
+                fresh_k=fresh_k,
+                fresh_v=fresh_v,
+                k_cache=k_cache,
+                k_scale=k_scale,
+                v_cache=v_cache,
+                v_scale=v_scale,
+                sm_scale=sm_scale,
+                alloc_func=alloc_func,
+            )
         chunk_tokens = min(self.dequant_chunk_tokens, max(self.max_prefix_len, 1))
         req_to_token = self.infer_state.req_manager.req_to_token_indexs
         acc_out = alloc_func(q.shape, dtype=torch.float32, device=q.device)
@@ -786,6 +816,66 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
         output = alloc_func(q.shape, dtype=q.dtype, device=q.device)
         output.copy_(acc_out)
         return output
+
+    def _oneshot_prefix_prefill_att(
+        self,
+        q: torch.Tensor,
+        fresh_k: torch.Tensor,
+        fresh_v: torch.Tensor,
+        k_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_cache: torch.Tensor,
+        v_scale: torch.Tensor,
+        sm_scale: float,
+        alloc_func: Callable[..., torch.Tensor],
+    ) -> torch.Tensor:
+        n_kv, head_dim = k_cache.shape[-2], q.shape[-1]
+        group_size = self.backend.quant_group_size
+        req_to_token = self.infer_state.req_manager.req_to_token_indexs
+        total_kv = int(self.infer_state.prefix_total_token_num) + int(q.shape[0])
+        k_pack = alloc_func((total_kv, n_kv, head_dim), dtype=q.dtype, device=q.device)
+        v_pack = alloc_func((total_kv, n_kv, head_dim), dtype=q.dtype, device=q.device)
+        cu_k = [0]
+        kv_off = 0
+        max_kv = 0
+        for q_start, q_end, req_id, prefix_len in self.request_slices:
+            q_len = q_end - q_start
+            if prefix_len > 0:
+                gather_dequant_int8kv(
+                    k_cache,
+                    k_scale,
+                    v_cache,
+                    v_scale,
+                    req_to_token[req_id, :prefix_len],
+                    k_pack[kv_off : kv_off + prefix_len],
+                    v_pack[kv_off : kv_off + prefix_len],
+                    group_size,
+                )
+            k_pack[kv_off + prefix_len : kv_off + prefix_len + q_len].copy_(fresh_k[q_start:q_end])
+            v_pack[kv_off + prefix_len : kv_off + prefix_len + q_len].copy_(fresh_v[q_start:q_end])
+            kv_off += prefix_len + q_len
+            cu_k.append(kv_off)
+            max_kv = max(max_kv, prefix_len + q_len)
+
+        infer = self.infer_state
+        cu_seqlens_k = getattr(infer, "b1_cu_kv_seq_len", None)
+        if cu_seqlens_k is None or int(cu_seqlens_k[-1]) != kv_off:
+            cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=q.device)
+        else:
+            cu_seqlens_k = cu_seqlens_k.int()
+        return maca_flash_attn_varlen_func(
+            q=q,
+            k=k_pack,
+            v=v_pack,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=infer.max_q_seq_len,
+            max_seqlen_k=max(max_kv, int(getattr(infer, "max_kv_seq_len", 0) or 0)),
+            softmax_scale=sm_scale,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+        )
 
     def _prefix_chunk_att(
         self,
