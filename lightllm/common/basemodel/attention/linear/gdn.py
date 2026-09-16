@@ -134,7 +134,11 @@ class LinearAttPrefillAttState(BasePrefillAttState):
         # 在开启了mtp的时候，conv 状态的最后一维可能存在冗余的部分，需要进行切片对齐。
         # prefill 模式下，使用不到这几个维度，所以需要扣除掉，
         if backend.mtp_step > 0:
-            conv_states = conv_states[:, :, : -backend.mtp_step]
+            conv_dim = backend.tp_key_dim * 2 + backend.tp_value_dim
+            if conv_states.shape[-1] == conv_dim:
+                conv_states = conv_states[:, : backend.conv_kernel_dim - 1, :]
+            else:
+                conv_states = conv_states[:, :, : -backend.mtp_step]
         mixed_qkv, z, b, a = backend._split_qkvzba(mixed_qkvzba)
         core_attn_out = self._gdn_prefill_kernel(
             mixed_qkv, conv_states, ssm_states, a, b, self.infer_state, layer_weight
@@ -312,14 +316,20 @@ class LinearAttDecodeAttState(BaseDecodeAttState):
 
         # Recurrent processing with fused gating. Decode uses a specialized
         # conv+pack kernel to avoid materializing the post-conv qkv tensor
-        # before immediately splitting it into q/k/v.
+        # before immediately splitting it into q/k/v. NPU uses the 910B
+        # recurrent (accurate vs PyTorch). CUDA keeps the GPU-style grid.
+        conv_weight = layer_weight.linear_conv1d.mm_param.weight
+        if mixed_qkv.device.type == "npu":
+            if getattr(layer_weight, "linear_conv1d_mtp_weight_t", None) is None:
+                layer_weight.linear_conv1d_mtp_weight_t = conv_weight.transpose(0, 1).contiguous()
+            conv_weight = layer_weight.linear_conv1d_mtp_weight_t
         query, key, value, z, a, b = conv_pack_gdn_decode_inputs(
             mixed_qkv,
             z,
             a,
             b,
             conv_states,
-            layer_weight.linear_conv1d.mm_param.weight,
+            conv_weight,
             layer_weight.linear_conv1d.bias,
             self.b_conv_buffer_idx,
             backend.activation,
@@ -329,19 +339,37 @@ class LinearAttDecodeAttState(BaseDecodeAttState):
             backend.tp_num_v_heads,
             backend.head_v_dim,
         )
-        core_attn_out, _ = fused_recurrent_gated_delta_rule(
-            q=query,
-            k=key,
-            v=value,
-            initial_state=ssm_states,
-            inplace_final_state=True,
-            ssm_state_indices=self.b_ssm_buffer_idx,
-            use_qk_l2norm_in_kernel=True,
-            A_log=layer_weight.linear_A_log.weight,
-            dt_bias=layer_weight.linear_dt_bias.weight,
-            a_raw=a,
-            b_raw=b,
-        )
+        if mixed_qkv.device.type == "npu":
+            from lightllm.common.basemodel.triton_kernel.linear_att.gdn_decode_npu import (
+                fused_recurrent_decode_npu,
+            )
+
+            core_attn_out = fused_recurrent_decode_npu(
+                q=query,
+                k=key,
+                v=value,
+                initial_state=ssm_states,
+                ssm_state_indices=self.b_ssm_buffer_idx,
+                A_log=layer_weight.linear_A_log.weight,
+                dt_bias=layer_weight.linear_dt_bias.weight,
+                a_raw=a,
+                b_raw=b,
+                persist=True,
+            )
+        else:
+            core_attn_out, _ = fused_recurrent_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                initial_state=ssm_states,
+                inplace_final_state=True,
+                ssm_state_indices=self.b_ssm_buffer_idx,
+                use_qk_l2norm_in_kernel=True,
+                A_log=layer_weight.linear_A_log.weight,
+                dt_bias=layer_weight.linear_dt_bias.weight,
+                a_raw=a,
+                b_raw=b,
+            )
         return core_attn_out, z
 
     def _gdn_mtp_kernel(

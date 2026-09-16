@@ -50,13 +50,24 @@ class LinearAttCacheConfig:
     def get_full_att_kv_layer_num_with_draft_model(self):
         return self.get_main_model_full_att_layer_num() + self.draft_full_att_kv_layer_num
 
+    def conv_state_feat_last(self) -> bool:
+        # Ascend Vector loads want the channel axis contiguous (SGL-style).
+        try:
+            return get_env_start_args().hardware_platform == "ascend"
+        except Exception:
+            return False
+
     def get_conv_state_shape(self):
         # Base committed sliding-window state, without speculative MTP tail.
-        return (self.get_conv_dim(), self.conv_kernel_size - 1)
+        dim = self.get_conv_dim()
+        window = self.conv_kernel_size - 1
+        return (window, dim) if self.conv_state_feat_last() else (dim, window)
 
     def get_mtp_conv_state_shape(self, mtp_step: int):
         # Working state with room for S speculative tokens before acceptance.
-        return (self.get_conv_dim(), (self.conv_kernel_size - 1) + mtp_step)
+        dim = self.get_conv_dim()
+        window = (self.conv_kernel_size - 1) + mtp_step
+        return (window, dim) if self.conv_state_feat_last() else (dim, window)
 
     def get_ssm_state_shape(self):
         return (self.num_linear_v_heads, self.head_linear_k_dim, self.head_linear_v_dim)

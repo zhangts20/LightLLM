@@ -91,6 +91,23 @@ def _host_has_init_list(has_initial_state, batch: int):
     return [bool(has_initial_state)] * batch
 
 
+def _conv_state_feat_last(conv_states: torch.Tensor, dim: int) -> bool:
+    return conv_states is not None and conv_states.shape[-1] == dim
+
+
+def _load_conv_window(conv_states: torch.Tensor, idx: int, state_len: int, dim: int):
+    if _conv_state_feat_last(conv_states, dim):
+        return conv_states[idx, :state_len, :].transpose(0, 1).contiguous()
+    return conv_states[idx, :, :state_len]
+
+
+def _store_conv_window(conv_states: torch.Tensor, idx: int, new_state: torch.Tensor, state_len: int, dim: int):
+    if _conv_state_feat_last(conv_states, dim):
+        conv_states[idx, :state_len, :].copy_(new_state.transpose(0, 1))
+    else:
+        conv_states[idx, :, :state_len].copy_(new_state)
+
+
 def _apply_packed_varlen(
     x: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -103,15 +120,16 @@ def _apply_packed_varlen(
 ) -> torch.Tensor:
     batch = int(query_start_loc.numel() - 1)
     need_state = conv_states is not None
+    dim = x.shape[0]
 
     def _apply_one(start: int, end: int, state_idx: int, has_init: bool):
         if end <= start or state_idx == pad_slot_id:
             return
-        init = conv_states[state_idx, :, :state_len] if (need_state and has_init) else None
+        init = _load_conv_window(conv_states, state_idx, state_len, dim) if (need_state and has_init) else None
         out_i, new_state = run_one(x[:, start:end], init)
         x[:, start:end].copy_(out_i)
         if need_state and new_state is not None:
-            conv_states[state_idx, :, :state_len].copy_(new_state)
+            _store_conv_window(conv_states, state_idx, new_state, state_len, dim)
 
     if batch == 1:
         # conc=1: skip .tolist() D2H; read start/end with .item() and run once.
@@ -196,11 +214,11 @@ def _causal_conv1d_fn_pytorch(
         state_idx = cache_indices_cpu[i] if cache_indices_cpu is not None else i
         init = None
         if conv_states is not None and has_init_cpu[i]:
-            init = conv_states[state_idx, :, :state_len]
+            init = _load_conv_window(conv_states, state_idx, state_len, dim)
         out_i, new_state = _run_one(x[i], init)
         x[i].copy_(out_i)
         if conv_states is not None:
-            conv_states[state_idx, :, :state_len].copy_(new_state)
+            _store_conv_window(conv_states, state_idx, new_state, state_len, dim)
     return x
 
 
@@ -223,7 +241,11 @@ def _causal_conv1d_update_pytorch(
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
     width = weight.shape[1]
-    assert conv_state.shape[-1] >= width - 1
+    feat_last = _conv_state_feat_last(conv_state, dim)
+    if feat_last:
+        assert conv_state.shape[1] >= width - 1
+    else:
+        assert conv_state.shape[-1] >= width - 1
     assert seqlen == 1, "graph-safe update currently supports decode seqlen=1 only"
 
     if conv_state_indices is None:
@@ -235,7 +257,10 @@ def _causal_conv1d_update_pytorch(
     safe_indices = torch.where(pad_mask, torch.zeros_like(indices), indices)
 
     # state: [B, dim, width-1], x: [B, dim, 1]
-    state = conv_state[safe_indices, :, : width - 1].to(dtype=torch.float32)
+    if feat_last:
+        state = conv_state[safe_indices, : width - 1, :].transpose(1, 2).to(dtype=torch.float32)
+    else:
+        state = conv_state[safe_indices, :, : width - 1].to(dtype=torch.float32)
     x_f = x[:, :, 0].to(dtype=torch.float32)
     w_f = weight.to(dtype=torch.float32)
 
@@ -256,7 +281,10 @@ def _causal_conv1d_update_pytorch(
             [state[:, :, 1:].to(dtype=conv_state.dtype), x_f.to(dtype=conv_state.dtype).unsqueeze(-1)],
             dim=-1,
         )
-    conv_state[:, :, : width - 1].index_copy_(0, safe_indices, new_state)
+    if feat_last:
+        conv_state[:, : width - 1, :].index_copy_(0, safe_indices, new_state.transpose(1, 2))
+    else:
+        conv_state[:, :, : width - 1].index_copy_(0, safe_indices, new_state)
 
     out = torch.where(pad_mask.view(batch, 1, 1), x.to(dtype_in), out)
     if unsqueeze:

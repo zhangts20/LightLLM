@@ -424,10 +424,16 @@ class InferenceContext:
                     if req.tail_linear_att_small_page_buffer_id is not None:
                         conv_src_idx = req.req_idx
                         ssm_src_idx = req.req_idx * (self.args.mtp_step + 1)
-                        conv_cache_width = self.req_manager.linear_config.get_conv_state_shape()[-1]
-                        gpu_conv_state = self.req_manager.req_to_conv_state.buffer[
-                            :, conv_src_idx, ..., :conv_cache_width
-                        ]
+                        if self.req_manager.linear_config.conv_state_feat_last():
+                            committed = self.req_manager.linear_config.conv_kernel_size - 1
+                            gpu_conv_state = self.req_manager.req_to_conv_state.buffer[
+                                :, conv_src_idx, :committed, :
+                            ]
+                        else:
+                            conv_cache_width = self.req_manager.linear_config.get_conv_state_shape()[-1]
+                            gpu_conv_state = self.req_manager.req_to_conv_state.buffer[
+                                :, conv_src_idx, ..., :conv_cache_width
+                            ]
                         gpu_ssm_state = self.req_manager.req_to_ssm_state.buffer[:, ssm_src_idx, ...]
                         dst_buffer_idx = req.tail_linear_att_small_page_buffer_id
 

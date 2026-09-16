@@ -316,11 +316,28 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 input_layout = "BNSD"
                 sparse_mode = 0
                 atten_mask = None
-                q = q.unsqueeze(2)
+                # unsqueeze(2) on [B, H, D] yields non-contiguous [B, H, 1, D].
+                # FIA graph_task_update then inserts AsStrided/aclnnContiguous
+                # and CANN 8.5.1 fails with 207019.
+                q = q.unsqueeze(2).contiguous()
             else:
                 input_layout = "TND"
                 sparse_mode = 3
                 atten_mask = self.backend.get_causal_attn_mask(q.device)
+                if not q.is_contiguous():
+                    q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            if not v.is_contiguous():
+                v = v.contiguous()
+            page_table = self.page_table
+            if page_table is not None and not page_table.is_contiguous():
+                page_table = page_table.contiguous()
+                self.page_table = page_table
+            kv_cache_args = {
+                name: val.contiguous() if isinstance(val, torch.Tensor) and not val.is_contiguous() else val
+                for name, val in kv_cache_args.items()
+            }
 
             output = torch.empty_like(q)
             softmax_lse = torch.empty(1, dtype=torch.float16, device=q.device)
@@ -371,7 +388,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
                     num_heads=N_Q,
                     num_key_value_heads=N_KV,
-                    block_table=self.page_table,
+                    block_table=page_table,
                     block_size=self.backend.page_size,
                     workspace=workspace,
                     out=[output, softmax_lse],
@@ -392,7 +409,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                         sm_scale,
                         N_Q,
                         N_KV,
-                        weak_ref_tensor(self.page_table),
+                        weak_ref_tensor(page_table),
                         self.backend.page_size,
                         weak_ref_tensor(output),
                         weak_ref_tensor(softmax_lse),
@@ -417,7 +434,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
                     num_heads=N_Q,
                     num_key_value_heads=N_KV,
-                    block_table=self.page_table,
+                    block_table=page_table,
                     block_size=self.backend.page_size,
                     out=[output, softmax_lse],
                     **kv_cache_args,

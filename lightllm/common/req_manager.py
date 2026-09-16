@@ -431,8 +431,12 @@ class ReqManagerForMamba(ReqManager):
         conv_state, ssm_state = big_page_buffers.get_state_cache(buffer_idx=big_page_buffer_idx)
         conv_dest = req.req_idx
         ssm_dest = req.req_idx * (self.mtp_step + 1)
-        conv_cache_width = conv_state.shape[-1]
-        self.req_to_conv_state.buffer[:, conv_dest, ..., :conv_cache_width] = conv_state
+        if conv_state.shape[-1] == self.linear_config.get_conv_dim():
+            committed = self.linear_config.conv_kernel_size - 1
+            self.req_to_conv_state.buffer[:, conv_dest, :committed, :] = conv_state
+        else:
+            conv_cache_width = conv_state.shape[-1]
+            self.req_to_conv_state.buffer[:, conv_dest, ..., :conv_cache_width] = conv_state
         self.req_to_ssm_state.buffer[:, ssm_dest, ...] = ssm_state
         if self.req_to_mtp_state_index is not None:
             self.req_to_mtp_state_index[req.req_idx] = 0
@@ -446,10 +450,14 @@ class ReqManagerForMamba(ReqManager):
         )
         conv_dest = req.req_idx
         ssm_dest = req.req_idx * (self.mtp_step + 1)
-        conv_cache_width = conv_state.shape[-1]
-        # TODO 下面这个从 cpu cache 拷贝数据的 gpu的操作，是否是阻塞的操作。
-        # 同时，非连续对象的拷贝，可能存在效率问题。
-        self.req_to_conv_state.buffer[:, conv_dest, ..., :conv_cache_width] = conv_state
+        if conv_state.shape[-1] == self.linear_config.get_conv_dim():
+            committed = self.linear_config.conv_kernel_size - 1
+            self.req_to_conv_state.buffer[:, conv_dest, :committed, :] = conv_state
+        else:
+            conv_cache_width = conv_state.shape[-1]
+            # TODO 下面这个从 cpu cache 拷贝数据的 gpu的操作，是否是阻塞的操作。
+            # 同时，非连续对象的拷贝，可能存在效率问题。
+            self.req_to_conv_state.buffer[:, conv_dest, ..., :conv_cache_width] = conv_state
         self.req_to_ssm_state.buffer[:, ssm_dest, ...] = ssm_state
         if self.req_to_mtp_state_index is not None:
             self.req_to_mtp_state_index[req.req_idx] = 0

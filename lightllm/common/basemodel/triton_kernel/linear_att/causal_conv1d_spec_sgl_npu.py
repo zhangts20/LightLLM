@@ -174,14 +174,12 @@ def causal_conv1d_update_sgl_npu(
     state_len = conv_state.shape[2]
     assert 2 <= width <= 6
 
-    # The upstream kernel is fast only when channels are contiguous in both
-    # state and weight.  Compact active slots and transpose once around the
-    # fused kernel; the persistent request cache keeps LightLLM's layout.
-    compact_state = (
-        torch.index_select(conv_state, 0, conv_state_indices)
-        .transpose(1, 2)
-        .contiguous()
-    )
+    # Kernel wants [slot, window, dim]. Last dim == channel => already feat-last.
+    selected = torch.index_select(conv_state, 0, conv_state_indices)
+    if selected.shape[-1] == dim:
+        compact_state = selected.contiguous()
+    else:
+        compact_state = selected.transpose(1, 2).contiguous()
     x_3d = x.view(batch, tokens_per_seq, dim)
     output = x_3d
 
@@ -214,5 +212,8 @@ def causal_conv1d_update_sgl_npu(
         multibuffer=False,
     )
 
-    conv_state.index_copy_(0, conv_state_indices, compact_state.transpose(1, 2))
+    if conv_state.shape[-1] == dim:
+        conv_state.index_copy_(0, conv_state_indices, compact_state)
+    else:
+        conv_state.index_copy_(0, conv_state_indices, compact_state.transpose(1, 2))
     return output.view_as(x).to(original_dtype)

@@ -117,6 +117,17 @@ class DecodeGraph:
         # Dummy decode only needs a tiny KV length. Ascend ACL graphs override this.
         return 2
 
+    def _reset_warmup_linear_states(self, model, batch_size: int) -> None:
+        if self.args.mtp_step != 0:
+            return
+        req_manager = model.req_manager
+        conv_cache = getattr(req_manager, "req_to_conv_state", None)
+        ssm_cache = getattr(req_manager, "req_to_ssm_state", None)
+        if conv_cache is not None:
+            conv_cache.buffer[:, :batch_size].zero_()
+        if ssm_cache is not None:
+            ssm_cache.buffer[:, :batch_size].zero_()
+
     def can_run(self, batch_size: int, max_len_in_batch: int) -> bool:
         return batch_size <= self.max_batch_size and max_len_in_batch <= self.graph_max_len_in_batch
 
@@ -250,14 +261,20 @@ class DecodeGraph:
 
         # decode cuda graph init
         for batch_size in self.graph_batch_sizes[::-1]:
+            self._reset_warmup_linear_states(model, batch_size)
             seq_len = self._warmup_dummy_seq_len()
             total_token_num = batch_size * seq_len
             max_len_in_batch = self.graph_max_len_in_batch
             input_ids = torch.tensor([1 for _ in range(batch_size)], dtype=torch.int64, device=self.target_device)
             mem_indexes = model.mem_manager.alloc(len(input_ids)).to(self.target_device)
-            b_req_idx = torch.tensor(
-                [model.req_manager.HOLD_REQUEST_ID for _ in range(batch_size)], dtype=torch.int32, device=self.target_device
-            )
+            if self.args.mtp_step == 0:
+                b_req_idx = torch.arange(batch_size, dtype=torch.int32, device=self.target_device)
+            else:
+                b_req_idx = torch.tensor(
+                    [model.req_manager.HOLD_REQUEST_ID for _ in range(batch_size)],
+                    dtype=torch.int32,
+                    device=self.target_device,
+                )
             b_seq_len = torch.empty(batch_size, dtype=torch.int32, device=self.target_device)
             b_seq_len.fill_(seq_len)
             b_mtp_index = torch.zeros(batch_size, dtype=torch.int32, device=self.target_device)
@@ -293,6 +310,7 @@ class DecodeGraph:
                     del locals()[var_name]
             self.platform_backend.runtime.empty_cache()
 
+        self._reset_warmup_linear_states(model, self.max_batch_size)
         logger.info(
             f"Capture cudagraph success, batch_size <={self.max_batch_size} "
             f"and max_len_in_batch <= {self.graph_max_len_in_batch} will infer with cudagraph."

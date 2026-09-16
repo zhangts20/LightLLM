@@ -3,6 +3,10 @@ import triton
 import triton.language as tl
 
 from lightllm.common.basemodel.triton_kernel.linear_att.causal_conv1d import _causal_conv1d_update_pytorch
+from lightllm.common.basemodel.triton_kernel.linear_att.gdn_decode_npu import (
+    conv_pack_gdn_decode_inputs_npu,
+    conv_pack_gdn_decode_inputs_npu_contig,
+)
 
 
 @triton.jit
@@ -155,15 +159,44 @@ def conv_pack_gdn_decode_inputs(
 
     assert conv_size >= 2, f"conv kernel size must be at least 2, got {conv_size}"
     assert mixed_qkv.shape[1] == conv_dim, f"mixed_qkv shape mismatch: {mixed_qkv.shape[1]} != {conv_dim}"
-    assert conv_weight.shape[0] == conv_dim, f"conv_weight shape mismatch: {conv_weight.shape[0]} != {conv_dim}"
-    assert conv_weight.shape[1] == conv_size, f"conv_weight kernel mismatch: {conv_weight.shape[1]} != {conv_size}"
-    assert conv_state.shape[1] == conv_dim, f"conv_state shape mismatch: {conv_state.shape[1]} != {conv_dim}"
-    assert (
-        conv_state.shape[2] >= conv_size - 1
-    ), f"conv_state width must be at least conv_size - 1, got {conv_state.shape[2]} and {conv_size}"
+    feat_last = conv_state.shape[-1] == conv_dim
+    if feat_last:
+        assert conv_state.shape[1] >= conv_size - 1, (
+            f"feat-last conv_state window too short: {conv_state.shape} conv_size={conv_size}"
+        )
+        if conv_weight.shape[0] == conv_size and conv_weight.shape[1] == conv_dim:
+            conv_weight_t = conv_weight
+        else:
+            assert conv_weight.shape[0] == conv_dim, f"conv_weight shape mismatch: {conv_weight.shape[0]} != {conv_dim}"
+            assert conv_weight.shape[1] == conv_size, f"conv_weight kernel mismatch: {conv_weight.shape[1]} != {conv_size}"
+            conv_weight_t = conv_weight.transpose(0, 1).contiguous()
+    else:
+        assert conv_weight.shape[0] == conv_dim, f"conv_weight shape mismatch: {conv_weight.shape[0]} != {conv_dim}"
+        assert conv_weight.shape[1] == conv_size, f"conv_weight kernel mismatch: {conv_weight.shape[1]} != {conv_size}"
+        assert conv_state.shape[1] == conv_dim, f"conv_state shape mismatch: {conv_state.shape[1]} != {conv_dim}"
+        assert (
+            conv_state.shape[2] >= conv_size - 1
+        ), f"conv_state width must be at least conv_size - 1, got {conv_state.shape[2]} and {conv_size}"
 
     if mixed_qkv.device.type == "npu":
-        return _conv_pack_gdn_decode_inputs_pytorch(
+        if feat_last:
+            return conv_pack_gdn_decode_inputs_npu_contig(
+                mixed_qkv,
+                z_raw,
+                a_raw,
+                b_raw,
+                conv_state,
+                conv_weight_t,
+                conv_bias,
+                conv_state_indices,
+                activation,
+                num_k_heads,
+                head_k_dim,
+                num_v_heads,
+                head_v_dim,
+                block_n=256,
+            )
+        return conv_pack_gdn_decode_inputs_npu(
             mixed_qkv,
             z_raw,
             a_raw,
@@ -173,10 +206,12 @@ def conv_pack_gdn_decode_inputs(
             conv_bias,
             conv_state_indices,
             activation,
+            conv_size,
             num_k_heads,
             head_k_dim,
             num_v_heads,
             head_v_dim,
+            block_n=128,
         )
 
     q = torch.empty((batch, 1, num_k_heads, head_k_dim), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
