@@ -63,10 +63,7 @@ class Qwen3NextMemManager(MemoryManager):
             self.operator = self.npu_operator_class(self)
 
     def get_full_att_cache_layer_index(self, layer_index: int) -> int:
-        if layer_index >= self.linear_config.all_layer_num:
-            # MTP draft full-attn layers are packed after the main model layers.
-            return layer_index - self.linear_config.linear_layer_num
-        return layer_index // self.linear_config.full_attention_interval
+        return self.linear_config.get_full_att_kv_layer_index(layer_index)
 
     def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:
         layer_index = self.get_full_att_cache_layer_index(layer_index)

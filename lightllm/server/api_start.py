@@ -36,6 +36,11 @@ def _set_envs_and_config(args: StartArgs):
 def _launch_subprocesses(args: StartArgs):
     _set_envs_and_config(args)
 
+    if args.mtp_mode is not None:
+        assert (
+            not args.disable_cudagraph or args.run_mode == "prefill"
+        ), "--disable_cudagraph is only supported on Prefill nodes when --mtp_mode is enabled"
+
     auto_set_max_req_total_len(args)
     auto_set_fused_shared_experts(args)
     set_unique_server_name(args)
@@ -148,21 +153,27 @@ def _launch_subprocesses(args: StartArgs):
         assert args.enable_tpsp_mix_mode and args.dp > 1, "need set --enable_tpsp_mix_mode firstly and --dp > 1"
 
     if args.enable_ep_moe:
-        allowed_ep_att_backends = {"auto", "fa3", "triton"}
+        allowed_ep_prefill_att_backends = {"auto", "fa3", "triton", "flashqla"}
         for backend in args.llm_prefill_att_backend:
-            assert backend in allowed_ep_att_backends, (
+            assert backend in allowed_ep_prefill_att_backends, (
                 "When --enable_ep_moe is enabled, --llm_prefill_att_backend must be one of "
-                f"{sorted(allowed_ep_att_backends)}; flashinfer is not supported."
+                f"{sorted(allowed_ep_prefill_att_backends)}; flashinfer is not supported."
             )
+        allowed_ep_decode_att_backends = {"auto", "fa3", "triton"}
         for backend in args.llm_decode_att_backend:
-            assert backend in allowed_ep_att_backends, (
+            assert backend in allowed_ep_decode_att_backends, (
                 "When --enable_ep_moe is enabled, --llm_decode_att_backend must be one of "
-                f"{sorted(allowed_ep_att_backends)}; flashinfer is not supported."
+                f"{sorted(allowed_ep_decode_att_backends)}; flashinfer is not supported."
             )
 
     # mtp params check
     if args.mtp_mode is not None:
         if args.mtp_draft_model_dir is None:
+            assert args.mtp_mode not in (
+                "eagle3",
+                "dspark",
+                "dflash",
+            ), f"--mtp_draft_model_dir is required for {args.mtp_mode} mode"
             args.mtp_draft_model_dir = [args.model_dir] * args.mtp_step
         assert args.mtp_step > 0
     else:
@@ -270,6 +281,12 @@ def _launch_subprocesses(args: StartArgs):
         dp_size_in_node = max(1, args.dp // args.nnodes)
         per_dp_cache_size = max(1, math.ceil(args.running_max_req_size / dp_size_in_node) * 2)
         args.linear_att_cache_size = min(default_cache_size, per_dp_cache_size)
+
+    if args.run_mode == "decode":
+        # PD Decode 节点只接收 prompt 末尾位置的 linear attention state，不具备
+        # 中间大页边界对应的 state。因此 Decode 节点必须使用默认值关闭大页功能，
+        # 避免请求释放时将不完整的大页 state 写入 radix cache 并触发断言。
+        args.linear_att_page_block_num = 10000000
 
     if args.enable_cpu_cache and is_linear_att_mixed_model(args.model_dir):
         args.cpu_cache_token_page_size = args.linear_att_hash_page_size * args.linear_att_page_block_num
@@ -396,13 +413,14 @@ def _launch_subprocesses(args: StartArgs):
         start_args=[(args,)],
     )
 
-    process_manager.start_submodule_processes(
+    router_process, _ = process_manager.start_submodule_processes(
         start_funcs=[start_router_process, start_detokenization_process],
         start_args=[
             (args,),
             (args,),
         ],
     )
+    process_manager.register_process_tree(router_process)
 
     return process_manager
 

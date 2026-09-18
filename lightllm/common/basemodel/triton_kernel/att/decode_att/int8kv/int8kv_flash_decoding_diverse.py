@@ -20,6 +20,9 @@ def token_decode_attention_flash_decoding(
     shared_streams_dict={},
 ):
     platform_backend = get_backend()
+    b_shared_seq_len = infer_state.decode_att_state.b_shared_seq_len
+    b_mark_shared_group = infer_state.decode_att_state.b_mark_shared_group
+
     if "stream1" not in shared_streams_dict:
         shared_streams_dict["stream1"] = platform_backend.runtime.create_stream()
     if "stream2" not in shared_streams_dict:
@@ -57,8 +60,8 @@ def token_decode_attention_flash_decoding(
             v_scale=cache_v_scale,
             Req_to_tokens=infer_state.req_manager.req_to_token_indexs,
             B_req_idx=infer_state.b_req_idx,
-            b_shared_seq_len=infer_state.b_shared_seq_len,
-            b_mark_shared_group=infer_state.b_mark_shared_group,
+            b_shared_seq_len=b_shared_seq_len,
+            b_mark_shared_group=b_mark_shared_group,
             max_len_in_batch=infer_state.max_kv_seq_len,
             mid_out=mid_o,
             mid_out_logsumexp=mid_o_logexpsum,
@@ -76,7 +79,7 @@ def token_decode_attention_flash_decoding(
             Req_to_tokens=infer_state.req_manager.req_to_token_indexs,
             B_req_idx=infer_state.b_req_idx,
             B_Seqlen=infer_state.b_seq_len,
-            b_shared_seq_len=infer_state.b_shared_seq_len,
+            b_shared_seq_len=b_shared_seq_len,
             max_len_in_batch=infer_state.max_kv_seq_len,
             mid_out=mid_o,
             mid_out_logsumexp=mid_o_logexpsum,
@@ -90,7 +93,7 @@ def token_decode_attention_flash_decoding(
         mid_out=mid_o,
         mid_out_logexpsum=mid_o_logexpsum,
         B_Seqlen=infer_state.b_seq_len,
-        b_shared_seq_len=infer_state.b_shared_seq_len,
+        b_shared_seq_len=b_shared_seq_len,
         O=o_tensor.view(calcu_shape1),
         block_seq=BLOCK_SEQ,
     )

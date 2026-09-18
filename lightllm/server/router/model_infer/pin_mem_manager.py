@@ -1,8 +1,18 @@
 import torch
 import threading
 import collections
-from typing import List, Dict, Union, Sequence
-from lightllm.utils.device_utils import get_target_device
+from dataclasses import dataclass
+from typing import List, Dict, Union, Sequence, Any
+from lightllm.platform import get_backend
+
+
+@dataclass
+class AsyncPinnedCpuTensor:
+    tensor: torch.Tensor
+    ready_event: Any
+
+    def wait(self) -> None:
+        self.ready_event.synchronize()
 
 
 class PinMemTensorManager:
@@ -13,7 +23,7 @@ class PinMemTensorManager:
         self.buffer_size = 4
         # 常量 tensor 缓存：逻辑 key -> 已 fill 的 buffer
         self.key_to_const_cpu_tensor: Dict[str, torch.Tensor] = {}
-        self.key_to_const_gpu_tensor: Dict[str, torch.Tensor] = {}
+        self.key_to_const_gpu_tensor: Dict[tuple, torch.Tensor] = {}
 
     def alloc_pin_tensor(self, key: str, size: int, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -49,6 +59,16 @@ class PinMemTensorManager:
         pin_mem = self.alloc_pin_tensor(key, size=size, dtype=gpu_tensor.dtype)
         pin_mem.copy_(gpu_tensor.view(-1), non_blocking=True)
         return pin_mem.view(gpu_tensor.shape)
+
+    def async_copy_from_gpu_tensor_with_event(
+        self,
+        key: str,
+        gpu_tensor: torch.Tensor,
+    ) -> AsyncPinnedCpuTensor:
+        cpu_tensor = self.async_copy_from_gpu_tensor(key=key, gpu_tensor=gpu_tensor)
+        ready_event = get_backend().runtime.create_event()
+        ready_event.record()
+        return AsyncPinnedCpuTensor(tensor=cpu_tensor, ready_event=ready_event)
 
     def get_const_cpu_tensor(
         self,
@@ -86,18 +106,20 @@ class PinMemTensorManager:
         """返回指定 ``shape`` 的 GPU 常量 tensor 切片（按需扩容）。
 
         与 ``get_const_cpu_tensor`` 对称：热路径上需要 GPU 侧占位常量、又不想每 step
-        ``torch.full`` 时使用。设备取当前 CUDA device。
+        ``torch.full`` 时使用。设备取当前平台 runtime 的 device。
         """
         size = 1
         for dim in shape:
             size *= int(dim)
 
+        device = get_backend().runtime.target_device()
+        cache_key = (key, device, dtype, fill_value)
         with self.lock:
-            buf = self.key_to_const_gpu_tensor.get(key)
+            buf = self.key_to_const_gpu_tensor.get(cache_key)
             if buf is None or buf.numel() < size:
                 n = max(size, 2048)
-                buf = torch.full((n,), fill_value, dtype=dtype, device=get_target_device())
-                self.key_to_const_gpu_tensor[key] = buf
+                buf = torch.full((n,), fill_value, dtype=dtype, device=device)
+                self.key_to_const_gpu_tensor[cache_key] = buf
             else:
                 assert buf.dtype == dtype, f"const gpu tensor key={key!r} dtype mismatch: {buf.dtype} vs {dtype}"
             return buf[:size].view(tuple(int(d) for d in shape))

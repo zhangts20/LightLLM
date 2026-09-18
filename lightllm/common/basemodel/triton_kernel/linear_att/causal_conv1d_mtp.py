@@ -5,8 +5,8 @@
 #   - imports point at standard triton instead of vLLM's triton-lite.
 #   - vLLM block-table params (block_idx_last_scheduled_token, initial_state_idx,
 #     null_block_id) are dropped; LightLLM uses contiguous per-request slots.
-#   - IS_VARLEN / IS_SPEC_DECODING / non-spec paths removed; this kernel now
-#     exclusively serves the spec-decode varlen path (with num_accepted_tokens,
+#   - Upstream non-MTP paths were removed; this kernel now exclusively serves
+#     the MTP decode varlen path (with num_accepted_tokens,
 #     query_start_loc and mtp_step all required).
 #   - One widened conv_state slot per request holds K-1+mtp_step positions.
 #     The read offset is num_accepted_tokens-1; writes go back to the same slot.
@@ -271,7 +271,8 @@ def _causal_conv1d_update_kernel(
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-            acc += matrix_x * matrix_w  # [BLOCK_N]
+            # Avoid BF16 product rounding before the FP32 accumulator.
+            acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)  # [BLOCK_N]
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
@@ -314,7 +315,7 @@ def causal_conv1d_update(
     query_start_loc: Optional[torch.Tensor] = None,
     pad_slot_id: int = -1,
 ):
-    """Spec-decode causal depthwise conv1d update.
+    """MTP decode causal depthwise conv1d update.
 
     Processes ``mtp_step + 1`` tokens per request in varlen layout.
     Uses a single widened conv_state slot per request that holds
@@ -329,7 +330,7 @@ def causal_conv1d_update(
         conv_state: ``(num_slots, dim, state_len)`` float with
             ``state_len == width - 1 + mtp_step``.
         weight: depthwise filter of shape ``(dim, width)``.
-        mtp_step: number of speculative (draft) tokens per request
+        mtp_step: number of extra MTP tokens per request
             (``seqlen == mtp_step + 1``).
         bias: optional ``(dim,)`` float bias.
         activation: ``None``, ``"silu"`` or ``"swish"``.

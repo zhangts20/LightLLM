@@ -69,7 +69,6 @@ class _NPUW8A8WeightGroup:
 
 
 @QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="cuda")
-@QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="maca")
 class w8a8QuantizationMethod(BaseQuantizationMethod):
     def __init__(self):
         super().__init__()
@@ -106,8 +105,12 @@ class w8a8QuantizationMethod(BaseQuantizationMethod):
                 out = self.cache_manager.alloc_tensor((m, n), input_tensor.dtype, device=input_tensor.device)
             else:
                 out = torch.empty((m, n), dtype=input_tensor.dtype, device=input_tensor.device)
-        cutlass_scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias)
+        self._scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias)
         return out
+
+    @staticmethod
+    def _scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias):
+        cutlass_scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias)
 
     @property
     def method_name(self):
@@ -129,6 +132,27 @@ class w8a8QuantizationMethod(BaseQuantizationMethod):
             weight_scale_split_dim=-1,
         )
         return mm_param, mm_param_list
+
+
+@QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="maca")
+class w8a8MacaQuantizationMethod(w8a8QuantizationMethod):
+    @staticmethod
+    def _scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias):
+        # MetaX cutlass INT8 GEMM can leave output tiles unwritten when M has
+        # both complete 256-row tiles and a partial tail (e.g. M=293, N=5120,
+        # K=6144). Run the full tiles and tail separately; neither call needs
+        # padding or extra output storage. Per-token scales follow the rows.
+        rows = x_q.shape[0]
+        full_rows = rows // 256 * 256
+        if full_rows and full_rows != rows:
+            cutlass_scaled_mm(
+                out[:full_rows], x_q[:full_rows], qweight, x_scale[:full_rows], weight_scale, bias
+            )
+            cutlass_scaled_mm(
+                out[full_rows:], x_q[full_rows:], qweight, x_scale[full_rows:], weight_scale, bias
+            )
+        else:
+            cutlass_scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias)
 
 
 @QUANTMETHODS.register(["w8a8", "w8a8-ascend"], platform="ascend")

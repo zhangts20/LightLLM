@@ -57,6 +57,20 @@ class LinearAttCacheConfig:
         except Exception:
             return False
 
+    def get_full_att_kv_layer_index(self, layer_index: int) -> int:
+        """Map a global target/draft layer index to the packed full-attention cache."""
+
+        layer_index = int(layer_index)
+        if layer_index >= self.all_layer_num:
+            kv_layer_index = layer_index - self.linear_layer_num
+        else:
+            kv_layer_index = layer_index // self.full_attention_interval
+        assert 0 <= kv_layer_index < self.get_full_att_kv_layer_num_with_draft_model(), (
+            f"layer {layer_index} maps outside the packed full-attention KV cache: "
+            f"slot={kv_layer_index}, slots={self.get_full_att_kv_layer_num_with_draft_model()}"
+        )
+        return kv_layer_index
+
     def get_conv_state_shape(self):
         # Base committed sliding-window state, without speculative MTP tail.
         dim = self.get_conv_dim()

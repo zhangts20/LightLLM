@@ -2,9 +2,10 @@ import dataclasses
 import torch
 from lightllm.utils.envs_utils import get_env_start_args
 from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, AttControl
-from typing import Optional, Tuple
+from typing import Tuple
 from lightllm.utils.envs_utils import enable_diverse_mode_gqa_decode_fast_kernel
 from lightllm.platform.base.attention import register_att_backend
+from lightllm.common.basemodel.triton_kernel.diverse_utils import build_diverse_shared_group_markers
 
 
 @register_att_backend(name="triton", category="standard", kv_types=("int8kv",), platforms=("cuda",))
@@ -117,8 +118,20 @@ class Int8kvTritonPrefillAttState(BasePrefillAttState):
 
 @dataclasses.dataclass
 class Int8kvTritonDecodeAttState(BaseDecodeAttState):
+    b_shared_seq_len: torch.Tensor = None
+    b_mark_shared_group: torch.Tensor = None
+
     def init_state(self):
-        pass
+        if enable_diverse_mode_gqa_decode_fast_kernel():
+            self.b_mark_shared_group = build_diverse_shared_group_markers(
+                b_shared_radix_node_id=self.infer_state.b_shared_radix_node_id,
+            )
+            # A one-row group has no cross-request prefix sharing to accelerate.
+            self.b_shared_seq_len = torch.where(
+                self.b_mark_shared_group == 1,
+                0,
+                self.infer_state.b_shared_seq_len,
+            )
 
     def copy_for_decode_cuda_graph(self, new_state: "Int8kvTritonDecodeAttState"):
         super().copy_for_decode_cuda_graph(new_state)

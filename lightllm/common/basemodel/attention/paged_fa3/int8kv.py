@@ -98,6 +98,9 @@ class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
     max_prefix_len: int = 0
 
     def init_state(self) -> None:
+        # ModelInput now carries total KV rows and current query rows.
+        # Their difference is the cached prefix count, without a device read.
+        self.prefix_total_token_num = self.infer_state.total_token_num - self.infer_state.input_ids.shape[0]
         self.request_slices = None
         self.use_paged_int8 = False
         self.selected_dequant_chunk_tokens = 0
@@ -138,7 +141,7 @@ class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
 
         self.dequant_reserve_bytes = reserve_mib * 2**20
         if (
-            self.infer_state.prefix_total_token_num != 0
+            self.prefix_total_token_num != 0
             and self.infer_state.max_q_seq_len == 1
         ):
             PagedFa3PrefillAttState.init_state(self)
@@ -149,7 +152,7 @@ class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
             self.infer_state.input_ids.device
         )
 
-        if self.infer_state.prefix_total_token_num == 0:
+        if self.prefix_total_token_num == 0:
             return
 
         if self.prefill_impl == "triton":
@@ -350,7 +353,7 @@ class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
             fresh_k, k_cache, k_scale_cache = k
             fresh_v, v_cache, v_scale_cache = v
             if (
-                self.infer_state.prefix_total_token_num != 0
+                self.prefix_total_token_num != 0
                 and self.prefill_impl == "triton"
             ):
                 from lightllm.common.basemodel.triton_kernel.att.prefill_att.context_flashattention_int8kv import (
@@ -586,6 +589,9 @@ class PagedFa3Int8KVAscendDecodeAttState(PagedFa3DecodeAttState):
 )
 class PagedFa3Int8KVMacaAttBackend(PagedFa3AttBackend):
 
+    # Group fixed native-MTP verify rows to reuse their common INT8 KV prefix.
+    supports_grouped_eagle_extend = True
+
     def __init__(self, model, page_size=None):
         super().__init__(model=model, page_size=page_size)
         self.quant_group_size = get_env_start_args().llm_kv_quant_group_size
@@ -620,6 +626,7 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
 
     def init_state(self) -> None:
         infer = self.infer_state
+        self.prefix_total_token_num = infer.total_token_num - infer.input_ids.shape[0]
         self.cu_seqlens_q = infer.b1_cu_q_seq_len.int()
         # Fresh / packed K is aligned to Q lengths; prefix KV is gathered separately.
         self.cu_seqlens_k = None
@@ -647,7 +654,7 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
         self.force_chunked_prefix = os.getenv(
             "LIGHTLLM_MACA_INT8KV_PREFIX_ONESHOT", "1"
         ) == "0"
-        if infer.prefix_total_token_num == 0:
+        if self.prefix_total_token_num == 0:
             return
 
         q_cu = infer.b1_cu_q_seq_len.detach().to("cpu", non_blocking=True)
@@ -690,7 +697,7 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
         fresh_v, v_cache, v_scale = v
         sm_scale = 1.0 / (q.shape[-1] ** 0.5)
 
-        if self.infer_state.prefix_total_token_num == 0:
+        if self.prefix_total_token_num == 0:
             return maca_flash_attn_varlen_func(
                 q=q,
                 k=fresh_k,
@@ -736,7 +743,7 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
         n_q, head_dim = q.shape[-2:]
         n_kv = k_cache.shape[-2]
         group_size = self.backend.quant_group_size
-        total_kv_tokens = int(self.infer_state.prefix_total_token_num) + int(q.shape[0])
+        total_kv_tokens = int(self.prefix_total_token_num) + int(q.shape[0])
         oneshot_bytes = total_kv_tokens * n_kv * head_dim * q.element_size() * 2
         if (
             not self.force_chunked_prefix
@@ -832,7 +839,7 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
         n_kv, head_dim = k_cache.shape[-2], q.shape[-1]
         group_size = self.backend.quant_group_size
         req_to_token = self.infer_state.req_manager.req_to_token_indexs
-        total_kv = int(self.infer_state.prefix_total_token_num) + int(q.shape[0])
+        total_kv = int(self.prefix_total_token_num) + int(q.shape[0])
         k_pack = alloc_func((total_kv, n_kv, head_dim), dtype=q.dtype, device=q.device)
         v_pack = alloc_func((total_kv, n_kv, head_dim), dtype=q.dtype, device=q.device)
         cu_k = [0]
@@ -1049,6 +1056,8 @@ class PagedFa3Int8KVMacaPrefillAttState(PagedFa3PrefillAttState):
 
 class PagedFa3Int8KVMacaDecodeAttState(PagedFa3DecodeAttState):
 
+    supports_noncausal_block = True
+
     def _normal_decode_att(
         self,
         q: torch.Tensor,
@@ -1072,16 +1081,24 @@ class PagedFa3Int8KVMacaDecodeAttState(PagedFa3DecodeAttState):
         page_size = self.backend.page_size
         group_size = self.backend.quant_group_size
 
-        att_batch_size = self.page_table.shape[0]
+        att_batch_size = self.page_table.shape[0] if self.causal else self.b_block_req_idx.shape[0]
         expected_tokens = att_batch_size * self.decode_max_q_seq_len
-        if q.shape[0] != expected_tokens:
+        if q.shape[0] > expected_tokens or (q.shape[0] != expected_tokens and not self.has_partial_block):
             raise ValueError(
                 "Unexpected MetaX INT8 KV decode query shape: "
                 f"q tokens={q.shape[0]}, batch={att_batch_size}, "
                 f"q_len={self.decode_max_q_seq_len}"
             )
 
-        q_bshd = q.view(att_batch_size, self.decode_max_q_seq_len, q.shape[1], q.shape[2])
+        if q.shape[0] < expected_tokens:
+            # Only the final graph HOLD group may be partial. Pad unused rows;
+            # real request blocks retain the same fixed-width layout.
+            padded_q = alloc_func((expected_tokens, *q.shape[1:]), dtype=q.dtype, device=q.device)
+            padded_q.zero_()
+            padded_q[:q.shape[0]].copy_(q)
+        else:
+            padded_q = q
+        q_bshd = padded_q.view(att_batch_size, self.decode_max_q_seq_len, q.shape[1], q.shape[2])
         from lightllm.common.basemodel.triton_kernel.att.decode_att.int8kv.maca_int8kv_flash_decoding import (
             int8kv_flash_decode,
         )
@@ -1093,13 +1110,14 @@ class PagedFa3Int8KVMacaDecodeAttState(PagedFa3DecodeAttState):
             v=v_cache,
             v_scale=v_scale,
             cache_seqlens=self.b_att_seq_len,
-            page_table=self.page_table,
+            page_table=(self.page_table if self.causal else self.backend.model.req_manager.req_to_token_indexs),
+            token_req_indices=None if self.causal else self.b_block_req_idx,
             page_size=page_size,
             sm_scale=1.0 / (head_dim ** 0.5),
-            causal=True,
+            causal=self.causal,
             sliding_window=window_size,
             quant_group_size=group_size,
-            max_kv_len=int(self.infer_state.max_kv_seq_len),
+            max_kv_len=int(self.infer_state.max_kv_seq_len if self.causal else self.block_max_kv_len),
             alloc_func=alloc_func,
         )
-        return output.view_as(q)
+        return output.reshape(-1, q.shape[1], q.shape[2])[:q.shape[0]]

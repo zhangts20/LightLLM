@@ -50,6 +50,7 @@ def _fwd_int8kv_decode_stage1(
     V,
     V_scale,
     Page_table,
+    Token_req_indices,
     B_seqlen,
     Mid_O,
     Mid_LSE,
@@ -90,6 +91,7 @@ def _fwd_int8kv_decode_stage1(
     NUM_GROUPS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     CAUSAL: tl.constexpr,
+    USE_TOKEN_TABLE: tl.constexpr,
     USE_SLIDING_WINDOW: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -97,6 +99,7 @@ def _fwd_int8kv_decode_stage1(
     split_id = tl.program_id(2)
     n_splits = tl.num_programs(2)
 
+    table_row = tl.load(Token_req_indices + cur_batch) if USE_TOKEN_TABLE else cur_batch
     kv_len = tl.load(B_seqlen + cur_batch)
     n_kv_blocks = tl.cdiv(kv_len, PAGE_SIZE)
     if split_id >= n_kv_blocks:
@@ -136,12 +139,19 @@ def _fwd_int8kv_decode_stage1(
         block_end = tl.minimum(kv_len, block_start + PAGE_SIZE)
         n_tiles = tl.cdiv(block_end - block_start, BLOCK_N)
         offs_n0 = block_start + tl.arange(0, BLOCK_N)
-        block_id = tl.load(Page_table + cur_batch * stride_pt_b + kv_block * stride_pt_p).to(tl.int64)
-        page_base = block_id * PAGE_SIZE
+        if not USE_TOKEN_TABLE:
+            block_id = tl.load(Page_table + cur_batch * stride_pt_b + kv_block * stride_pt_p).to(tl.int64)
+            page_base = block_id * PAGE_SIZE
         for tile in range(0, n_tiles):
             offs_n = offs_n0 + tile * BLOCK_N
             n_mask = offs_n < block_end
-            kv_loc = page_base + (offs_n - block_start)
+            if USE_TOKEN_TABLE:
+                # Block-draft scratch may break physical page alignment.
+                # Read exact token slots without expanding the INT8 KV cache.
+                kv_loc = tl.load(Page_table + table_row * stride_pt_b + offs_n * stride_pt_p,
+                                 mask=n_mask, other=0).to(tl.int64)
+            else:
+                kv_loc = page_base + (offs_n - block_start)
 
             k_i8 = tl.load(
                 K + kv_loc[None, :] * stride_k_t + cur_kv_head * stride_k_h + offs_d[:, None] * stride_k_d,
@@ -271,6 +281,7 @@ def int8kv_flash_decode(
     *,
     page_table: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
+    token_req_indices: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
     causal: bool = True,
     sliding_window: tuple[int, int] = (-1, -1),
@@ -280,6 +291,12 @@ def int8kv_flash_decode(
     alloc_func=torch.empty,
     run_config: Optional[dict] = None,
 ) -> torch.Tensor:
+    """Decode paged INT8 KV, optionally using exact request-to-token slots.
+
+    With token_req_indices, page_table is the full request-to-token mapping;
+    each batch row selects its request ID. page_size still partitions compute,
+    but no physical-contiguity assumption is made for the cached token slots.
+    """
     if q.dim() != 4:
         raise ValueError(f"q must be (B, Q_LEN, H_Q, D), got {tuple(q.shape)}")
     if page_table is None or page_size is None or page_size <= 0:
@@ -336,6 +353,7 @@ def int8kv_flash_decode(
         v,
         v_scale,
         page_table,
+        token_req_indices if token_req_indices is not None else cache_seqlens,
         cache_seqlens,
         mid_o,
         mid_lse,
@@ -376,6 +394,7 @@ def int8kv_flash_decode(
         NUM_GROUPS=num_groups,
         PAGE_SIZE=page_size,
         CAUSAL=use_causal,
+        USE_TOKEN_TABLE=token_req_indices is not None,
         USE_SLIDING_WINDOW=use_swa,
         num_warps=int(cfg["num_warps"]),
         num_stages=int(cfg["num_stages"]),
