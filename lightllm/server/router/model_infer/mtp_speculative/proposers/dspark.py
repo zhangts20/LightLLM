@@ -6,6 +6,7 @@ import torch
 
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
 from lightllm.server.router.model_infer.mtp_speculative import utils as mtp_utils
+from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
 from lightllm.server.router.model_infer.mtp_speculative.proposers.base import (
     BaseSpecProposer,
@@ -93,11 +94,20 @@ class DSparkProposer(BaseSpecProposer):
 
         # DSpark 每个请求固定展开一个完整 block，临时 KV 在 target verify 完成
         # 后通过 proposal 统一释放。block 第一行是 accepted-tail anchor，其余行
-        # 使用 mask token，由 parallel backbone 一次并行计算。
+        # 使用 mask token。Ascend 把 scratch 接到 accepted-tail 逻辑页后面；
+        # CUDA/MetaX 仍整段新开页。
         extra_allocations = []
-        extra_mem_indexes_cpu = mtp_utils.alloc_mem_indexes(
-            req_num * block_size, allocations=extra_allocations
-        )
+        if getattr(get_env_start_args(), "hardware_platform", "cuda") == "ascend":
+            extra_mem_indexes_cpu = mtp_utils.alloc_block_mem_indexes(
+                target_model_input.b_seq_len.index_select(0, accepted_tail_rows),
+                target_model_input.mem_indexes.index_select(0, accepted_tail_rows),
+                block_size,
+                allocations=extra_allocations,
+            )
+        else:
+            extra_mem_indexes_cpu = mtp_utils.alloc_mem_indexes(
+                req_num * block_size, allocations=extra_allocations
+            )
         block_input_ids = target_next_token_ids.new_full(
             (req_num * block_size,),
             fill_value=draft_model.mask_token_id,

@@ -1,5 +1,4 @@
 import dataclasses
-from typing import Any
 
 import torch
 import triton
@@ -11,7 +10,6 @@ from lightllm.utils.envs_utils import get_env_start_args, get_page_size
 from lightllm.common.basemodel.triton_kernel.fa3_utils import page_table_copy
 from lightllm.common.basemodel.triton_kernel.gen_prefill_params import gen_cumsum_pad0_tensor
 from lightllm.platform.base.attention import register_att_backend
-from .graph_utils import weak_ref_tensor
 
 try:
     from flash_attn import flash_attn_varlen_func as maca_flash_attn_varlen_func
@@ -47,7 +45,8 @@ def _gather_block_kv_kernel(
     tl.store(OUT_V + output_offset, vval, mask=valid)
 
 
-@register_att_backend(name="paged_fa3", category="standard", platforms=("ascend", "cuda", "maca",), validate_name="fa3")
+# Ascend FIA lives in fp_npu.py (PagedFa3AscendAttBackend).
+@register_att_backend(name="paged_fa3", category="standard", platforms=("cuda", "maca"), validate_name="fa3")
 class PagedFa3AttBackend(BaseAttBackend):
 
     def __init__(self, model, page_size=None):
@@ -80,22 +79,6 @@ class PagedFa3AttBackend(BaseAttBackend):
             ]
         return self._shared_page_table_buffer
 
-    def get_causal_attn_mask(self, device):
-        if not hasattr(self, "_causal_attn_mask"):
-            self._causal_attn_mask = torch.triu(
-                torch.ones((2048, 2048), dtype=torch.int8, device=device), diagonal=1
-            )
-        return self._causal_attn_mask
-
-    def get_decode_seq_len_cpu_buffers(self, min_len: int):
-        """Pinned CPU int32 buffers reused for npu_fused_infer_attention_score list args."""
-        model = self.model
-        cap = max(min_len, model.graph_max_batch_size)
-        if not hasattr(self, "_decode_seq_len_cpu_q") or self._decode_seq_len_cpu_q.shape[0] < min_len:
-            self._decode_seq_len_cpu_q = torch.empty(cap, dtype=torch.int32, pin_memory=True)
-            self._decode_seq_len_cpu_kv = torch.empty(cap, dtype=torch.int32, pin_memory=True)
-        return self._decode_seq_len_cpu_q, self._decode_seq_len_cpu_kv
-
     def create_att_prefill_state(self, infer_state):
         return PagedFa3PrefillAttState(backend=self, infer_state=infer_state)
 
@@ -125,7 +108,6 @@ class PagedFa3PrefillAttState(BasePrefillAttState):
             b_req_idx=self.infer_state.b_req_idx,
             page_size=self.backend.page_size,
         )
-        self.atten_mask = self.backend.get_causal_attn_mask(self.infer_state.input_ids.device)
 
     def prefill_att(self, q, k, v, att_control: AttControl = AttControl(), alloc_func=torch.empty):
         assert att_control.use_alibi is False
@@ -163,48 +145,24 @@ class PagedFa3PrefillAttState(BasePrefillAttState):
                 window_size=window_size,
                 softcap=0.0,
             )
-        elif q.device.type == "npu":
-            import torch_npu
-
-            N_Q, HEAD_DIM = q.shape[-2:]
-            N_KV = k.shape[-2]
-            key = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
-            value = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
-            return torch_npu.npu_fused_infer_attention_score(
-                query=q,
-                key=key,
-                value=value,
-                input_layout="TND",
-                sparse_mode=3,
-                atten_mask=self.atten_mask,
-                scale=sm_scale,
-                next_tokens=0,
-                actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
-                actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
-                num_heads=N_Q,
-                num_key_value_heads=N_KV,
-                block_table=self.page_table,
-                block_size=self.backend.page_size,
-            )[0]
-        else:
-            return flash_attn_with_kvcache(
-                q=q,
-                k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
-                v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
-                page_table=self.page_table,
-                cache_seqlens=self.infer_state.b_seq_len,
-                cu_seqlens_q=self.cu_seqlens_q,
-                cu_seqlens_k_new=self.cu_seqlens_k,
-                max_seqlen_q=self.infer_state.max_q_seq_len,
-                softmax_scale=sm_scale,
-                causal=True,
-                window_size=window_size,
-                softcap=0.0,
-                k_descale=None,
-                v_descale=None,
-                return_softmax_lse=False,
-                sinks=sink_weight,
-            )
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
+            v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
+            page_table=self.page_table,
+            cache_seqlens=self.infer_state.b_seq_len,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_k_new=self.cu_seqlens_k,
+            max_seqlen_q=self.infer_state.max_q_seq_len,
+            softmax_scale=sm_scale,
+            causal=True,
+            window_size=window_size,
+            softcap=0.0,
+            k_descale=None,
+            v_descale=None,
+            return_softmax_lse=False,
+            sinks=sink_weight,
+        )
 
 
 @dataclasses.dataclass
@@ -221,7 +179,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
     b_block_req_idx: torch.Tensor = None
     block_max_kv_len: int = None
 
-    def init_state(self):
+    def _init_decode_layout(self):
         args = get_env_start_args()
         model = self.backend.model
         is_block_mode = args.mtp_mode in ("dspark", "dflash")
@@ -239,26 +197,15 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                     "paged_fa3 block verification requires mtp_dynamic_verify=False"
                 )
             self.causal = self.backend.uses_causal_attention()
-            if not self.causal and (
-                self.infer_state.input_ids.device.type == "npu"
-                or (type(self)._normal_decode_att is not PagedFa3DecodeAttState._normal_decode_att
-                    and not getattr(self, "supports_noncausal_block", False))
-            ):
-                # Require an explicit noncausal implementation in specialized
-                # backends; Ascend per-row BNSD remains causal-only.
-                raise NotImplementedError(
-                    "paged_fa3 noncausal block decode requires a supported CUDA or MACA backend"
-                )
 
         mtp_size = args_mtp_step + 1
         rows = self.infer_state.batch_size
         self.has_partial_block = rows % mtp_size != 0
         if not is_block_mode:
             assert not self.has_partial_block
-        # Fixed-layout graph/TPSP padding appends HOLD rows. A final partial
-        # group belongs only to that padding, never to a real request. Keep
-        # its true query length so capture need not round graph_max_batch_size.
         att_batch_size = triton.cdiv(rows, mtp_size)
+        last_rows = None
+        b_kv_seq_len = None
         if args_mtp_step > 0:
             b_q_seq_len = torch.full(
                 (att_batch_size,), mtp_size, dtype=torch.int32,
@@ -274,24 +221,11 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
         else:
             self.cu_seqlens_q = self.infer_state.b1_cu_q_seq_len.int()
             self.cu_seqlens_k = self.infer_state.b1_cu_kv_seq_len.int()
+        return args_mtp_step, mtp_size, rows, att_batch_size, last_rows, b_kv_seq_len
 
-        self.use_mtp_bnsd = args_mtp_step > 0 and self.infer_state.input_ids.device.type == "npu"
-        page_table_batch_size = rows if self.use_mtp_bnsd else att_batch_size
+    def _init_page_table_state(self, args_mtp_step, att_batch_size, rows, last_rows, b_kv_seq_len):
         model = self.backend.model
-        if not self.causal:
-            # Scratch slots may start in the middle of a logical page while
-            # physically starting a new page. Do not divide their token IDs by
-            # page_size: preserve the exact prefix + scratch mapping.
-            self.b_block_req_idx = (
-                self.infer_state.b_req_idx.index_select(0, last_rows)
-                if args_mtp_step > 0 else self.infer_state.b_req_idx
-            )
-            self.b_att_seq_len = b_kv_seq_len.contiguous() if args_mtp_step > 0 else self.infer_state.b_seq_len
-            self.decode_max_q_seq_len = mtp_size
-            self.block_max_kv_len = self.infer_state.max_kv_seq_len
-            if rows <= model.graph_max_batch_size and self.block_max_kv_len <= model.graph_max_len_in_batch:
-                self.block_max_kv_len = model.graph_max_len_in_batch
-            return
+        page_table_batch_size = rows if self.use_mtp_bnsd else att_batch_size
         table_len = triton.cdiv(self.infer_state.max_kv_seq_len, self.backend.page_size)
         if (
             self.infer_state.batch_size <= model.graph_max_batch_size
@@ -308,7 +242,6 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 dtype=torch.int32,
                 device=self.infer_state.input_ids.device,
             )
-
         if args_mtp_step > 0:
             page_table_req_idx = (
                 self.infer_state.b_req_idx
@@ -333,17 +266,37 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             self.b_att_seq_len = self.infer_state.b_seq_len
             self.decode_max_q_seq_len = 1
 
+    def _init_noncausal_block_state(self, args_mtp_step, mtp_size, rows, last_rows, b_kv_seq_len):
+        self.b_block_req_idx = (
+            self.infer_state.b_req_idx.index_select(0, last_rows)
+            if args_mtp_step > 0 else self.infer_state.b_req_idx
+        )
+        self.b_att_seq_len = b_kv_seq_len.contiguous() if args_mtp_step > 0 else self.infer_state.b_seq_len
+        self.decode_max_q_seq_len = mtp_size
+        self.block_max_kv_len = self.infer_state.max_kv_seq_len
+        # CUDA/MetaX capture a static token table / packed gather of graph_max_len.
+        model = self.backend.model
+        if rows <= model.graph_max_batch_size and self.block_max_kv_len <= model.graph_max_len_in_batch:
+            self.block_max_kv_len = model.graph_max_len_in_batch
+
+    def init_state(self):
+        args_mtp_step, mtp_size, rows, att_batch_size, last_rows, b_kv_seq_len = self._init_decode_layout()
+        if not self.causal and (
+            type(self)._normal_decode_att is not PagedFa3DecodeAttState._normal_decode_att
+            and not getattr(self, "supports_noncausal_block", False)
+        ):
+            raise NotImplementedError(
+                "paged_fa3 noncausal block decode requires a supported CUDA or MACA backend"
+            )
+        self.use_mtp_bnsd = False
+        if not self.causal:
+            self._init_noncausal_block_state(args_mtp_step, mtp_size, rows, last_rows, b_kv_seq_len)
+            return
+        self._init_page_table_state(args_mtp_step, att_batch_size, rows, last_rows, b_kv_seq_len)
+
     def decode_att(self, q, k, v, att_control: AttControl = AttControl(), alloc_func=torch.empty):
         assert att_control.use_alibi is False
         return self._normal_decode_att(q=q, k=k, v=v, att_control=att_control, alloc_func=alloc_func)
-
-    def _prepare_npu_kv_cache(
-        self, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, int, dict[str, Any]]:
-        N_KV, HEAD_DIM = k.shape[-2:]
-        k = k.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
-        v = v.view(-1, self.backend.page_size, N_KV * HEAD_DIM)
-        return k, v, N_KV, {}
 
     def _block_decode_att(self, q, k, v, window_size, sink_weight, alloc_func):
         req_to_token = self.backend.model.req_manager.req_to_token_indexs
@@ -397,7 +350,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
 
         if not self.causal:
             if q.shape[0] != self.infer_state.batch_size:
-                raise ValueError("Unexpected MetaX decode query shape for noncausal block")
+                raise ValueError("Unexpected GPU decode query shape for noncausal block")
             return self._block_decode_att(q, k, v, window_size, sink_weight, alloc_func)
 
         sm_scale = 1.0 / (q.shape[-1] ** 0.5)
@@ -448,157 +401,21 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 softcap=0.0,
             )
             return output.view_as(q)
-        elif q.device.type == "npu":
-            import torch_npu
-
-            N_Q = q.shape[-2]
-            k, v, N_KV, kv_cache_args = self._prepare_npu_kv_cache(k, v)
-
-            if self.decode_max_q_seq_len == 1 or self.use_mtp_bnsd:
-                input_layout = "BNSD"
-                sparse_mode = 0
-                atten_mask = None
-                # unsqueeze(2) on [B, H, D] yields non-contiguous [B, H, 1, D].
-                # FIA graph_task_update then inserts AsStrided/aclnnContiguous
-                # and CANN 8.5.1 fails with 207019.
-                q = q.unsqueeze(2).contiguous()
-            else:
-                input_layout = "TND"
-                sparse_mode = 3
-                atten_mask = self.backend.get_causal_attn_mask(q.device)
-                if not q.is_contiguous():
-                    q = q.contiguous()
-            if not k.is_contiguous():
-                k = k.contiguous()
-            if not v.is_contiguous():
-                v = v.contiguous()
-            page_table = self.page_table
-            if page_table is not None and not page_table.is_contiguous():
-                page_table = page_table.contiguous()
-                self.page_table = page_table
-            kv_cache_args = {
-                name: val.contiguous() if isinstance(val, torch.Tensor) and not val.is_contiguous() else val
-                for name, val in kv_cache_args.items()
-            }
-
-            output = torch.empty_like(q)
-            softmax_lse = torch.empty(1, dtype=torch.float16, device=q.device)
-            if torch.npu.is_current_stream_capturing():
-                stream = torch.npu.current_stream()
-
-                from lightllm.common.basemodel.graph.acl_graph import get_attn_params
-
-                batch_size = self.infer_state.batch_size
-                attn_params = get_attn_params()
-
-                event = torch.npu.ExternalEvent()
-                event.wait(stream)
-                event.reset(stream)
-
-                workspace = attn_params.workspaces.get(batch_size, None)
-                if workspace is None:
-                    workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                        query=q,
-                        key=k,
-                        value=v,
-                        atten_mask=atten_mask,
-                        input_layout=input_layout,
-                        sparse_mode=sparse_mode,
-                        next_tokens=0,
-                        scale=sm_scale,
-                        actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
-                        actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
-                        num_heads=N_Q,
-                        num_key_value_heads=N_KV,
-                        block_table=self.page_table,
-                        block_size=self.backend.page_size,
-                        **kv_cache_args,
-                    )
-                    attn_params.workspaces[batch_size] = workspace
-
-                torch.npu.graph_task_group_begin(stream)
-                torch_npu.npu_fused_infer_attention_score.out(
-                    query=q,
-                    key=k,
-                    value=v,
-                    atten_mask=atten_mask,
-                    input_layout=input_layout,
-                    sparse_mode=sparse_mode,
-                    next_tokens=0,
-                    scale=sm_scale,
-                    actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
-                    actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
-                    num_heads=N_Q,
-                    num_key_value_heads=N_KV,
-                    block_table=page_table,
-                    block_size=self.backend.page_size,
-                    workspace=workspace,
-                    out=[output, softmax_lse],
-                    **kv_cache_args,
-                )
-                handle = torch.npu.graph_task_group_end(stream)
-
-                from lightllm.common.basemodel.graph.acl_graph import add_attn_params
-
-                add_attn_params(
-                    batch_size=self.infer_state.batch_size,
-                    event=event,
-                    handle=handle,
-                    attn_params=(
-                        weak_ref_tensor(q),
-                        weak_ref_tensor(k),
-                        weak_ref_tensor(v),
-                        sm_scale,
-                        N_Q,
-                        N_KV,
-                        weak_ref_tensor(page_table),
-                        self.backend.page_size,
-                        weak_ref_tensor(output),
-                        weak_ref_tensor(softmax_lse),
-                        weak_ref_tensor(atten_mask),
-                        input_layout,
-                        sparse_mode,
-                        {name: weak_ref_tensor(value) for name, value in kv_cache_args.items()},
-                    ),
-                    microbatch_index=self.infer_state.microbatch_index,
-                )
-            else:
-                torch_npu.npu_fused_infer_attention_score.out(
-                    query=q,
-                    key=k,
-                    value=v,
-                    atten_mask=atten_mask,
-                    input_layout=input_layout,
-                    sparse_mode=sparse_mode,
-                    next_tokens=0,
-                    scale=sm_scale,
-                    actual_seq_lengths=self.infer_state.b1_cu_q_seq_len_cpu,
-                    actual_seq_lengths_kv=self.infer_state.b_cu_kv_seq_len_cpu,
-                    num_heads=N_Q,
-                    num_key_value_heads=N_KV,
-                    block_table=page_table,
-                    block_size=self.backend.page_size,
-                    out=[output, softmax_lse],
-                    **kv_cache_args,
-                )
-
-            return output.squeeze(2) if input_layout == "BNSD" else output
-        else:
-            return flash_attn_with_kvcache(
-                q=q,
-                k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
-                v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
-                page_table=self.page_table,
-                cache_seqlens=self.b_att_seq_len,
-                cu_seqlens_q=self.cu_seqlens_q,
-                cu_seqlens_k_new=self.cu_seqlens_k,
-                max_seqlen_q=self.decode_max_q_seq_len,
-                softmax_scale=sm_scale,
-                causal=self.causal,
-                window_size=window_size,
-                softcap=0.0,
-                k_descale=None,
-                v_descale=None,
-                return_softmax_lse=False,
-                sinks=sink_weight,
-            )
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
+            v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
+            page_table=self.page_table,
+            cache_seqlens=self.b_att_seq_len,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_k_new=self.cu_seqlens_k,
+            max_seqlen_q=self.decode_max_q_seq_len,
+            softmax_scale=sm_scale,
+            causal=self.causal,
+            window_size=window_size,
+            softcap=0.0,
+            k_descale=None,
+            v_descale=None,
+            return_softmax_lse=False,
+            sinks=sink_weight,
+        )

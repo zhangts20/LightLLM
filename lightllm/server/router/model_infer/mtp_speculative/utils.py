@@ -87,6 +87,25 @@ def alloc_eagle_mem_indexes(
     return indexes
 
 
+def alloc_block_mem_indexes(
+    b_seq_len: torch.Tensor,
+    b_last_mem_index: torch.Tensor,
+    block_size: int,
+    *,
+    allocations: List[MtpMemIndexesToFree],
+) -> torch.Tensor:
+    req_num = int(b_seq_len.numel())
+    step_major = alloc_eagle_mem_indexes(
+        b_seq_len,
+        b_last_mem_index,
+        block_size,
+        allocations=allocations,
+    )
+    if req_num == 0 or block_size <= 1:
+        return step_major
+    return step_major.view(block_size, req_num).transpose(0, 1).contiguous().reshape(-1)
+
+
 def verify_mtp_tokens(
     backend: ModeBackend,
     next_token_ids: torch.Tensor,
@@ -188,6 +207,7 @@ def free_mem_indexes(
 __all__ = [
     "alloc_mem_indexes",
     "alloc_eagle_mem_indexes",
+    "alloc_block_mem_indexes",
     "free_mem_indexes",
     "record_request_mtp_metrics",
     "scatter_mtp_next_tokens",

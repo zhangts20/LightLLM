@@ -311,6 +311,69 @@ def _align_block_d(head_dim: int, group_size: int) -> int:
 
 
 @triton.jit
+def _gather_dequant_int8kv_npu(
+    K,
+    K_scale,
+    V,
+    V_scale,
+    Indices,
+    K_out,
+    V_out,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_ks_t,
+    stride_ks_h,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_vs_t,
+    stride_vs_h,
+    stride_ko_t,
+    stride_ko_h,
+    stride_ko_d,
+    stride_vo_t,
+    stride_vo_h,
+    stride_vo_d,
+    n_tokens,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Per-token scale, D-tiled. Smaller UB than loading full head_dim.
+    offs_t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    head = tl.program_id(1)
+    offs_d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+    t_mask = offs_t < n_tokens
+    d_mask = offs_d < HEAD_DIM
+    locs = tl.load(Indices + offs_t, mask=t_mask, other=0).to(tl.int64)
+    k_s = tl.load(K_scale + locs * stride_ks_t + head * stride_ks_h, mask=t_mask, other=0.0)
+    k_i8 = tl.load(
+        K + locs[:, None] * stride_k_t + head * stride_k_h + offs_d[None, :] * stride_k_d,
+        mask=t_mask[:, None] & d_mask[None, :],
+        other=0,
+    )
+    k = k_i8.to(K_out.dtype.element_ty) * k_s[:, None].to(K_out.dtype.element_ty)
+    tl.store(
+        K_out + offs_t[:, None] * stride_ko_t + head * stride_ko_h + offs_d[None, :] * stride_ko_d,
+        k,
+        mask=t_mask[:, None] & d_mask[None, :],
+    )
+    v_s = tl.load(V_scale + locs * stride_vs_t + head * stride_vs_h, mask=t_mask, other=0.0)
+    v_i8 = tl.load(
+        V + locs[:, None] * stride_v_t + head * stride_v_h + offs_d[None, :] * stride_v_d,
+        mask=t_mask[:, None] & d_mask[None, :],
+        other=0,
+    )
+    v = v_i8.to(V_out.dtype.element_ty) * v_s[:, None].to(V_out.dtype.element_ty)
+    tl.store(
+        V_out + offs_t[:, None] * stride_vo_t + head * stride_vo_h + offs_d[None, :] * stride_vo_d,
+        v,
+        mask=t_mask[:, None] & d_mask[None, :],
+    )
+
+
+@triton.jit
 def _gather_dequant_int8kv(
     K,
     K_scale,
@@ -410,6 +473,43 @@ def gather_dequant_int8kv(
     head_dim = k.shape[2]
     if head_dim % quant_group_size != 0:
         raise ValueError(f"head_dim {head_dim} is not divisible by group {quant_group_size}")
+    on_npu = k.device.type == "npu"
+    if on_npu and quant_group_size == head_dim:
+        # 910B: T=32/D=256, multibuffer off. T=64 corrupts; T=128 UB-align faults.
+        block_t = 32 if n_tokens >= 32 else (16 if n_tokens >= 16 else 8)
+        block_d = 256
+        grid = (triton.cdiv(n_tokens, block_t), n_kv, triton.cdiv(head_dim, block_d))
+        _gather_dequant_int8kv_npu[grid](
+            k,
+            k_scale,
+            v,
+            v_scale,
+            indices,
+            k_out,
+            v_out,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k_scale.stride(0),
+            k_scale.stride(1) if k_scale.ndim > 1 else 0,
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v_scale.stride(0),
+            v_scale.stride(1) if v_scale.ndim > 1 else 0,
+            k_out.stride(0),
+            k_out.stride(1),
+            k_out.stride(2),
+            v_out.stride(0),
+            v_out.stride(1),
+            v_out.stride(2),
+            n_tokens,
+            HEAD_DIM=head_dim,
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            multibuffer=False,
+        )
+        return k_out, v_out
     block_d = _align_block_d(head_dim, quant_group_size)
     num_groups = block_d // quant_group_size
     block_t = 64 if n_tokens >= 64 else 16

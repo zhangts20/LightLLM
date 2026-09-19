@@ -15,6 +15,11 @@ from .fp import (
     PagedFa3PrefillAttState,
     maca_flash_attn_varlen_func,
 )
+from .fp_npu import (
+    PagedFa3AscendAttBackend,
+    PagedFa3AscendDecodeAttState,
+    PagedFa3AscendPrefillAttState,
+)
 from .prefix_flash_npu import can_use_prefix_flash, prefix_flash_attention
 from lightllm.common.basemodel.triton_kernel.kv_copy.ppl_int8kv_copy_kv import gather_dequant_int8kv
 
@@ -62,7 +67,7 @@ def _merge_attn_lse(
     platforms=("ascend",),
     validate_name="fa3",
 )
-class PagedFa3Int8KVAscendAttBackend(PagedFa3AttBackend):
+class PagedFa3Int8KVAscendAttBackend(PagedFa3AscendAttBackend):
 
     def create_att_prefill_state(
         self, infer_state: "InferStateInfo"
@@ -76,7 +81,7 @@ class PagedFa3Int8KVAscendAttBackend(PagedFa3AttBackend):
 
 
 @dataclasses.dataclass
-class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
+class PagedFa3Int8KVAscendPrefillAttState(PagedFa3AscendPrefillAttState):
     # The request info for each prefill request, as a tuple of (q_start, q_end, req_id, prefix_len).
     # Then use req_id to index stored K/V cache and prefix_len to determine how many tokens to 
     # dequantize in chunks.
@@ -144,7 +149,7 @@ class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
             self.prefix_total_token_num != 0
             and self.infer_state.max_q_seq_len == 1
         ):
-            PagedFa3PrefillAttState.init_state(self)
+            PagedFa3AscendPrefillAttState.init_state(self)
             self.use_paged_int8 = True
             return
 
@@ -537,7 +542,7 @@ class PagedFa3Int8KVAscendPrefillAttState(PagedFa3PrefillAttState):
 
 
 @dataclasses.dataclass
-class PagedFa3Int8KVAscendDecodeAttState(PagedFa3DecodeAttState):
+class PagedFa3Int8KVAscendDecodeAttState(PagedFa3AscendDecodeAttState):
 
     def _normal_decode_att(
         self,

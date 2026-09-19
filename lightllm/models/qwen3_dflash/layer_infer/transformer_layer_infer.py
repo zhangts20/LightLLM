@@ -3,8 +3,10 @@ import torch
 from lightllm.common.basemodel.triton_kernel.norm.qk_norm import qk_rmsnorm_forward
 from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
 from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
+from lightllm.models.qwen2_vl.triton_kernel.mrope import mrope_triton_fused
 from lightllm.models.qwen3_dflash.infer_struct import Qwen3DFlashInferStateInfo
 from lightllm.models.qwen3_dflash.layer_weights.transformer_layer_weight import Qwen3DFlashTransformerLayerWeight
+from lightllm.utils.envs_utils import get_env_start_args
 
 
 class Qwen3DFlashTransformerLayerInfer(LlamaTransformerLayerInfer):
@@ -19,6 +21,39 @@ class Qwen3DFlashTransformerLayerInfer(LlamaTransformerLayerInfer):
         super().__init__(layer_num, network_config)
         self.head_dim_ = network_config["head_dim"]
         self.partial_rotary_factor = network_config.get("partial_rotary_factor", 1.0)
+        rope_scaling = network_config.get("rope_scaling") or {}
+        mrope_section = rope_scaling.get("mrope_section")
+        self.use_mrope = (
+            bool(mrope_section)
+            and getattr(get_env_start_args(), "hardware_platform", "cuda") == "ascend"
+        )
+        self.mrope_section = (
+            torch.tensor(mrope_section, dtype=torch.int32, device=self.target_device)
+            if self.use_mrope
+            else None
+        )
+
+    def _apply_rotary(self, q, k, infer_state: Qwen3DFlashInferStateInfo):
+        if self.use_mrope and infer_state.position_cos is not None and infer_state.position_cos.ndim == 3:
+            if q is None:
+                q = torch.empty_like(k)
+            mrope_triton_fused(
+                q,
+                k,
+                infer_state.position_cos,
+                infer_state.position_sin,
+                self.mrope_section,
+                is_interleaved=True,
+                partial_rotary_factor=self.partial_rotary_factor,
+            )
+            return
+        rotary_emb_fwd(
+            q if q is not None else k,
+            k if q is not None else None,
+            infer_state.position_cos,
+            infer_state.position_sin,
+            partial_rotary_factor=self.partial_rotary_factor,
+        )
 
     def context_forward(
         self,
@@ -34,13 +69,7 @@ class Qwen3DFlashTransformerLayerInfer(LlamaTransformerLayerInfer):
             self.eps_,
         )
         cache_kv = cache_kv.view(token_num, self.tp_k_head_num_ + self.tp_v_head_num_, self.head_dim_)
-        rotary_emb_fwd(
-            cache_kv[:, : self.tp_k_head_num_, :],
-            None,
-            infer_state.position_cos,
-            infer_state.position_sin,
-            partial_rotary_factor=self.partial_rotary_factor,
-        )
+        self._apply_rotary(None, cache_kv[:, : self.tp_k_head_num_, :], infer_state)
         self._post_cache_kv(cache_kv, infer_state, layer_weight)
         return input_embdings
 
@@ -59,11 +88,9 @@ class Qwen3DFlashTransformerLayerInfer(LlamaTransformerLayerInfer):
             self.head_dim_,
         )
 
-        rotary_emb_fwd(
+        self._apply_rotary(
             q.view(-1, self.tp_q_head_num_, self.head_dim_),
             cache_kv[:, : self.tp_k_head_num_, :],
-            infer_state.position_cos,
-            infer_state.position_sin,
-            partial_rotary_factor=self.partial_rotary_factor,
+            infer_state,
         )
         return q, cache_kv

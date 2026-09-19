@@ -13,6 +13,7 @@ from lightllm.models.qwen3_dflash.layer_infer.pre_layer_infer import Qwen3DFlash
 from lightllm.models.qwen3_dflash.layer_infer.transformer_layer_infer import Qwen3DFlashTransformerLayerInfer
 from lightllm.models.qwen3_dflash.layer_weights.pre_and_post_layer_weight import Qwen3DFlashPreAndPostLayerWeight
 from lightllm.models.qwen3_dflash.layer_weights.transformer_layer_weight import Qwen3DFlashTransformerLayerWeight
+from lightllm.utils.envs_utils import get_env_start_args
 
 
 @DraftModelRegistry(model_type="qwen3", spec_modes="dflash")
@@ -35,6 +36,19 @@ class Qwen3DFlashModel(LlamaTpPartModel):
     def _pre_init(self, kvargs: dict):
         self.main_model: TpPartBaseModel = kvargs.pop("main_model")
         self.mtp_previous_draft_models = kvargs.pop("mtp_previous_draft_models")
+
+    def _draft_rope_from_seq_len(self, b_seq_len: torch.Tensor, b_position_delta=None):
+        position_ids = b_seq_len - 1
+        if b_position_delta is not None:
+            position_ids = position_ids + b_position_delta.to(device=position_ids.device, dtype=position_ids.dtype)
+        rope_scaling = self.config.get("rope_scaling") or {}
+        if rope_scaling.get("mrope_section"):
+            position_ids = position_ids.unsqueeze(0).expand(3, -1).contiguous()
+            return self._cos_cached[position_ids], self._sin_cached[position_ids]
+        return (
+            torch.index_select(self._cos_cached, 0, position_ids),
+            torch.index_select(self._sin_cached, 0, position_ids),
+        )
 
     def _verify_params(self):
         super()._verify_params()
@@ -95,11 +109,17 @@ class Qwen3DFlashModel(LlamaTpPartModel):
         # committed to the draft cache. Project those rows and write their KV
         # directly: no token embedding, attention state, or draft logits are
         # needed for this half of the parallel-block proposal.
-        position_ids = model_input.b_seq_len - 1
         infer_state = self.infer_state_class()
         infer_state.mtp_draft_input_hiddens = model_input.mtp_draft_input_hiddens
-        infer_state.position_cos = torch.index_select(self._cos_cached, 0, position_ids)
-        infer_state.position_sin = torch.index_select(self._sin_cached, 0, position_ids)
+        if getattr(get_env_start_args(), "hardware_platform", "cuda") == "ascend":
+            infer_state.position_cos, infer_state.position_sin = self._draft_rope_from_seq_len(
+                model_input.b_seq_len,
+                model_input.b_position_delta,
+            )
+        else:
+            position_ids = model_input.b_seq_len - 1
+            infer_state.position_cos = torch.index_select(self._cos_cached, 0, position_ids)
+            infer_state.position_sin = torch.index_select(self._sin_cached, 0, position_ids)
         infer_state.mem_manager = self.mem_manager
         infer_state.mem_index = model_input.mem_indexes
 

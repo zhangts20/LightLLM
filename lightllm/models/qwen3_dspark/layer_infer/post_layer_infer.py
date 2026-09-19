@@ -121,6 +121,7 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
                 gathered_winners = self.alloc_tensor(
                     (self.tp_world_size_ * num_reqs, 2),
                     dtype=torch.float32,
+                    device=local_logits.device,
                 )
                 all_gather_into_tensor(
                     gathered_winners,

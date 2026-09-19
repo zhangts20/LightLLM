@@ -1,6 +1,8 @@
 from lightllm.models.llama.model import LlamaTpPartModel
 from lightllm.models.qwen3_dspark.model import Qwen3DSparkModel
+from lightllm.models.qwen3_5.infer_struct import Qwen35InferStateInfo
 from lightllm.models.draft_registry import DraftModelRegistry
+from lightllm.utils.envs_utils import get_env_start_args
 
 
 @DraftModelRegistry(model_type=("qwen3_5", "qwen3_5_text"), spec_modes="dspark")
@@ -22,8 +24,14 @@ class Qwen3_5DSparkModel(Qwen3DSparkModel):
         self.config["partial_rotary_factor"] = rope_parameters.get("partial_rotary_factor", 1.0)
 
     def _init_custom(self):
-        # Draft and target use different rotary shapes, so the draft owns its rotary cache.
-        LlamaTpPartModel._init_custom(self)
+        if getattr(get_env_start_args(), "hardware_platform", "cuda") == "ascend":
+            # Ascend: share the target interleaved 3-axis M-RoPE table.
+            self.infer_state_class = Qwen35InferStateInfo
+            self._cos_cached = self.main_model._cos_cached
+            self._sin_cached = self.main_model._sin_cached
+        else:
+            # CUDA/MetaX: draft owns its 1D rotary cache.
+            LlamaTpPartModel._init_custom(self)
         self.block_size = self.config["block_size"]
         self.mask_token_id = self.config["mask_token_id"]
 

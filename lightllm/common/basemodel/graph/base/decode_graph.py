@@ -313,13 +313,14 @@ class DecodeGraph:
 
     @contextmanager
     def _block_warmup_input(self, model, batch_size: int):
-        """Own temporary requests and complete pages without resetting target state."""
+        """Own temporary requests and a short dummy page block without resetting target state."""
         width = model.mtp_manager.get_decode_batch_multiplier(model.is_mtp_draft_model)
         group_count = triton.cdiv(batch_size, width)
-        seq_len = max(self._warmup_dummy_seq_len(), width + 1)
-        if seq_len > self.graph_max_len_in_batch:
+        alloc_seq_len = width + 1
+        if alloc_seq_len > self.graph_max_len_in_batch:
             raise ValueError("decode graph max sequence length is smaller than the speculative warmup block")
-        prefix_len = seq_len - width
+        max_kv_seq_len = max(self._warmup_dummy_seq_len(), alloc_seq_len)
+        prefix_len = alloc_seq_len - width
         req_manager = model.req_manager
         requests, allocations, saved_rows = [], [], []
         try:
@@ -329,22 +330,24 @@ class DecodeGraph:
                     raise RuntimeError("not enough free requests for speculative graph warmup")
                 requests.append(req_idx)
                 saved_rows.append(req_manager.req_to_token_indexs[req_idx].clone())
-                page_tokens = req_manager.alloc_page_aligned_mem_indices(seq_len)
+                page_tokens = req_manager.alloc_page_aligned_mem_indices(alloc_seq_len)
                 if page_tokens is None:
                     raise RuntimeError("not enough free KV pages for speculative graph warmup")
                 allocations.append(page_tokens)
-                req_manager.req_to_token_indexs[req_idx, :seq_len] = page_tokens[:seq_len].to(self.target_device)
+                req_manager.req_to_token_indexs[req_idx, :alloc_seq_len] = page_tokens[:alloc_seq_len].to(
+                    self.target_device
+                )
 
             offsets = torch.arange(batch_size, dtype=torch.int32, device=self.target_device) % width
             req_ids = torch.tensor(requests, dtype=torch.int32, device=self.target_device)
             b_req_idx = req_ids.repeat_interleave(width)[:batch_size]
-            mem_indexes = torch.cat([tokens[prefix_len:seq_len] for tokens in allocations])[:batch_size]
+            mem_indexes = torch.cat([tokens[prefix_len:alloc_seq_len] for tokens in allocations])[:batch_size]
             b_seq_len = prefix_len + offsets + 1
             yield ModelInput(
                 batch_size=batch_size,
                 total_token_num=int(b_seq_len.sum().item()),
                 max_q_seq_len=1,
-                max_kv_seq_len=seq_len,
+                max_kv_seq_len=max_kv_seq_len,
                 input_ids=torch.ones(batch_size, dtype=torch.int64, device=self.target_device),
                 mem_indexes=mem_indexes.to(self.target_device),
                 b_req_idx=b_req_idx,
