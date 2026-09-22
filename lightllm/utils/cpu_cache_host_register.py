@@ -11,6 +11,10 @@ logger = init_logger(__name__)
 
 class HostRegisterOps:
 
+    def registration_chunk_bytes(self, size: int) -> int:
+        # 在 CUDA 中分段注册后的设备地址仍然连续
+        return 128 * 1024 * 1024
+
     def register_segment(self, shm_ptr: int, offset: int, seg_len: int) -> None:
         raise NotImplementedError
 
@@ -118,6 +122,10 @@ def _metax_ops() -> HostRegisterOps:
             self.flag = 3
             self.device_id = get_current_device_id()
             torch.cuda.set_device(self.device_id)
+
+        def registration_chunk_bytes(self, size: int) -> int:
+            # 沐曦下，分段注册的地址不连续，所以需要返回整个范围的大小
+            return size
 
         def register_segment(self, shm_ptr: int, offset: int, seg_len: int) -> None:
             torch.cuda.set_device(self.device_id)

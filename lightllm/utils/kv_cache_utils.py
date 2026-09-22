@@ -248,7 +248,8 @@ def create_shm_kv_cache_ptr(key: int, size: int) -> int:
 @lru_cache(maxsize=None)
 def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> int:
     """Synchronously host-register [shm_ptr, shm_ptr+size) via platform worker."""
-    chunk_bytes = 128 * 1024 * 1024  # 128M性能最好
+    ops = get_host_register_worker()
+    chunk_bytes = ops.registration_chunk_bytes(size)
     tasks: list[tuple[int, int]] = []
     offset = 0
     while offset < size:
@@ -256,7 +257,6 @@ def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> int:
         tasks.append((offset, seg_len))
         offset += seg_len
 
-    ops = get_host_register_worker()
     desc = f"pid {os.getpid()} Registering pinned host memory"
 
     def _register_one_segment(task: Tuple[int, int]):
