@@ -197,7 +197,6 @@ def _launch_subprocesses(args: StartArgs):
         assert (
             not args.enable_dp_prefill_balance
         ), "page_size > 1 is not supported with DP prefill balance, please set PAGE_SIZE=1"
-        assert not args.enable_cpu_cache, "page_size > 1 is not supported with CPU cache, please set PAGE_SIZE=1"
 
     if args.afs_image_embed_dir is not None:
         os.makedirs(args.afs_image_embed_dir, mode=0o777, exist_ok=True)
@@ -291,6 +290,18 @@ def _launch_subprocesses(args: StartArgs):
     if args.enable_cpu_cache and is_linear_att_mixed_model(args.model_dir):
         args.cpu_cache_token_page_size = args.linear_att_hash_page_size * args.linear_att_page_block_num
         logger.info(f"set cpu_cache_token_page_size to {args.cpu_cache_token_page_size} for linear hybrid att model")
+
+    if args.enable_cpu_cache and get_page_size() > 1:
+        page_size = get_page_size()
+        assert args.cpu_cache_token_page_size % page_size == 0, (
+            f"cpu_cache_token_page_size ({args.cpu_cache_token_page_size}) must be a multiple of "
+            f"PAGE_SIZE={page_size}"
+        )
+        if is_linear_att_mixed_model(args.model_dir):
+            assert args.linear_att_hash_page_size % page_size == 0, (
+                f"linear_att_hash_page_size ({args.linear_att_hash_page_size}) must be a multiple of "
+                f"PAGE_SIZE={page_size} when cpu cache is enabled"
+            )
 
     # help to manage data stored on Ceph
     if "s3://" in args.model_dir:

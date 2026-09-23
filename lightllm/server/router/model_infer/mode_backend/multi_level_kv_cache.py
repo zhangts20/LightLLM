@@ -43,9 +43,6 @@ class MultiLevelKvCacheModule(object):
         self.cpu_cache_handle_queue: Deque[TransTask] = deque()
         self.cpu_cache_client = CpuKvCacheClient(only_create_meta_data=False, init_shm_data=False)
 
-        self.platform_backend = get_backend()
-        self.target_device = get_target_device()
-
     @lru_cache()
     def need_sync_compute_stream(self) -> bool:
         """
@@ -112,8 +109,7 @@ class MultiLevelKvCacheModule(object):
 
                     if self.need_sync_compute_stream():
                         # TODO fa3 现在必须使用同步模式, 未来需要移除
-                        torch.cuda.current_stream().wait_stream(g_infer_context.get_overlap_stream())
-                        # g_infer_context.get_overlap_stream().synchronize()
+                        g_infer_context.get_overlap_stream().synchronize()
 
                     mem_manager = self.backend.model.mem_manager
                     req_manager = self.backend.model.req_manager

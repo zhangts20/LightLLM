@@ -284,8 +284,104 @@ class NpuLinearAttMemOperator(LinearAttMemOperator):
         copy_kv_buffer_to_kv_buffer(src_mem_index, dst_mem_index, self.mem_manager.k_buffer)
         copy_kv_buffer_to_kv_buffer(src_mem_index, dst_mem_index, self.mem_manager.v_buffer)
 
-    def load_cpu_cache_to_gpu(self, *args, **kwargs):
-        raise NotImplementedError("CPU KV cache is not implemented for split Qwen3.5 NPU K/V buffers")
+    def _is_int8_split_kv(self) -> bool:
+        return getattr(self.mem_manager, "k_scale_buffer", None) is not None
 
-    def offload_gpu_kv_to_cpu_cache(self, *args, **kwargs):
-        raise NotImplementedError("CPU KV cache is not implemented for split Qwen3.5 NPU K/V buffers")
+    def _flat_token_kv(self, buf: torch.Tensor) -> torch.Tensor:
+        return buf.view(buf.shape[0], -1, buf.shape[-2], buf.shape[-1])
+
+    def _flat_token_scale(self, buf: torch.Tensor) -> torch.Tensor:
+        return buf.view(buf.shape[0], -1)
+
+    def _ensure_cuda_layout_staging(self, token_num: int) -> torch.Tensor:
+        k_flat = self._flat_token_kv(self.mem_manager.k_buffer)
+        layers, _, head_num, head_dim = k_flat.shape
+        dtype = self.linear_config.full_att_dtype
+        buf = getattr(self, "_cpu_cache_kv_staging", None)
+        if buf is None or buf.shape[1] < token_num or buf.dtype != dtype or buf.shape[0] != layers:
+            self._cpu_cache_kv_staging = torch.empty(
+                (layers, token_num, 2 * head_num, head_dim),
+                dtype=dtype,
+                device=self.mem_manager.target_device,
+            )
+        return self._cpu_cache_kv_staging
+
+    def _remap_mem_indexes(self, mem_indexes: torch.Tensor):
+        n = mem_indexes.numel()
+        valid = mem_indexes >= 0
+        remap = torch.arange(n, device=mem_indexes.device, dtype=mem_indexes.dtype)
+        remap = torch.where(valid, remap, mem_indexes.new_full((), -1))
+        return valid, remap
+
+    def _gather_split_kv_to_cuda_layout(self, mem_indexes: torch.Tensor):
+        n = mem_indexes.numel()
+        buf = self._ensure_cuda_layout_staging(n)
+        packed = buf[:, :n]
+        valid, remap = self._remap_mem_indexes(mem_indexes)
+        idx = mem_indexes.clamp(min=0).to(torch.int64)
+        head_num = self.mem_manager.head_num
+        k = self._flat_token_kv(self.mem_manager.k_buffer).index_select(1, idx)
+        v = self._flat_token_kv(self.mem_manager.v_buffer).index_select(1, idx)
+        if self._is_int8_split_kv():
+            k_scale = self._flat_token_scale(self.mem_manager.k_scale_buffer).index_select(1, idx)
+            v_scale = self._flat_token_scale(self.mem_manager.v_scale_buffer).index_select(1, idx)
+            dest_dtype = packed.dtype
+            k = (k.float() * k_scale.unsqueeze(-1).unsqueeze(-1)).to(dest_dtype)
+            v = (v.float() * v_scale.unsqueeze(-1).unsqueeze(-1)).to(dest_dtype)
+        packed[:, :, :head_num].copy_(k)
+        packed[:, :, head_num:].copy_(v)
+        packed.masked_fill_(~valid.view(1, -1, 1, 1), 0)
+        return packed, remap
+
+    def _scatter_cuda_layout_to_split_kv(self, mem_indexes: torch.Tensor, packed: torch.Tensor):
+        valid = mem_indexes >= 0
+        valid_idx = mem_indexes.to(torch.int64)[valid]
+        if valid_idx.numel() == 0:
+            return
+        head_num = self.mem_manager.head_num
+        k_src = packed[:, valid, :head_num]
+        v_src = packed[:, valid, head_num:]
+        k_flat = self._flat_token_kv(self.mem_manager.k_buffer)
+        v_flat = self._flat_token_kv(self.mem_manager.v_buffer)
+        if self._is_int8_split_kv():
+            import torch_npu
+
+            layers, token_num, heads, head_dim = k_src.shape
+            k_q, k_scale = torch_npu.npu_dynamic_quant(
+                k_src.reshape(layers * token_num, -1), dst_type=torch.int8
+            )
+            v_q, v_scale = torch_npu.npu_dynamic_quant(
+                v_src.reshape(layers * token_num, -1), dst_type=torch.int8
+            )
+            k_flat.index_copy_(1, valid_idx, k_q.view(layers, token_num, heads, head_dim))
+            v_flat.index_copy_(1, valid_idx, v_q.view(layers, token_num, heads, head_dim))
+            self._flat_token_scale(self.mem_manager.k_scale_buffer).index_copy_(
+                1, valid_idx, k_scale.view(layers, token_num)
+            )
+            self._flat_token_scale(self.mem_manager.v_scale_buffer).index_copy_(
+                1, valid_idx, v_scale.view(layers, token_num)
+            )
+            return
+        k_flat.index_copy_(1, valid_idx, k_src)
+        v_flat.index_copy_(1, valid_idx, v_src)
+
+    def load_cpu_cache_to_gpu(self, mem_indexes, page_indexes, cpu_cache_client, req):
+        n = mem_indexes.numel()
+        buf = self._ensure_cuda_layout_staging(n)
+        _, remap = self._remap_mem_indexes(mem_indexes)
+        old_kv = self.mem_manager.kv_buffer
+        self.mem_manager.kv_buffer = buf
+        try:
+            super().load_cpu_cache_to_gpu(remap, page_indexes, cpu_cache_client, req)
+        finally:
+            self.mem_manager.kv_buffer = old_kv
+        self._scatter_cuda_layout_to_split_kv(mem_indexes, buf[:, :n])
+
+    def offload_gpu_kv_to_cpu_cache(self, mem_indexes, page_indexes, page_readies, cpu_cache_client, req):
+        _, remap = self._gather_split_kv_to_cuda_layout(mem_indexes)
+        old_kv = self.mem_manager.kv_buffer
+        self.mem_manager.kv_buffer = self._cpu_cache_kv_staging
+        try:
+            return super().offload_gpu_kv_to_cpu_cache(remap, page_indexes, page_readies, cpu_cache_client, req)
+        finally:
+            self.mem_manager.kv_buffer = old_kv

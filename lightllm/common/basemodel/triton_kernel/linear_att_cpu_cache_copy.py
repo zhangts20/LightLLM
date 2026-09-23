@@ -2,6 +2,359 @@ import torch
 import triton
 import triton.language as tl
 from lightllm.common.linear_att_cache_manager.config_objs import LinearAttCacheConfig
+from lightllm.common.basemodel.triton_kernel.linear_att_copy import _npu_vector_core_count
+
+
+_NPU_STAGING = {}
+
+
+def _npu_page_staging(batch, att_u32, conv_u32, ssm_u32, device):
+    key = (batch, att_u32, conv_u32, ssm_u32, str(device))
+    hit = _NPU_STAGING.get(key)
+    if hit is None:
+        hit = tuple(
+            torch.empty((batch, n), dtype=torch.uint32, device=device) for n in (att_u32, conv_u32, ssm_u32, conv_u32, ssm_u32)
+        )
+        _NPU_STAGING[key] = hit
+    return hit
+
+
+def _gpu_kv_as_u32(gpu_kv: torch.Tensor):
+    gpu = gpu_kv
+    if not gpu.is_contiguous():
+        gpu = gpu.permute(1, 0, 2)
+    if not gpu.is_contiguous():
+        raise AssertionError("gpu kv must share storage with a contiguous [layer, token, dim] buffer")
+    gpu_u32 = gpu.view(dtype=torch.uint32).view(gpu.shape[0], gpu.shape[1], -1)
+    if gpu is gpu_kv:
+        return gpu_u32, gpu_u32.stride(0), gpu_u32.stride(1), gpu_u32.stride(2)
+    return gpu_u32, gpu_u32.stride(1), gpu_u32.stride(0), gpu_u32.stride(2)
+
+
+def _npu_copy_meta(gpu_kv, cpu_kv_conv, cpu_kv_ssm, big_page_token_num):
+    gpu_u32, stride_s, stride_l, stride_d = _gpu_kv_as_u32(gpu_kv)
+    att_u32 = gpu_u32.shape[-1] * gpu_kv.shape[1] * big_page_token_num
+    conv_u32 = cpu_kv_conv[0].numel() * cpu_kv_conv.element_size() // 4
+    ssm_u32 = cpu_kv_ssm[0].numel() * cpu_kv_ssm.element_size() // 4
+    return gpu_u32, stride_s, stride_l, stride_d, att_u32, conv_u32, ssm_u32
+
+
+def _pick_valid_pages(page_indexes, page_readies, big_page_buffer_ids, mem_indexes, big_page_token_num):
+    page_ids = page_indexes.detach().cpu().tolist()
+    big_ids = big_page_buffer_ids.detach().cpu().tolist()
+    if page_readies is None:
+        readies = [False] * len(page_ids)
+    else:
+        readies = page_readies.detach().cpu().tolist()
+    valid_pos = []
+    valid_pages = []
+    valid_big = []
+    for i, (page_id, ready, big_id) in enumerate(zip(page_ids, readies, big_ids)):
+        if page_id < 0 or ready:
+            continue
+        valid_pos.append(i)
+        valid_pages.append(int(page_id))
+        valid_big.append(int(big_id))
+    if not valid_pos:
+        return [], [], None
+    idx = torch.tensor(valid_pos, device=mem_indexes.device, dtype=torch.int64)
+    token = mem_indexes.view(len(page_ids), big_page_token_num).index_select(0, idx).reshape(-1).contiguous()
+    return valid_pages, valid_big, token
+
+
+@triton.jit
+def _copy_kv_to_cpu_cache_npu(
+    mem_indexes_ptr,
+    gpu_kv,
+    gpu_stride_s,
+    gpu_stride_l,
+    gpu_stride_d,
+    dest_att,
+    dest_att_stride_p,
+    src_conv,
+    dest_conv,
+    conv_stride_s,
+    dest_conv_stride_p,
+    src_ssm,
+    dest_ssm,
+    ssm_stride_s,
+    dest_ssm_stride_p,
+    att_u32,
+    conv_u32,
+    ssm_u32,
+    att_tiles,
+    conv_tiles,
+    tiles_per_page,
+    tiles,
+    big_page_token_num,
+    full_att_layer_num,
+    BLOCK: tl.constexpr,
+):
+    gpu_stride_s = tl.cast(gpu_stride_s, tl.int64)
+    gpu_stride_l = tl.cast(gpu_stride_l, tl.int64)
+    gpu_stride_d = tl.cast(gpu_stride_d, tl.int64)
+    dest_att_stride_p = tl.cast(dest_att_stride_p, tl.int64)
+    conv_stride_s = tl.cast(conv_stride_s, tl.int64)
+    dest_conv_stride_p = tl.cast(dest_conv_stride_p, tl.int64)
+    ssm_stride_s = tl.cast(ssm_stride_s, tl.int64)
+    dest_ssm_stride_p = tl.cast(dest_ssm_stride_p, tl.int64)
+    att_u32 = tl.cast(att_u32, tl.int64)
+    conv_u32 = tl.cast(conv_u32, tl.int64)
+    ssm_u32 = tl.cast(ssm_u32, tl.int64)
+    offs = tl.arange(0, BLOCK)
+    for tile in range(tl.program_id(0), tiles, tl.num_programs(0)):
+        page = (tile // tiles_per_page).to(tl.int64)
+        sub = tile % tiles_per_page
+        if sub < att_tiles:
+            col = sub * BLOCK + offs
+            mask = col < att_u32
+            safe_col = tl.where(mask, col, 0)
+            per_token = att_u32 // big_page_token_num
+            per_layer = per_token // full_att_layer_num
+            mem_offs = safe_col // per_token
+            mem_index = tl.load(mem_indexes_ptr + page * big_page_token_num + mem_offs, mask=mask, other=-1).to(
+                tl.int64
+            )
+            valid = mask & (mem_index >= 0)
+            safe_index = tl.where(valid, mem_index, 0)
+            layer = (safe_col // per_layer) % full_att_layer_num
+            dim = safe_col % per_layer
+            data = tl.load(
+                gpu_kv + safe_index * gpu_stride_s + layer * gpu_stride_l + dim * gpu_stride_d,
+                mask=valid,
+                other=0,
+            )
+            tl.store(dest_att + page * dest_att_stride_p + safe_col, data, mask=valid)
+        else:
+            if sub < att_tiles + conv_tiles:
+                col = (sub - att_tiles) * BLOCK + offs
+                mask = col < conv_u32
+                safe_col = tl.where(mask, col, 0)
+                data = tl.load(src_conv + page * conv_stride_s + safe_col, mask=mask, other=0)
+                tl.store(dest_conv + page * dest_conv_stride_p + safe_col, data, mask=mask)
+            else:
+                col = (sub - att_tiles - conv_tiles) * BLOCK + offs
+                mask = col < ssm_u32
+                safe_col = tl.where(mask, col, 0)
+                data = tl.load(src_ssm + page * ssm_stride_s + safe_col, mask=mask, other=0)
+                tl.store(dest_ssm + page * dest_ssm_stride_p + safe_col, data, mask=mask)
+
+
+@triton.jit
+def _copy_cpu_cache_to_kv_npu(
+    mem_indexes_ptr,
+    gpu_kv,
+    gpu_stride_s,
+    gpu_stride_l,
+    gpu_stride_d,
+    src_att,
+    src_att_stride_p,
+    src_conv,
+    dest_conv,
+    conv_stride_s,
+    dest_conv_stride_p,
+    src_ssm,
+    dest_ssm,
+    ssm_stride_s,
+    dest_ssm_stride_p,
+    att_u32,
+    conv_u32,
+    ssm_u32,
+    att_tiles,
+    conv_tiles,
+    tiles_per_page,
+    tiles,
+    big_page_token_num,
+    full_att_layer_num,
+    BLOCK: tl.constexpr,
+):
+    gpu_stride_s = tl.cast(gpu_stride_s, tl.int64)
+    gpu_stride_l = tl.cast(gpu_stride_l, tl.int64)
+    gpu_stride_d = tl.cast(gpu_stride_d, tl.int64)
+    src_att_stride_p = tl.cast(src_att_stride_p, tl.int64)
+    conv_stride_s = tl.cast(conv_stride_s, tl.int64)
+    dest_conv_stride_p = tl.cast(dest_conv_stride_p, tl.int64)
+    ssm_stride_s = tl.cast(ssm_stride_s, tl.int64)
+    dest_ssm_stride_p = tl.cast(dest_ssm_stride_p, tl.int64)
+    att_u32 = tl.cast(att_u32, tl.int64)
+    conv_u32 = tl.cast(conv_u32, tl.int64)
+    ssm_u32 = tl.cast(ssm_u32, tl.int64)
+    offs = tl.arange(0, BLOCK)
+    for tile in range(tl.program_id(0), tiles, tl.num_programs(0)):
+        page = (tile // tiles_per_page).to(tl.int64)
+        sub = tile % tiles_per_page
+        if sub < att_tiles:
+            col = sub * BLOCK + offs
+            mask = col < att_u32
+            safe_col = tl.where(mask, col, 0)
+            per_token = att_u32 // big_page_token_num
+            per_layer = per_token // full_att_layer_num
+            mem_offs = safe_col // per_token
+            mem_index = tl.load(mem_indexes_ptr + page * big_page_token_num + mem_offs, mask=mask, other=-1).to(
+                tl.int64
+            )
+            valid = mask & (mem_index >= 0)
+            safe_index = tl.where(valid, mem_index, 0)
+            layer = (safe_col // per_layer) % full_att_layer_num
+            dim = safe_col % per_layer
+            data = tl.load(src_att + page * src_att_stride_p + safe_col, mask=valid, other=0)
+            tl.store(
+                gpu_kv + safe_index * gpu_stride_s + layer * gpu_stride_l + dim * gpu_stride_d,
+                data,
+                mask=valid,
+            )
+        else:
+            if sub < att_tiles + conv_tiles:
+                col = (sub - att_tiles) * BLOCK + offs
+                mask = col < conv_u32
+                safe_col = tl.where(mask, col, 0)
+                data = tl.load(src_conv + page * conv_stride_s + safe_col, mask=mask, other=0)
+                tl.store(dest_conv + page * dest_conv_stride_p + safe_col, data, mask=mask)
+            else:
+                col = (sub - att_tiles - conv_tiles) * BLOCK + offs
+                mask = col < ssm_u32
+                safe_col = tl.where(mask, col, 0)
+                data = tl.load(src_ssm + page * ssm_stride_s + safe_col, mask=mask, other=0)
+                tl.store(dest_ssm + page * dest_ssm_stride_p + safe_col, data, mask=mask)
+
+
+def _launch_copy_kv_to_cpu_cache_npu(
+    mem_indexes,
+    page_indexes,
+    page_readies,
+    big_page_buffer_ids,
+    cpu_cache_full_att,
+    cpu_cache_conv,
+    cpu_cache_ssm,
+    gpu_kv_full_att_state,
+    cpu_kv_conv_state,
+    cpu_kv_ssm_state,
+    tp_rank,
+    big_page_token_num,
+    head_scale_size,
+):
+    valid_pages, valid_big, token = _pick_valid_pages(
+        page_indexes, page_readies, big_page_buffer_ids, mem_indexes, big_page_token_num
+    )
+    if not valid_pages:
+        return
+    write_full_att = 1 if tp_rank % head_scale_size == 0 else 0
+    att_head = tp_rank // head_scale_size
+    device = gpu_kv_full_att_state.device
+    gpu_u32, gpu_stride_s, gpu_stride_l, gpu_stride_d, att_u32, conv_u32, ssm_u32 = _npu_copy_meta(
+        gpu_kv_full_att_state, cpu_kv_conv_state, cpu_kv_ssm_state, big_page_token_num
+    )
+    batch = len(valid_pages)
+    dest_att, dest_conv, dest_ssm, src_conv, src_ssm = _npu_page_staging(batch, att_u32, conv_u32, ssm_u32, device)
+    for i, big_id in enumerate(valid_big):
+        src_conv[i].copy_(cpu_kv_conv_state[big_id].view(dtype=torch.uint32).reshape(-1))
+        src_ssm[i].copy_(cpu_kv_ssm_state[big_id].view(dtype=torch.uint32).reshape(-1))
+    BLOCK = 1024
+    att_tiles = triton.cdiv(att_u32, BLOCK) if write_full_att else 0
+    conv_tiles = triton.cdiv(conv_u32, BLOCK)
+    tiles_per_page = att_tiles + conv_tiles + triton.cdiv(ssm_u32, BLOCK)
+    tiles = batch * tiles_per_page
+    _copy_kv_to_cpu_cache_npu[(min(_npu_vector_core_count(), tiles),)](
+        mem_indexes_ptr=token,
+        gpu_kv=gpu_u32,
+        gpu_stride_s=gpu_stride_s,
+        gpu_stride_l=gpu_stride_l,
+        gpu_stride_d=gpu_stride_d,
+        dest_att=dest_att,
+        dest_att_stride_p=dest_att.stride(0),
+        src_conv=src_conv,
+        dest_conv=dest_conv,
+        conv_stride_s=src_conv.stride(0),
+        dest_conv_stride_p=dest_conv.stride(0),
+        src_ssm=src_ssm,
+        dest_ssm=dest_ssm,
+        ssm_stride_s=src_ssm.stride(0),
+        dest_ssm_stride_p=dest_ssm.stride(0),
+        att_u32=att_u32,
+        conv_u32=conv_u32,
+        ssm_u32=ssm_u32,
+        att_tiles=att_tiles,
+        conv_tiles=conv_tiles,
+        tiles_per_page=tiles_per_page,
+        tiles=tiles,
+        big_page_token_num=big_page_token_num,
+        full_att_layer_num=gpu_kv_full_att_state.shape[1],
+        BLOCK=BLOCK,
+        multibuffer=False,
+    )
+    for i, page_id in enumerate(valid_pages):
+        if write_full_att:
+            cpu_cache_full_att[page_id, att_head].view(dtype=torch.uint32).copy_(dest_att[i])
+        cpu_cache_conv[page_id, tp_rank].view(dtype=torch.uint32).copy_(dest_conv[i])
+        cpu_cache_ssm[page_id, tp_rank].view(dtype=torch.uint32).copy_(dest_ssm[i])
+
+
+def _launch_copy_cpu_cache_to_kv_npu(
+    mem_indexes,
+    page_indexes,
+    big_page_buffer_ids,
+    cpu_cache_full_att,
+    cpu_cache_conv,
+    cpu_cache_ssm,
+    gpu_kv_full_att_state,
+    cpu_kv_conv_state,
+    cpu_kv_ssm_state,
+    tp_rank,
+    big_page_token_num,
+    head_scale_size,
+):
+    valid_pages, valid_big, token = _pick_valid_pages(
+        page_indexes, None, big_page_buffer_ids, mem_indexes, big_page_token_num
+    )
+    if not valid_pages:
+        return
+    att_head = tp_rank // head_scale_size
+    device = gpu_kv_full_att_state.device
+    gpu_u32, gpu_stride_s, gpu_stride_l, gpu_stride_d, att_u32, conv_u32, ssm_u32 = _npu_copy_meta(
+        gpu_kv_full_att_state, cpu_kv_conv_state, cpu_kv_ssm_state, big_page_token_num
+    )
+    batch = len(valid_pages)
+    src_att, dest_conv, dest_ssm, src_conv, src_ssm = _npu_page_staging(batch, att_u32, conv_u32, ssm_u32, device)
+    for i, page_id in enumerate(valid_pages):
+        src_att[i].copy_(cpu_cache_full_att[page_id, att_head].view(dtype=torch.uint32).reshape(-1))
+        src_conv[i].copy_(cpu_cache_conv[page_id, tp_rank].view(dtype=torch.uint32).reshape(-1))
+        src_ssm[i].copy_(cpu_cache_ssm[page_id, tp_rank].view(dtype=torch.uint32).reshape(-1))
+    BLOCK = 1024
+    att_tiles = triton.cdiv(att_u32, BLOCK)
+    conv_tiles = triton.cdiv(conv_u32, BLOCK)
+    tiles_per_page = att_tiles + conv_tiles + triton.cdiv(ssm_u32, BLOCK)
+    tiles = batch * tiles_per_page
+    _copy_cpu_cache_to_kv_npu[(min(_npu_vector_core_count(), tiles),)](
+        mem_indexes_ptr=token,
+        gpu_kv=gpu_u32,
+        gpu_stride_s=gpu_stride_s,
+        gpu_stride_l=gpu_stride_l,
+        gpu_stride_d=gpu_stride_d,
+        src_att=src_att,
+        src_att_stride_p=src_att.stride(0),
+        src_conv=src_conv,
+        dest_conv=dest_conv,
+        conv_stride_s=src_conv.stride(0),
+        dest_conv_stride_p=dest_conv.stride(0),
+        src_ssm=src_ssm,
+        dest_ssm=dest_ssm,
+        ssm_stride_s=src_ssm.stride(0),
+        dest_ssm_stride_p=dest_ssm.stride(0),
+        att_u32=att_u32,
+        conv_u32=conv_u32,
+        ssm_u32=ssm_u32,
+        att_tiles=att_tiles,
+        conv_tiles=conv_tiles,
+        tiles_per_page=tiles_per_page,
+        tiles=tiles,
+        big_page_token_num=big_page_token_num,
+        full_att_layer_num=gpu_kv_full_att_state.shape[1],
+        BLOCK=BLOCK,
+        multibuffer=False,
+    )
+    for i, big_id in enumerate(valid_big):
+        cpu_kv_conv_state[big_id].view(dtype=torch.uint32).reshape(-1).copy_(dest_conv[i])
+        cpu_kv_ssm_state[big_id].view(dtype=torch.uint32).reshape(-1).copy_(dest_ssm[i])
 
 
 @triton.jit
@@ -203,6 +556,24 @@ def copy_kv_buffer_to_cpu_cache(
         and (gpu_full_att_tail_dim // big_page_token_num) % full_att_layer_num == 0
     )
     assert (tp_rank // head_scale_size) < linear_config.full_att_all_num_kv_heads
+
+    if gpu_kv_full_att_state.device.type == "npu":
+        _launch_copy_kv_to_cpu_cache_npu(
+            mem_indexes=mem_indexes,
+            page_indexes=page_indexes,
+            page_readies=page_readies,
+            big_page_buffer_ids=big_page_buffer_ids,
+            cpu_cache_full_att=cpu_cache_full_att,
+            cpu_cache_conv=cpu_cache_conv,
+            cpu_cache_ssm=cpu_cache_ssm,
+            gpu_kv_full_att_state=gpu_kv_full_att_state,
+            cpu_kv_conv_state=cpu_kv_conv_state,
+            cpu_kv_ssm_state=cpu_kv_ssm_state,
+            tp_rank=tp_rank,
+            big_page_token_num=big_page_token_num,
+            head_scale_size=head_scale_size,
+        )
+        return
 
     grid = (grid_num,)
     _copy_kv_buffer_to_cpu_cache[grid](
@@ -430,6 +801,23 @@ def copy_cpu_cache_to_kv_buffer(
 
     assert (tp_rank // head_scale_size) < linear_config.full_att_all_num_kv_heads
 
+    if gpu_full_att_kv_state.device.type == "npu":
+        _launch_copy_cpu_cache_to_kv_npu(
+            mem_indexes=mem_indexes,
+            page_indexes=page_indexes,
+            big_page_buffer_ids=big_page_buffer_ids,
+            cpu_cache_full_att=cpu_cache_full_att,
+            cpu_cache_conv=cpu_cache_conv,
+            cpu_cache_ssm=cpu_cache_ssm,
+            gpu_kv_full_att_state=gpu_full_att_kv_state,
+            cpu_kv_conv_state=cpu_kv_conv_state,
+            cpu_kv_ssm_state=cpu_kv_ssm_state,
+            tp_rank=tp_rank,
+            big_page_token_num=big_page_token_num,
+            head_scale_size=head_scale_size,
+        )
+        return
+
     grid = (grid_num,)
     _copy_cpu_cache_to_kv_buffer[grid](
         page_num=len(page_indexes),
@@ -508,6 +896,10 @@ def copy_linear_att_state_to_linear_att_state(
 ):
     assert src_conv_state.shape == dst_conv_state.shape
     assert src_ssm_state.shape == dst_ssm_state.shape
+    if src_conv_state.device.type != "cuda":
+        dst_conv_state.copy_(src_conv_state)
+        dst_ssm_state.copy_(src_ssm_state)
+        return
 
     BLOCK = 4096
 
