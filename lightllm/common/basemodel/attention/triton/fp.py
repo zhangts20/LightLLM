@@ -5,7 +5,7 @@ from lightllm.platform.base.attention import register_att_backend
 from lightllm.common.basemodel.triton_kernel.mtp_utils import build_mtp_shared_group_markers
 
 
-@register_att_backend(name="triton", category="standard", platforms=("cuda", "maca"))
+@register_att_backend(name="triton", category="standard", platforms=("cuda", "musa", "maca"))
 class TritonAttBackend(BaseAttBackend):
     def create_att_prefill_state(self, infer_state) -> "TritonPrefillAttState":
         return TritonPrefillAttState(backend=self, infer_state=infer_state)

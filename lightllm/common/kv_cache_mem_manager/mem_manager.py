@@ -66,7 +66,9 @@ class MemoryManager:
         if self.size is not None:
             return
 
-        torch.cuda.empty_cache()
+        from lightllm.platform import get_backend
+
+        get_backend().runtime.empty_cache()
         world_size = dist.get_world_size()
         available_memory = get_available_gpu_memory(world_size) - get_total_gpu_memory() * (1 - mem_fraction)
         cell_size = self.get_cell_size()
