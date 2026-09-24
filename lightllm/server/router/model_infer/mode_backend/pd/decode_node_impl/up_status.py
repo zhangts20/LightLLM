@@ -91,7 +91,13 @@ class UpStatusManager:
                             if pd_master_obj.node_id in self.id_to_handle_queue:
                                 task_queue = self.id_to_handle_queue[pd_master_obj.node_id]
                                 upkv_status: PDUpKVStatus = await task_queue.get()
-                                await websocket.send(pickle.dumps(upkv_status))
+                                try:
+                                    await websocket.send(pickle.dumps(upkv_status))
+                                except BaseException:
+                                    # 连接可能在阻塞等待期间已经断开。状态已出队，不放回的话
+                                    # prefill 会一直等到 pd_event 超时。
+                                    task_queue.put_nowait(upkv_status)
+                                    raise
                                 logger.info(f"up kv status: {upkv_status}")
                             else:
                                 await asyncio.sleep(3)

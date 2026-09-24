@@ -107,7 +107,7 @@ def reduce_tensor(tensor):
 
     storage = tensor._typed_storage()
 
-    if storage._untyped_storage.device.type == "cuda":
+    if storage._untyped_storage.device.type in ("cuda", "musa"):
         (
             device,
             handle,

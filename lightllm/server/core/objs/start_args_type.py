@@ -22,7 +22,7 @@ class StartArgs:
     pd_master_ip: str = field(default="0.0.0.0")
     pd_master_port: int = field(default=1212)
     pd_master_mode: str = field(default="elastic")
-    pd_trans_mode: str = field(default="nccl", metadata={"choices": ["nccl", "nixl"]})
+    pd_trans_mode: str = field(default="nccl", metadata={"choices": ["nccl", "nixl", "mooncake"]})
     config_server_host: str = field(default=None)
     config_server_port: int = field(default=None)
     config_server_visual_redis_port: int = field(default=None)

@@ -16,6 +16,7 @@ from lightllm.server.router.model_infer.mtp_speculative.engine import SpecEngine
 from lightllm.server.router.model_infer.mtp_speculative import utils as mtp_utils
 from lightllm.server.router.model_infer.mtp_speculative.proposers.base import MtpMemIndexesToFree
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.device_utils import is_musa
 from lightllm.utils.dist_utils import get_current_device_id
 from .control_state import ControlState
 from lightllm.utils.envs_utils import get_env_start_args
@@ -130,6 +131,11 @@ class ChunkedPrefillBackend(ModeBackend):
         event_pack.notify_post_handle_and_wait_pre_post_handle()
         update_packs = self._pre_post_handle(run_reqs, is_chuncked_mode=not self.disable_chunked_prefill)
 
+        # MUSA 上另一个线程被放开后会立刻 broadcast。本步 allreduce 还在
+        # overlap stream 上时，两条集合通信打进同一个 MCCL 组，decode 会卡住。
+        if is_musa():
+            sync_event.synchronize()
+
         # 第三阶段
         event_pack.notify_forward_and_wait_post_handle()
         sync_event.synchronize()
@@ -168,6 +174,9 @@ class ChunkedPrefillBackend(ModeBackend):
         # 第二阶段
         event_pack.notify_post_handle_and_wait_pre_post_handle()
         update_packs = self._pre_post_handle(run_reqs, is_chuncked_mode=False)
+
+        if is_musa():
+            sync_event.synchronize()
 
         # 第三阶段
         event_pack.notify_forward_and_wait_post_handle()
@@ -225,6 +234,9 @@ class ChunkedPrefillBackend(ModeBackend):
         # 第二阶段
         event_pack.notify_post_handle_and_wait_pre_post_handle()
         update_packs = self._pre_post_handle(run_reqs, is_chuncked_mode=not self.disable_chunked_prefill)
+
+        if is_musa():
+            sync_event.synchronize()
 
         # 第三阶段
         event_pack.notify_forward_and_wait_post_handle()
@@ -342,6 +354,9 @@ class ChunkedPrefillBackend(ModeBackend):
         verify_ok_reqs = [req for req, accepted in zip(run_reqs, accepted_index_cpu.tolist()) if accepted]
 
         update_packs = self._pre_post_handle(verify_ok_reqs, is_chuncked_mode=False)
+
+        if is_musa():
+            sync_event.synchronize()
 
         # 第三阶段
         event_pack.notify_forward_and_wait_post_handle()

@@ -73,7 +73,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--pd_trans_mode",
         type=str,
-        choices=["nccl", "nixl"],
+        choices=["nccl", "nixl", "mooncake"],
         default="nccl",
         help="KV transfer backend for PD disaggregation; default: nccl",
     )
