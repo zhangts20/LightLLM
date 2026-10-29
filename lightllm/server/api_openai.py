@@ -180,6 +180,15 @@ def _is_force_thinking_mode(request: ChatCompletionRequest) -> bool:
     return True  # default
 
 
+def _get_guided_reasoning_end(request: ChatCompletionRequest, tokenizer) -> List[int]:
+    """Return the generated delimiter after which output constraints become active."""
+    if not _is_force_thinking_mode(request):
+        return []
+    parser_name = get_env_start_args().reasoning_parser
+    detector = ReasoningParser.DetectorMap[parser_name.lower()]()
+    return tokenizer.encode(detector.grammar_start_token, add_special_tokens=False)
+
+
 def _process_reasoning_stream(
     index: int,
     delta: str,
@@ -363,6 +372,15 @@ async def chat_completions_impl(request: ChatCompletionRequest, raw_request: Req
                 sampling_params_dict["guided_json"] = json.dumps(obj.json_schema)
         elif request.response_format.type == "json_object":
             sampling_params_dict["guided_grammar"] = "json"
+
+        if get_env_start_args().output_constraint_mode == "xgrammar" and (
+            sampling_params_dict.get("regular_constraint")
+            or sampling_params_dict.get("guided_json")
+            or sampling_params_dict.get("guided_grammar")
+        ):
+            sampling_params_dict["guided_reasoning_end"] = _get_guided_reasoning_end(
+                request, g_objs.httpserver_manager.tokenizer
+            )
 
     sampling_params = SamplingParams()
     sampling_params.init(tokenizer=g_objs.httpserver_manager.tokenizer, **sampling_params_dict)

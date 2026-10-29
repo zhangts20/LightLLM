@@ -1,11 +1,16 @@
 import torch
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
 from lightllm.utils.envs_utils import get_env_start_args
 
 
-def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
+def sample(
+    logits: torch.Tensor,
+    reqs: List[InferReq],
+    eos_id: List[int] = [2],
+    post_penalty_mask_func: Optional[Callable[[torch.Tensor], None]] = None,
+):
     (
         b_req_idx,
         b_temperatures,
@@ -84,6 +89,9 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
         )
 
     logits.div_(b_temperatures.view((-1, 1)))
+    if post_penalty_mask_func is not None:
+        # Hard output constraints must be applied after penalties and temperature.
+        post_penalty_mask_func(logits)
     probs = torch.softmax(logits, dim=-1)
 
     if is_all_greedy:

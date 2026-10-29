@@ -465,6 +465,7 @@ class InferSamplingParams:
         self.regular_constraint = self.shm_param.regular_constraint.to_str()
         self.guided_grammar = self.shm_param.guided_grammar.to_str()
         self.guided_json = self.shm_param.guided_json.to_str()
+        self.guided_reasoning_end = self.shm_param.guided_reasoning_end.to_list()
         if len(self.regular_constraint) == 0:
             self.regular_constraint = None
         if len(self.guided_grammar) == 0:

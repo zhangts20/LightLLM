@@ -295,7 +295,11 @@ class ReqSamplingParamsManager:
             constrained_req_ids = [
                 req.req_idx
                 for req in reqs
-                if req.sampling_param.guided_grammar is not None or req.sampling_param.guided_json is not None
+                if (
+                    req.sampling_param.regular_constraint is not None
+                    or req.sampling_param.guided_grammar is not None
+                    or req.sampling_param.guided_json is not None
+                )
             ]
         elif b_req_idx.numel() == 0:
             constrained_req_ids = []
