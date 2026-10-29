@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 import triton
 import triton.language as tl
@@ -41,8 +42,10 @@ def apply_constraint_mask(
     req_to_bitmask_enabled: torch.Tensor,
     vocab_size: int,
 ) -> None:
-    assert logits.is_cuda and logits.stride(1) == 1
-    assert req_to_bitmask.is_cuda and req_to_bitmask_enabled.is_cuda
+    assert get_backend().runtime.is_device_tensor(logits) and logits.stride(1) == 1
+    assert get_backend().runtime.is_device_tensor(req_to_bitmask) and get_backend().runtime.is_device_tensor(
+        req_to_bitmask_enabled
+    )
     if logits.shape[0] == 0:
         return
     block_size = 4096

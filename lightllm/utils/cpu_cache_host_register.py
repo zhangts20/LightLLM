@@ -2,6 +2,7 @@ import os
 import ctypes
 import ctypes.util
 import threading
+import re
 import torch
 from typing import Callable, Dict
 from lightllm.utils.dist_utils import get_current_device_id
@@ -22,7 +23,7 @@ _maca_patch_lock = threading.Lock()
 
 
 def patch_mc_host_register_gpu_free_check(soname: str = "libmcruntime.so") -> int:
-    """ 跳过本进程 mcHostRegister 里「空闲显存必须大于注册长度」的比较。 """
+    """跳过本进程 mcHostRegister 里「空闲显存必须大于注册长度」的比较。"""
     with _maca_patch_lock:
         regions = []
         with open("/proc/self/maps") as f:
@@ -68,7 +69,6 @@ def patch_mc_host_register_gpu_free_check(soname: str = "libmcruntime.so") -> in
 
 
 class HostRegisterOps:
-
     def registration_chunk_bytes(self, size: int) -> int:
         # 在 CUDA 中分段注册后的设备地址仍然连续
         return 128 * 1024 * 1024
@@ -108,9 +108,7 @@ def get_host_register_worker() -> HostRegisterOps:
 
 @register_host_register_worker("cuda")
 def _cuda_ops() -> HostRegisterOps:
-
     class CudaHostRegisterOps(HostRegisterOps):
-
         def __init__(self):
             cuda = ctypes.CDLL("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so")
             cuda.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
@@ -135,9 +133,7 @@ def _cuda_ops() -> HostRegisterOps:
             res = self.cuda.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
             if res != 0:
                 raise Exception(f"cudaHostGetDevicePointer failed with error code {res}")
-            logger.info(
-                f"cudaHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}"
-            )
+            logger.info(f"cudaHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}")
             return device_ptr.value
 
     return CudaHostRegisterOps()
@@ -145,9 +141,7 @@ def _cuda_ops() -> HostRegisterOps:
 
 @register_host_register_worker("ascend")
 def _npu_ops() -> HostRegisterOps:
-
     class AscendHostRegisterOps(HostRegisterOps):
-
         def __init__(self):
             import acl
 
@@ -170,44 +164,56 @@ def _npu_ops() -> HostRegisterOps:
 
 @register_host_register_worker("maca")
 def _metax_ops() -> HostRegisterOps:
-
     class MacaHostRegisterOps(HostRegisterOps):
-
         def __init__(self):
-            mc = ctypes.CDLL(os.path.join(os.getenv("MACA_PATH", "/opt/maca"), "lib/libmcruntime.so"))
-            mc.mcHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-            mc.mcHostRegister.restype = ctypes.c_int
-            mc.mcHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_int]
-            mc.mcHostGetDevicePointer.restype = ctypes.c_int
+            root = os.getenv("MACA_PATH", "/opt/maca")
+            release = re.match(r"(\d+)\.(\d+)", str(getattr(torch.version, "maca", "")))
+            self.whole_region = release is not None and tuple(map(int, release.groups())) >= (3, 8)
+            compatibility_library = os.path.join(root, "lib64/libsymbol_cu.so")
+            if not os.path.isfile(compatibility_library):
+                compatibility_library = os.path.join(root, "lib/libsymbol_cu.so")
+            if self.whole_region and os.path.isfile(compatibility_library):
+                mc = ctypes.CDLL(compatibility_library)
+                prefix = "cuda"
+            else:
+                mc = ctypes.CDLL(os.path.join(root, "lib/libmcruntime.so"))
+                prefix = "mc"
+            self._register = getattr(mc, prefix + "HostRegister")
+            self._register.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+            self._register.restype = ctypes.c_int
+            self._get_pointer = getattr(mc, prefix + "HostGetDevicePointer")
+            self._get_pointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_int]
+            self._get_pointer.restype = ctypes.c_int
             self.mc = mc
             self.flag = 3
             self.device_id = get_current_device_id()
             torch.cuda.set_device(self.device_id)
-            patch_mc_host_register_gpu_free_check()
+            if not self.whole_region:
+                patch_mc_host_register_gpu_free_check()
 
         def registration_chunk_bytes(self, size: int) -> int:
-            # 段长由 MACA_HOST_REGISTER_LIMIT_GB 控制，分段后的设备地址不连续。
+            # MACA 3.8 maps a whole registration; splitting it can alias windows.
+            if self.whole_region:
+                return size
             return min(size, MACA_HOST_REGISTER_LIMIT_BYTES)
 
         def host_register_mappings_are_contiguous(self) -> bool:
-            return False
+            return self.whole_region
 
         def register_segment(self, shm_ptr: int, offset: int, seg_len: int) -> None:
             torch.cuda.set_device(self.device_id)
             ptr = ctypes.c_void_p(shm_ptr + offset)
-            r = self.mc.mcHostRegister(ptr, ctypes.c_size_t(seg_len), self.flag)
+            r = self._register(ptr, ctypes.c_size_t(seg_len), self.flag)
             if r != 0:
                 raise Exception(f"mcHostRegister failed with error code {r}, prefer to use hugetlb")
 
         def get_device_ptr(self, shm_ptr: int) -> int:
             device_ptr = ctypes.c_void_p()
             host_ptr = ctypes.c_void_p(shm_ptr)
-            res = self.mc.mcHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
+            res = self._get_pointer(ctypes.byref(device_ptr), host_ptr, 0)
             if res != 0:
                 raise Exception(f"mcHostGetDevicePointer failed with error code {res}")
-            logger.info(
-                f"mcHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}"
-            )
+            logger.info(f"mcHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}")
             return device_ptr.value
 
     return MacaHostRegisterOps()
@@ -215,9 +221,7 @@ def _metax_ops() -> HostRegisterOps:
 
 @register_host_register_worker("musa")
 def _musa_ops() -> HostRegisterOps:
-
     class MusaHostRegisterOps(HostRegisterOps):
-
         def __init__(self):
             import torch_musa  # noqa: F401
 
@@ -246,9 +250,7 @@ def _musa_ops() -> HostRegisterOps:
             res = self.musa.musaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
             if res != 0:
                 raise Exception(f"musaHostGetDevicePointer failed with error code {res}")
-            logger.info(
-                f"musaHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}"
-            )
+            logger.info(f"musaHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}")
             return device_ptr.value
 
     return MusaHostRegisterOps()
@@ -256,7 +258,6 @@ def _musa_ops() -> HostRegisterOps:
 
 @register_host_register_worker("mlu")
 def _mlu_ops() -> HostRegisterOps:
-
     class _CnrtPointerAttributes(ctypes.Structure):
         _fields_ = [
             ("type", ctypes.c_int),
@@ -269,7 +270,6 @@ def _mlu_ops() -> HostRegisterOps:
         ]
 
     class MluHostRegisterOps(HostRegisterOps):
-
         def __init__(self):
             import torch_mlu  # noqa: F401
 
@@ -310,9 +310,7 @@ def _mlu_ops() -> HostRegisterOps:
             res = self.cnrt.cnrtPointerGetAttributes(ctypes.byref(attr), ctypes.c_void_p(shm_ptr))
             if res != 0 or not attr.devicePointer:
                 return shm_ptr
-            logger.info(
-                f"cnrtPointerGetAttributes success, host_ptr={shm_ptr}, device_ptr={attr.devicePointer}"
-            )
+            logger.info(f"cnrtPointerGetAttributes success, host_ptr={shm_ptr}, device_ptr={attr.devicePointer}")
             return attr.devicePointer
 
     return MluHostRegisterOps()

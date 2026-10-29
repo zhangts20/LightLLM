@@ -1,7 +1,24 @@
 import torch
 
 
+class _RawDevicePtrHolder:
+    """Expose a device pointer without retaining the allocation it references."""
+
+    def __init__(self, device_ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (device_ptr, False),
+            "version": 3,
+            "strides": None,
+        }
+
+
 def ptr_to_tensor(device_ptr: int, nbytes: int) -> torch.Tensor:
+    from lightllm.utils.device_utils import is_maca
+
+    if is_maca():
+        return torch.as_tensor(_RawDevicePtrHolder(device_ptr, nbytes), device="cuda")
     import cupy as cp
 
     mem = cp.cuda.UnownedMemory(device_ptr, nbytes, owner=None)

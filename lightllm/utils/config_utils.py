@@ -195,10 +195,23 @@ def _get_config_llm_keyvalue(model_path: str, key_name: list[str]):
                 value = config_json["llm_config"][key]
             except:
                 value = config_json.get("text_config", {}).get(key)
-        if config_json.get("thinker_config") is not None:
-            value = config_json.get("thinker_config", {}).get("text_config").get(key)
+        thinker_config = config_json.get("thinker_config")
+        if isinstance(thinker_config, dict):
+            thinker_text_config = thinker_config.get("text_config")
+            if isinstance(thinker_text_config, dict):
+                value = thinker_text_config.get(key, value)
         if value is not None:
             return value
+
+    # HF LLaVA checkpoints may omit values that are defaults of LlamaConfig.
+    if config_json.get("model_type") == "llava" and "text_config" in config_json:
+        from transformers import AutoConfig
+
+        text_config = AutoConfig.from_pretrained(model_path, local_files_only=True).text_config
+        for key in key_name:
+            value = getattr(text_config, key, None)
+            if value is not None:
+                return value
 
     logger.error(f"cannot get {key_name} from config.json, return None")
 
@@ -280,7 +293,7 @@ def get_eos_token_ids(model_path: str) -> Optional[List[int]]:
     try:
         config_json = get_config_json(model_path)
         model_type = config_json.get("model_type") or config_json.get("text_config", {}).get("model_type")
-        if model_type in {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}:
+        if model_type in {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "minicpmv4_6", "llava"}:
             from transformers import AutoTokenizer
 
             eos_token_ids = []
@@ -416,8 +429,7 @@ def get_vocab_size(model_path: str):
         vocab_size = _get_vocab_size_from_tokenizer(model_path)
         if vocab_size is not None:
             logger.warning(
-                f"vocab_size missing in config.json for {model_path}, "
-                f"using tokenizer vocab_size={vocab_size}"
+                f"vocab_size missing in config.json for {model_path}, " f"using tokenizer vocab_size={vocab_size}"
             )
             return vocab_size
     except Exception as e:
@@ -489,6 +501,8 @@ def has_vision_module(model_path: str) -> bool:
             return True
         elif model_type in ["qwen3_5", "qwen3_5_moe"]:
             return True
+        elif model_type == "minicpmv4_6":
+            return model_cfg.get("vision_config") is not None
         else:
             raise Exception("unknown vision model type")
     except:
@@ -526,7 +540,7 @@ def is_linear_att_mixed_model(model_path: str) -> bool:
 
         model_cfg, _ = PretrainedConfig.get_config_dict(model_path)
         model_type = model_cfg["model_type"]
-        if model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"]:
+        if model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text", "minicpmv4_6"]:
             return True
         else:
             return False
@@ -559,7 +573,7 @@ def get_tool_call_parser_for_model(model_path: str) -> Optional[str]:
         return None
 
     # Qwen3.5 series
-    if model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"]:
+    if model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text", "minicpmv4_6"]:
         return "qwen3_coder"
 
     # Qwen3 series

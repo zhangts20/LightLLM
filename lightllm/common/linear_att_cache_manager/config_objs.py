@@ -111,10 +111,7 @@ class LinearAttCacheConfig:
             assert self.full_att_head_dim % group == 0
             per_token = (
                 2 * self.full_att_all_num_kv_heads * self.full_att_head_dim
-                + 2
-                * self.full_att_all_num_kv_heads
-                * (self.full_att_head_dim // group)
-                * self.full_att_dtype.itemsize
+                + 2 * self.full_att_all_num_kv_heads * (self.full_att_head_dim // group) * self.full_att_dtype.itemsize
             )
         else:
             per_token = 2 * self.full_att_all_num_kv_heads * self.full_att_head_dim * self.full_att_dtype.itemsize
@@ -137,7 +134,7 @@ class LinearAttCacheConfig:
 
         model_cfg, _ = PretrainedConfig.get_config_dict(model_path)
         model_type = model_cfg["model_type"]
-        assert model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"]
+        assert model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text", "minicpmv4_6"]
         llm_config = model_cfg
         try:
             llm_config = llm_config["text_config"]

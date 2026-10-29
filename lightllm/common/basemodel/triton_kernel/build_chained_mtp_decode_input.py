@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 import triton
 import triton.language as tl
@@ -45,10 +46,10 @@ def build_chained_mtp_decode_input_inplace(
     ``d0``，覆盖后该请求的下一层输入就是 ``[m1, m2, d0]``。
     """
 
-    assert input_ids.is_cuda
-    assert draft_token_ids.is_cuda
-    assert b_req_mtp_start_loc.is_cuda
-    assert accept_len.is_cuda
+    assert get_backend().runtime.is_device_tensor(input_ids)
+    assert get_backend().runtime.is_device_tensor(draft_token_ids)
+    assert get_backend().runtime.is_device_tensor(b_req_mtp_start_loc)
+    assert get_backend().runtime.is_device_tensor(accept_len)
     assert input_ids.shape == draft_token_ids.shape
     assert b_req_mtp_start_loc.shape == accept_len.shape
     assert input_ids.dtype == draft_token_ids.dtype

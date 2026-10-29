@@ -452,6 +452,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         num_warps = 1
         num_stages = 1 if T == 1 else 3
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    fuse_gating = A_log is not None
 
     if out is not None:
         o = out.unsqueeze(0) if out.ndim == v.ndim else out

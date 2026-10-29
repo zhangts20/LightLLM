@@ -5,7 +5,17 @@ from typing import Any, Optional, ContextManager, Tuple, Union
 
 
 class BackendRuntime(ABC):
-    
+    def copy_tensors(self, destinations: list[torch.Tensor], sources: list[torch.Tensor]) -> None:
+        """Refresh graph inputs while preserving each tensor's storage."""
+        if len(destinations) != len(sources):
+            raise ValueError("Source and destination tensor counts must match")
+        for destination, source in zip(destinations, sources):
+            destination.copy_(source, non_blocking=True)
+
+    def is_device_tensor(self, tensor: torch.Tensor) -> bool:
+        """Check accelerator placement without relying on CUDA-only properties."""
+        return tensor.device.type == self.device_type
+
     @property
     @abstractmethod
     def device_type(self) -> str:
@@ -82,9 +92,7 @@ class BackendRuntime(ABC):
             raise ValueError(f"Invalid device: {device}")
 
         if _device.type != self.device_type:
-            raise ValueError(
-                f"Expected device type {self.device_type!r}, got {_device.type!r} ({_device})"
-            )
+            raise ValueError(f"Expected device type {self.device_type!r}, got {_device.type!r} ({_device})")
         return _device
 
     @abstractmethod

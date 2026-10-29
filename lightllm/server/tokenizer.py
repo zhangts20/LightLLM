@@ -122,6 +122,14 @@ def get_tokenizer(
         tokenizer = QWen3_5Tokenizer(
             tokenizer=tokenizer, image_processor=processor.image_processor, model_cfg=model_cfg
         )
+    elif model_type == "minicpmv4_6":
+        from transformers import AutoProcessor
+        from lightllm.models.minicpmv4_6.tokenizer import MiniCPMV4_6Tokenizer
+
+        processor = AutoProcessor.from_pretrained(tokenizer_name)
+        tokenizer = MiniCPMV4_6Tokenizer(
+            tokenizer=tokenizer, image_processor=processor.image_processor, model_cfg=model_cfg
+        )
     elif model_cfg.get("thinker_config") is not None:
         from transformers import AutoProcessor
 

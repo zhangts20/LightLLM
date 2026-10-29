@@ -1,6 +1,7 @@
 import threading
 
 import torch
+from lightllm.platform import get_backend
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING, Tuple, Union, Dict
@@ -146,11 +147,14 @@ class BaseDecodeAttState(ABC):
         pass
 
     def copy_for_decode_cuda_graph(self, new_state: "BaseDecodeAttState"):
+        destinations, sources = [], []
         for attr_name, attr_value in vars(new_state).items():
             if isinstance(attr_value, torch.Tensor):
                 attr_ = getattr(self, attr_name, None)
                 if attr_ is not None and attr_.data_ptr() != attr_value.data_ptr():
-                    attr_.copy_(attr_value, non_blocking=True)
+                    destinations.append(attr_)
+                    sources.append(attr_value)
+        get_backend().runtime.copy_tensors(destinations, sources)
 
     @abstractmethod
     def decode_att(

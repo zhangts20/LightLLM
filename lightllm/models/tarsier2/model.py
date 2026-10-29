@@ -130,7 +130,13 @@ class Tarsier2Qwen2VLTpPartModel(Qwen2VLTpPartModel):
         return
 
 
-@ModelRegistry("llava", condition=llm_model_type_is("llama"))
+def _is_tarsier_llava_config(model_cfg: dict) -> bool:
+    if not llm_model_type_is("llama")(model_cfg):
+        return False
+    return any(str(architecture).startswith("Tarsier") for architecture in (model_cfg.get("architectures") or []))
+
+
+@ModelRegistry("llava", condition=_is_tarsier_llava_config)
 class Tarsier2LlamaTpPartModel(LlamaTpPartModel):
 
     pre_and_post_weight_class = Tarsier2LlamaPreAndPostLayerWeight
