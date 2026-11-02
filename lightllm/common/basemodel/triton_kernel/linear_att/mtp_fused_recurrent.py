@@ -16,9 +16,14 @@ import triton
 import triton.language as tl
 
 from lightllm.common.triton_utils.autotuner import autotune
+from lightllm.platform import get_backend
 
 
 def _mtp_configs():
+    if get_backend().name == "maca":
+        return [
+            {"BV": bv, "num_warps": w, "num_stages": 1} for bv in (8, 16, 32, 64) for w in (1, 2, 4)
+        ]
     return [{"num_warps": w, "num_stages": s} for w in (1, 2, 4) for s in (1, 2, 3)]
 
 
@@ -339,6 +344,15 @@ def mtp_fused_recurrent_gated_delta_rule(
         BV = min(triton.next_power_of_2(V), 64)
         num_warps = 4
         num_stages = 1
+    elif get_backend().name == "maca":
+        if run_config is None:
+            BV = min(triton.next_power_of_2(V), 16)
+            num_warps = 1
+            num_stages = 1
+        else:
+            BV = min(int(run_config["BV"]), triton.next_power_of_2(V))
+            num_warps = int(run_config["num_warps"])
+            num_stages = int(run_config["num_stages"])
     else:
         BV = min(triton.next_power_of_2(V), 8)
         if run_config is None:
