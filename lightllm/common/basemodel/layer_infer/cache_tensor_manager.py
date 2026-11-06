@@ -60,7 +60,10 @@ if torch.__version__ >= "2.1.0" and (not _disable_gpu_tensor_cache):
             from lightllm.platform import get_backend
 
             if get_backend().name == "ascend":
-                from torch_npu._C import _storage_Use_Count as use_count
+                import torch_npu
+
+                # Newer TorchNPU uses the upstream storage implementation.
+                use_count = getattr(torch_npu._C, "_storage_Use_Count", torch._C._storage_Use_Count)
             else:
                 from torch._C import _storage_Use_Count as use_count
             self.use_count = use_count

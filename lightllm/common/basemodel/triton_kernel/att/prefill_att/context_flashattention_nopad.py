@@ -30,6 +30,13 @@ def _prefill_block_n(block_m: int, head_dim: int) -> int:
     return block_m
 
 
+def _prefill_num_warps(head_dim: int) -> int:
+    platform = get_backend().name
+    if platform == "mlu":
+        return 1
+    return 4 if head_dim <= 64 or platform == "maca" else 8
+
+
 @triton.jit
 def _fwd_kernel(
     Q,
@@ -191,7 +198,7 @@ def context_attention_fwd(
     grid = lambda meta: (triton.cdiv(max_input_len, meta["BLOCK_M"]), batch * head, 1)
 
     BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
-    num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
+    num_warps = _prefill_num_warps(Lk)
     num_stages = 1
 
     if sliding_window == (-1, -1):
@@ -371,7 +378,7 @@ def context_attention_fwd_no_prompt_cache(q, k, v, o, b_start_loc, b_seq_len, ma
 
     grid = (triton.cdiv(max_input_len, BLOCK_M), batch * head, 1)
     BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
-    num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
+    num_warps = _prefill_num_warps(Lk)
     num_stages = 1
 
     _fwd_kernel_no_prompt_cache[grid](
@@ -550,7 +557,7 @@ def context_attention_fwd_contiguous_kv(
 
     grid = lambda meta: (triton.cdiv(max_q_input_len, meta["BLOCK_M"]), batch * head, 1)
     BLOCK_N = _prefill_block_n(BLOCK_M, Lk)
-    num_warps = 4 if (Lk <= 64 or get_backend().name == "maca") else 8
+    num_warps = _prefill_num_warps(Lk)
     num_stages = 1
 
     _fwd_kernel_contiguous_kv[grid](

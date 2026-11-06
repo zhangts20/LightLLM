@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 import triton
 import triton.language as tl
@@ -44,12 +45,12 @@ def scatter_prompt_logprobs_to_cpu(
     max_topk: int,
 ) -> None:
     token_count, topk = top_token_ids.shape
-    assert mem_indexes.is_cuda and mem_indexes.is_contiguous()
+    assert get_backend().runtime.is_device_tensor(mem_indexes) and mem_indexes.is_contiguous()
     assert mem_indexes.dtype in (torch.int32, torch.int64)
     assert mem_indexes.numel() == token_count
-    assert top_token_ids.is_cuda and top_token_ids.is_contiguous()
+    assert get_backend().runtime.is_device_tensor(top_token_ids) and top_token_ids.is_contiguous()
     assert top_token_ids.dtype == torch.int32
-    assert top_logprobs.is_cuda and top_logprobs.is_contiguous()
+    assert get_backend().runtime.is_device_tensor(top_logprobs) and top_logprobs.is_contiguous()
     assert top_logprobs.dtype == torch.float32
     assert top_logprobs.shape == top_token_ids.shape
     assert 0 < topk <= max_topk

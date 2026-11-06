@@ -59,12 +59,12 @@ class LlamaMultimodalPreLayerInfer(LlamaPreLayerInfer):
             f"but image embed dimension is {cpu_embed_cache_tensor.shape[2]}"
         )
         # each tp will fill the img embeds, should divide by world_size
-        img_start_token_ids = torch.tensor(
-            img_start_token_ids, dtype=torch.long, device="cpu", pin_memory=True
-        ).to(device=self.target_device, non_blocking=True)
-        img_token_lens = torch.tensor(
-            img_token_lens, dtype=torch.long, device="cpu", pin_memory=True
-        ).to(device=self.target_device, non_blocking=True)
+        img_start_token_ids = torch.tensor(img_start_token_ids, dtype=torch.long, device="cpu", pin_memory=True).to(
+            device=self.target_device, non_blocking=True
+        )
+        img_token_lens = torch.tensor(img_token_lens, dtype=torch.long, device="cpu", pin_memory=True).to(
+            device=self.target_device, non_blocking=True
+        )
         img_start_locs_in_cache = torch.tensor(
             img_start_locs_in_cache, dtype=torch.long, device="cpu", pin_memory=True
         ).to(device=self.target_device, non_blocking=True)
@@ -95,7 +95,7 @@ class LlamaMultimodalPreLayerInfer(LlamaPreLayerInfer):
         """
         方便子类继承修改多模态的embed计算的细节实现方式。
         """
-        multimodal_emb(
+        self.platform_backend.ops.multimodal_emb(
             out=out,
             prompt_ids=input_ids,
             text_weight_embs=layer_weight.wte_weight_.weight,

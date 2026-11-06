@@ -93,6 +93,15 @@ class VisualModelRpcServer(rpyc.Service):
                 self.model = (
                     Qwen3VisionTransformerPretrainedModel(kvargs, **model_cfg["vision_config"]).eval().bfloat16()
                 )
+            elif self.model_type == "minicpmv4_6":
+                from lightllm.models.minicpmv4_6.visual import MiniCPMV4_6VisionModel
+
+                self.model = MiniCPMV4_6VisionModel(
+                    kvargs,
+                    vision_config=model_cfg["vision_config"],
+                    text_hidden_size=model_cfg["text_config"]["hidden_size"],
+                    downsample_mode=model_cfg.get("downsample_mode", "16x"),
+                ).eval()
             elif model_cfg["architectures"][0] == "TarsierForConditionalGeneration":
                 self.model = TarsierVisionTransformerPretrainedModel(**model_cfg).eval().bfloat16()
             elif self.model_type == "llava":

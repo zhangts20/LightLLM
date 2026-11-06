@@ -15,6 +15,8 @@ logger = init_logger(__name__)
 
 @lru_cache(maxsize=None)
 def is_tesla():
+    if not is_nvidia():
+        return False
     try:
         return "Tesla" in torch.cuda.get_device_name(0)
     except AssertionError:
@@ -24,6 +26,8 @@ def is_tesla():
 
 @lru_cache(maxsize=None)
 def is_hopper():
+    if not is_nvidia():
+        return False
     return (
         "H100" in torch.cuda.get_device_name(0)
         or "H200" in torch.cuda.get_device_name(0)
@@ -34,6 +38,8 @@ def is_hopper():
 
 @lru_cache(maxsize=None)
 def is_4090():
+    if not is_nvidia():
+        return False
     return "4090" in torch.cuda.get_device_name(0) or "RTX 4090" in torch.cuda.get_device_name(0)
 
 
@@ -48,7 +54,7 @@ def get_device_sm_count():
 
 @lru_cache(maxsize=None)
 def is_sm100_gpu():
-    return torch.cuda.get_device_capability()[0] == 10
+    return is_nvidia() and torch.cuda.get_device_capability()[0] == 10
 
 
 @lru_cache(maxsize=None)
@@ -100,12 +106,18 @@ def is_musa():
 
 
 @lru_cache(maxsize=1)
+def is_maca():
+    return getattr(torch.version, "maca", None) is not None
+
+
+@lru_cache(maxsize=1)
 def is_nvidia():
     ans = (
         torch.cuda.is_available()
         and getattr(torch.version, "cuda", None) is not None
         and getattr(torch.version, "hip", None) is None
         and not is_musa()
+        and not is_maca()
     )
     logger.info(f"device is_nvidia : {ans}")
     return ans
@@ -136,13 +148,13 @@ def init_p2p(device_index):
     """
     torch 调用跨卡的to操作后，triton编译的算子便能自动操作跨卡tensor。
     """
-    num_gpus = get_backend().runtime.device_count()
-    tensor = torch.zeros((1,))
-    tensor = tensor.to(f"cuda:{device_index}")
+    runtime = get_backend().runtime
+    num_gpus = runtime.device_count()
+    tensor = torch.zeros((1,), device=runtime.target_device(device_index))
     for j in range(num_gpus):
-        tensor.to(f"cuda:{j}")
+        tensor.to(runtime.target_device(j))
 
-    torch.cuda.empty_cache()
+    runtime.empty_cache()
     return
 
 

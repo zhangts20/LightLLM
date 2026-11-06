@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import functools
 
 import torch
@@ -73,7 +74,7 @@ def _hadamard_transform_triton(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    assert x.is_cuda, "hadamard_transform only supports CUDA tensors"
+    assert get_backend().runtime.is_device_tensor(x), "hadamard_transform only supports CUDA tensors"
     assert x.dtype == torch.bfloat16, "hadamard_transform expects bfloat16 input"
     assert x.size(-1) == 128, "DeepSeek-V3.2 Hadamard transform expects hidden size 128"
 

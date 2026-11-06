@@ -49,6 +49,7 @@ indexes 导出。
            ▼
     final_token_metadata shm  ──HTTP──►  response["prompt_logprobs"]
 """
+from lightllm.platform import get_backend
 
 import os
 from typing import ClassVar, Optional, Tuple
@@ -149,7 +150,7 @@ class PromptLogprobsCaptureManager:
     def extract(self, mem_indexes: torch.Tensor, topk: int) -> Tuple[np.ndarray, np.ndarray]:
         if not self.is_buffer_initialized():
             return
-        indexes = mem_indexes.cpu() if mem_indexes.is_cuda else mem_indexes
+        indexes = mem_indexes.cpu() if get_backend().runtime.is_device_tensor(mem_indexes) else mem_indexes
         return (
             self.top_token_ids[indexes, :topk].numpy(),
             self.top_logprobs[indexes, :topk].numpy(),
@@ -163,7 +164,11 @@ class PromptLogprobsCaptureManager:
     ) -> None:
         if not self.is_buffer_initialized():
             return
-        source = source_indexes.cpu() if source_indexes.is_cuda else source_indexes
-        destination = destination_indexes.cpu() if destination_indexes.is_cuda else destination_indexes
+        source = source_indexes.cpu() if get_backend().runtime.is_device_tensor(source_indexes) else source_indexes
+        destination = (
+            destination_indexes.cpu()
+            if get_backend().runtime.is_device_tensor(destination_indexes)
+            else destination_indexes
+        )
         self.top_token_ids[destination, :topk] = self.top_token_ids[source, :topk]
         self.top_logprobs[destination, :topk] = self.top_logprobs[source, :topk]
