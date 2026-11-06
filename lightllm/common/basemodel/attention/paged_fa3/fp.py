@@ -337,6 +337,37 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             window_size=window_size, softcap=0.0,
         )
 
+    def _maca_kvcache_decode(self, q_bshd, k_cache, v_cache, sm_scale, window_size, alloc_func):
+        q_len = q_bshd.shape[1]
+        group = q_bshd.shape[2] // k_cache.shape[2]
+        if q_len > 1 and group > q_len:
+            out = alloc_func(q_bshd.shape, dtype=q_bshd.dtype, device=q_bshd.device)
+            for i in range(q_len):
+                seqlens_i = (self.b_att_seq_len - (q_len - 1 - i)).clamp_min(0)
+                out[:, i : i + 1] = maca_flash_attn_with_kvcache(
+                    q=q_bshd[:, i : i + 1],
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=self.page_table,
+                    cache_seqlens=seqlens_i,
+                    softmax_scale=sm_scale,
+                    causal=self.causal,
+                    window_size=window_size,
+                    softcap=0.0,
+                )
+            return out
+        return maca_flash_attn_with_kvcache(
+            q=q_bshd,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=self.page_table,
+            cache_seqlens=self.b_att_seq_len,
+            softmax_scale=sm_scale,
+            causal=self.causal,
+            window_size=window_size,
+            softcap=0.0,
+        )
+
     def _normal_decode_att(self, q, k, v, att_control: AttControl, alloc_func=torch.empty):
         if att_control.use_sliding_window:
             window_size = att_control.sliding_window
@@ -389,16 +420,10 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             q_bshd = q.view(
                 att_batch_size, self.decode_max_q_seq_len, q.shape[1], q.shape[2]
             )
-            output = maca_flash_attn_with_kvcache(
-                q=q_bshd,
-                k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
-                v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
-                block_table=self.page_table,
-                cache_seqlens=self.b_att_seq_len,
-                softmax_scale=sm_scale,
-                causal=self.causal,
-                window_size=window_size,
-                softcap=0.0,
+            k_cache = k.view(-1, self.backend.page_size, k.shape[1], k.shape[2])
+            v_cache = v.view(-1, self.backend.page_size, v.shape[1], v.shape[2])
+            output = self._maca_kvcache_decode(
+                q_bshd, k_cache, v_cache, sm_scale, window_size, alloc_func
             )
             return output.view_as(q)
         return flash_attn_with_kvcache(

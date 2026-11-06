@@ -15,6 +15,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .op import safe_exp
+from .utils import is_maca
 from lightllm.common.triton_utils.autotuner import autotune
 
 
@@ -174,6 +175,7 @@ def chunk_scaled_dot_kkt_fwd(
     num_stages = run_config.get("num_stages", 2)
 
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    launch_kwargs = {"scenario": "mla;fullstage"} if is_maca() else {}
     chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
         k=k,
         g=g,
@@ -189,5 +191,6 @@ def chunk_scaled_dot_kkt_fwd(
         BK=BK,
         num_warps=num_warps,
         num_stages=num_stages,
+        **launch_kwargs,
     )
     return A

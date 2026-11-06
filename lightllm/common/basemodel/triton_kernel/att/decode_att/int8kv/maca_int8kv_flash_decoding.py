@@ -27,21 +27,19 @@ def _q_rows(q_len: int, gqa: int) -> int:
     return max(16, _next_pow2(q_len * gqa))
 
 
-def _default_run_config(head_dim: int, page_size: Optional[int] = None) -> dict:
-    del head_dim
+def _default_run_config() -> dict:
     return {
         "BLOCK_N": 16,
-        "BLOCK_SEQ": page_size if page_size else 256,
-        "num_warps": 4,
+        "num_warps": 2,
         "num_stages": 2,
-        "scenario": "mla",
+        "scenario": "mla;cvt_shm_no_pad",
     }
 
 
 def _split_count(batch_size: int, max_kv_len: int, block_seq: int) -> int:
-    del batch_size
     needed = max(1, triton.cdiv(max(max_kv_len, 1), block_seq))
-    return max(1, min(needed, 512))
+    cap = 64 if batch_size >= 16 else 128
+    return max(1, min(needed, cap))
 
 
 @triton.jit
@@ -215,7 +213,7 @@ def _fwd_int8kv_decode_stage1(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_splits"])
 def _fwd_int8kv_decode_stage2(
     Mid_O,
     Mid_LSE,
@@ -275,10 +273,11 @@ def _fwd_int8kv_decode_stage2(
 def _int8_decode_configs():
     # BLOCK_N=128 needs 90112 bytes of shared memory; the C500 limit is 65536.
     return [
-        {"BLOCK_N": bn, "num_warps": w, "num_stages": s, "scenario": "mla"}
+        {"BLOCK_N": bn, "num_warps": w, "num_stages": s, "scenario": scen}
         for bn in (16, 32, 64)
-        for w in (2, 4, 8)
+        for w in (1, 2, 4, 8)
         for s in (1, 2)
+        for scen in ("mla", "mla;cvt_shm_no_pad")
     ]
 
 
@@ -348,20 +347,19 @@ def int8kv_flash_decode(
     if use_swa and sliding_window[1] not in (0, -1):
         raise NotImplementedError("right sliding window is not supported")
 
-    cfg = dict(_default_run_config(head_dim, page_size))
+    cfg = dict(_default_run_config())
     if run_config:
         cfg.update(run_config)
     # Split unit is one page; the unaligned page-walk path is gone.
-    block_seq = page_size
     block_n = int(cfg["BLOCK_N"])
-    while block_n > 0 and block_seq % block_n != 0:
+    while block_n > 0 and page_size % block_n != 0:
         block_n //= 2
     if block_n <= 0:
         raise ValueError(f"page_size={page_size} is not compatible with BLOCK_N")
 
     if max_kv_len is None:
         max_kv_len = int(cache_seqlens.max().item())
-    n_splits = int(cfg["n_splits"]) if cfg.get("n_splits") else _split_count(batch, max_kv_len, block_seq)
+    n_splits = int(cfg["n_splits"]) if cfg.get("n_splits") else _split_count(batch, max_kv_len, page_size)
     n_splits = max(1, n_splits)
 
     block_d = _align_block_d(head_dim, quant_group_size)
@@ -452,7 +450,8 @@ def int8kv_flash_decode(
         BLOCK_D=block_d,
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
-        num_warps=4,
+        num_warps=1,
         num_stages=1,
+        scenario="mla",
     )
     return out
