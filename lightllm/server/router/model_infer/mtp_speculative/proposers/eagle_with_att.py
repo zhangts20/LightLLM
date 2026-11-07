@@ -76,20 +76,6 @@ class EagleWithAttProposer(BaseSpecProposer):
         verify_draft_input = copy.copy(target_model_input)
         verify_draft_input.input_ids = target_next_token_ids
         verify_draft_input.mtp_draft_input_hiddens = target_model_output.mtp_collector.spec_hidden
-        # MACA INT8 attention can reuse the prefix across a fixed verify group.
-        # Keep this explicit per input: subsequent recurrent calls have only
-        # one row, and must not reuse the extension's grouped CUDA Graph.
-        args = getattr(draft_model, "args", None)
-        if (
-            getattr(getattr(draft_model, "decode_att_backend", None), "supports_grouped_eagle_extend", False)
-            and getattr(args, "mtp_mode", None) == "eagle_with_att"
-            and not args.mtp_dynamic_verify
-            and not args.enable_tpsp_mix_mode
-            and not args.enable_decode_microbatch_overlap
-        ):
-            width = args.mtp_step + 1
-            assert target_model_input.batch_size == req_num * width
-            verify_draft_input.decode_query_group_size = width
         extend_output = draft_model.forward(verify_draft_input)
 
         # 只在 req_num 行 logits 上进行 argmax，避免为未接受的 verify 行执行
@@ -142,7 +128,6 @@ class EagleWithAttProposer(BaseSpecProposer):
         max_kv_seq_len = target_model_input.max_kv_seq_len
         draft_input = copy.copy(target_model_input)
         draft_input.is_prefill = False
-        draft_input.decode_query_group_size = 1
         draft_input.batch_size = req_num
         draft_input.b_req_idx = selected_rows.b_req_idx
         draft_input.b_mtp_index = g_pin_mem_manager.get_const_gpu_tensor(

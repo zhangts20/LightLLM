@@ -657,31 +657,6 @@ class TpPartBaseModel:
         model_output.prefill_mem_indexes_ready_event = prefill_mem_indexes_ready_event
         return model_output
 
-    def _get_decode_graph(self, query_group_size: int):
-        if query_group_size == 1 or self.graph is None:
-            return self.graph
-        # The same physical row count can mean independent one-token requests
-        # or grouped verify rows. Never replay one layout's graph for the other.
-        graphs = getattr(self, "_grouped_decode_graphs", None)
-        if graphs is None:
-            graphs = self._grouped_decode_graphs = {}
-        if query_group_size not in graphs:
-            max_rows = self.graph_max_batch_size // query_group_size * query_group_size
-            if max_rows == 0:
-                return None
-            graphs[query_group_size] = DecodeGraph(
-                platform_backend=self.platform_backend.name,
-                batch_step_size_before_split=query_group_size,
-                split_batch_size=self.args.graph_split_batch_size * query_group_size,
-                batch_step_size_after_split=self.args.graph_grow_step_size * query_group_size,
-                max_batch_size=max_rows,
-                max_len_in_batch=self.graph_max_len_in_batch,
-                tp_world_size=self.tp_world_size_,
-            )
-        # Capture lazily on the first real extension. Recurrent one-row graphs
-        # retain their existing startup warmup and separate memory pool.
-        return graphs[query_group_size]
-
     def _decode(
         self,
         model_input: ModelInput,
@@ -705,7 +680,6 @@ class TpPartBaseModel:
         query_group_size = model_input.decode_query_group_size
         assert query_group_size >= 1
         assert model_input.batch_size % query_group_size == 0
-        graph = self._get_decode_graph(query_group_size)
         origin_batch_size = model_input.batch_size
         # 空 DP rank 先补出一个 dummy request；TPSP 模式下继续将 batch size
         # 向上对齐到 TP world size 的整数倍，保证后续切分得到合法 shape。
@@ -716,14 +690,14 @@ class TpPartBaseModel:
         # CUDA Graph 可能继续向上对齐 batch size，并因此加入 seq_len=2 的
         # dummy request。先用最终可能出现的 KV 长度判断 graph，再统一 padding 一次。
         infer_max_kv_seq_len = max(2, self._decode_padding_block_width(model_input), model_input.max_kv_seq_len)
-        use_cuda_graph = graph is not None and graph.can_run(
+        use_cuda_graph = self.graph is not None and self.graph.can_run(
             batch_size=infer_batch_size,
             max_len_in_batch=infer_max_kv_seq_len,
         )
         need_capture = False
         if use_cuda_graph:
-            infer_batch_size = graph.find_closest_graph_batch_size(batch_size=infer_batch_size)
-            need_capture = graph.need_capture(infer_batch_size)
+            infer_batch_size = self.graph.find_closest_graph_batch_size(batch_size=infer_batch_size)
+            need_capture = self.graph.need_capture(infer_batch_size)
 
         model_input = self._create_padded_decode_model_input(model_input=model_input, new_batch_size=infer_batch_size)
         infer_state = self._create_inferstate(model_input)
@@ -741,9 +715,9 @@ class TpPartBaseModel:
 
         if use_cuda_graph:
             if need_capture:
-                model_output: ModelOutput = graph.capture_decode(self._token_forward, infer_state)
+                model_output: ModelOutput = self.graph.capture_decode(self._token_forward, infer_state)
             else:
-                model_output: ModelOutput = graph.replay(infer_state)
+                model_output: ModelOutput = self.graph.replay(infer_state)
         else:
             model_output = self._token_forward(infer_state)
 
