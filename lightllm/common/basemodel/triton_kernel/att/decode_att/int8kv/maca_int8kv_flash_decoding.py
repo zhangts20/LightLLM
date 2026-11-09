@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -34,6 +35,11 @@ def _default_run_config() -> dict:
         "num_stages": 2,
         "scenario": "mla;cvt_shm_no_pad",
     }
+
+
+def _fp16_dot_enabled(q_dtype: torch.dtype) -> bool:
+    enabled = os.getenv("LIGHTLLM_INT8KV_FP16_DOT", "1").lower() in ["on", "true", "1"]
+    return enabled and q_dtype in (torch.bfloat16, torch.float16)
 
 
 def _split_count(batch_size: int, max_kv_len: int, block_seq: int) -> int:
@@ -195,6 +201,178 @@ def _fwd_int8kv_decode_stage1(
             alpha = tl.exp(m_i - new_max)
             p = tl.where(vis, tl.exp(qk - new_max[:, None]), 0.0)
             acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = new_max
+
+    out_head = q_s * N_Q + q_head
+    l_safe = tl.where(l_i == 0, 1.0, l_i)
+    lse = tl.where(l_i == 0, -1.0e10, m_i + tl.log(l_i))
+    tl.store(
+        Mid_O + cur_batch * stride_mid_b + out_head[:, None] * stride_mid_h + split_id * stride_mid_s + offs_d[None, :],
+        acc / l_safe[:, None],
+        mask=q_valid[:, None] & d_mask[None, :],
+    )
+    tl.store(
+        Mid_LSE + cur_batch * stride_lse_b + out_head * stride_lse_h + split_id * stride_lse_s,
+        lse,
+        mask=q_valid,
+    )
+
+
+@triton.jit
+def _fwd_int8kv_decode_stage1_fp16(
+    Q,
+    K,
+    K_scale,
+    V,
+    V_scale,
+    Page_table,
+    Token_req_indices,
+    B_seqlen,
+    Mid_O,
+    Mid_LSE,
+    sm_scale,
+    stride_q_b,
+    stride_q_s,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_ks_t,
+    stride_ks_h,
+    stride_ks_g,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_vs_t,
+    stride_vs_h,
+    stride_vs_g,
+    stride_pt_b,
+    stride_pt_p,
+    stride_mid_b,
+    stride_mid_h,
+    stride_mid_s,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_s,
+    sliding_left,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    Q_ROWS: tl.constexpr,
+    GQA: tl.constexpr,
+    N_Q: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    USE_TOKEN_TABLE: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_kv_head = tl.program_id(1)
+    split_id = tl.program_id(2)
+    n_splits = tl.num_programs(2)
+
+    table_row = tl.load(Token_req_indices + cur_batch) if USE_TOKEN_TABLE else cur_batch
+    kv_len = tl.load(B_seqlen + cur_batch)
+    n_kv_blocks = tl.cdiv(kv_len, PAGE_SIZE)
+    if split_id >= n_kv_blocks:
+        return
+
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_g = tl.arange(0, NUM_GROUPS)
+    d_mask = offs_d < HEAD_DIM
+    g_mask = offs_g < (HEAD_DIM // GROUP_SIZE)
+
+    offs_row = tl.arange(0, Q_ROWS)
+    q_valid = offs_row < (Q_LEN * GQA)
+    q_s = offs_row // GQA
+    q_h = offs_row % GQA
+    q_head = cur_kv_head * GQA + q_h
+    q_head = tl.where(q_valid, q_head, cur_kv_head * GQA)
+    q_s = tl.where(q_valid, q_s, 0)
+
+    q = tl.load(
+        Q
+        + cur_batch * stride_q_b
+        + q_s[:, None] * stride_q_s
+        + q_head[:, None] * stride_q_h
+        + offs_d[None, :] * stride_q_d,
+        mask=q_valid[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    q_dot = q.to(tl.float16)
+
+    acc = tl.zeros([Q_ROWS, BLOCK_D], dtype=tl.float32)
+    # Finite sentinel: -inf - (-inf) is NaN on some MetaX compiles (D=128 long seq).
+    m_i = tl.zeros([Q_ROWS], dtype=tl.float32) - 1.0e10
+    l_i = tl.zeros([Q_ROWS], dtype=tl.float32)
+    q_pos = kv_len - Q_LEN + q_s
+
+    for kv_block in range(split_id, n_kv_blocks, n_splits):
+        block_start = kv_block * PAGE_SIZE
+        block_end = tl.minimum(kv_len, block_start + PAGE_SIZE)
+        n_tiles = tl.cdiv(block_end - block_start, BLOCK_N)
+        offs_n0 = block_start + tl.arange(0, BLOCK_N)
+        if not USE_TOKEN_TABLE:
+            block_id = tl.load(Page_table + cur_batch * stride_pt_b + kv_block * stride_pt_p).to(tl.int64)
+            page_base = block_id * PAGE_SIZE
+        for tile in range(0, n_tiles):
+            offs_n = offs_n0 + tile * BLOCK_N
+            n_mask = offs_n < block_end
+            if USE_TOKEN_TABLE:
+                # Block-draft scratch may break physical page alignment.
+                # Read exact token slots without expanding the INT8 KV cache.
+                kv_loc = tl.load(Page_table + table_row * stride_pt_b + offs_n * stride_pt_p,
+                                 mask=n_mask, other=0).to(tl.int64)
+            else:
+                kv_loc = page_base + (offs_n - block_start)
+
+            k_i8 = tl.load(
+                K + kv_loc[None, :] * stride_k_t + cur_kv_head * stride_k_h + offs_d[:, None] * stride_k_d,
+                mask=n_mask[None, :] & d_mask[:, None],
+                other=0,
+            )
+            k_s = tl.load(
+                K_scale + kv_loc[None, :] * stride_ks_t + cur_kv_head * stride_ks_h + offs_g[:, None] * stride_ks_g,
+                mask=n_mask[None, :] & g_mask[:, None],
+                other=0.0,
+            )
+            k_i8 = tl.reshape(k_i8, (NUM_GROUPS, GROUP_SIZE, BLOCK_N))
+            k_s = tl.reshape(k_s, (NUM_GROUPS, 1, BLOCK_N))
+            k = tl.reshape((k_i8.to(tl.float16) * k_s.to(tl.float16)), (BLOCK_D, BLOCK_N))
+
+            qk = tl.dot(q_dot, k, out_dtype=tl.float32) * sm_scale
+            vis = n_mask[None, :] & q_valid[:, None]
+            if CAUSAL:
+                vis = vis & (offs_n[None, :] < (q_pos[:, None] + 1))
+            if USE_SLIDING_WINDOW:
+                win_lo = tl.maximum(q_pos - sliding_left, 0)
+                vis = vis & (offs_n[None, :] >= win_lo[:, None])
+            qk = tl.where(vis, qk, -1.0e10)
+
+            v_i8 = tl.load(
+                V + kv_loc[:, None] * stride_v_t + cur_kv_head * stride_v_h + offs_d[None, :] * stride_v_d,
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0,
+            )
+            v_s = tl.load(
+                V_scale + kv_loc[:, None] * stride_vs_t + cur_kv_head * stride_vs_h + offs_g[None, :] * stride_vs_g,
+                mask=n_mask[:, None] & g_mask[None, :],
+                other=0.0,
+            )
+            v_i8 = tl.reshape(v_i8, (BLOCK_N, NUM_GROUPS, GROUP_SIZE))
+            v_s = tl.reshape(v_s, (BLOCK_N, NUM_GROUPS, 1))
+            v = tl.reshape((v_i8.to(tl.float16) * v_s.to(tl.float16)), (BLOCK_N, BLOCK_D))
+
+            tile_max = tl.max(qk, axis=1)
+            new_max = tl.maximum(m_i, tile_max)
+            alpha = tl.exp(m_i - new_max)
+            p = tl.where(vis, tl.exp(qk - new_max[:, None]), 0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v, out_dtype=tl.float32)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = new_max
 
@@ -376,7 +554,11 @@ def int8kv_flash_decode(
     use_causal = bool(causal) and q_len > 1
 
     grid = (batch, n_kv, n_splits)
-    _fwd_int8kv_decode_stage1[grid](
+    if _fp16_dot_enabled(q.dtype):
+        stage1_call = _fwd_int8kv_decode_stage1_fp16
+    else:
+        stage1_call = _fwd_int8kv_decode_stage1
+    stage1_call[grid](
         q,
         k,
         k_scale,

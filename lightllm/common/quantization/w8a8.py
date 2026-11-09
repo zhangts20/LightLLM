@@ -7,6 +7,7 @@ from .quantize_method import QuantizationMethod, WeightPack
 from .registry import QUANTMETHODS
 from lightllm.utils.vllm_utils import HAS_VLLM, vllm_ops, cutlass_scaled_mm
 from lightllm.utils.sgl_utils import HAS_SGL_KERNEL, sgl_ops
+from lightllm.utils.maca_utils import maca_w8a8_need_partial_m_split
 
 _HAS_SGL_FP8 = HAS_SGL_KERNEL and sgl_ops is not None and hasattr(sgl_ops, "fp8_scaled_mm")
 
@@ -138,13 +139,9 @@ class w8a8QuantizationMethod(BaseQuantizationMethod):
 class w8a8MacaQuantizationMethod(w8a8QuantizationMethod):
     @staticmethod
     def _scaled_mm(out, x_q, qweight, x_scale, weight_scale, bias):
-        # MetaX cutlass INT8 GEMM can leave output tiles unwritten when M has
-        # both complete 256-row tiles and a partial tail (e.g. M=293, N=5120,
-        # K=6144). Run the full tiles and tail separately; neither call needs
-        # padding or extra output storage. Per-token scales follow the rows.
         rows = x_q.shape[0]
         full_rows = rows // 256 * 256
-        if full_rows and full_rows != rows:
+        if maca_w8a8_need_partial_m_split() and full_rows and full_rows != rows:
             cutlass_scaled_mm(
                 out[:full_rows], x_q[:full_rows], qweight, x_scale[:full_rows], weight_scale, bias
             )
