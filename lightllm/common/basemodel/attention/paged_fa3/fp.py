@@ -14,9 +14,210 @@ from lightllm.platform.base.attention import register_att_backend
 try:
     from flash_attn import flash_attn_varlen_func as maca_flash_attn_varlen_func
     from flash_attn import flash_attn_with_kvcache as maca_flash_attn_with_kvcache
+    import flash_attn_2_cuda as maca_flash_attn_cuda
 except ImportError:
     maca_flash_attn_varlen_func = None
     maca_flash_attn_with_kvcache = None
+    maca_flash_attn_cuda = None
+
+
+@triton.jit(do_not_specialize=["softmax_scale"])
+def _causal_tail_merge_kernel(
+    Q,
+    Kcache,
+    Vcache,
+    Out1,
+    Lse1,
+    Out,
+    BlockTable,
+    SeqLens,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_kp,
+    stride_kh,
+    stride_kd,
+    stride_vb,
+    stride_vp,
+    stride_vh,
+    stride_vd,
+    stride_o1b,
+    stride_o1h,
+    stride_o1d,
+    stride_lb,
+    stride_lh,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    stride_tb,
+    stride_tp,
+    n_q,
+    group,
+    page_size,
+    softmax_scale,
+    DIM: tl.constexpr,
+    N_TAIL: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < DIM
+    q = tl.load(Q + batch * stride_qb + head * stride_qh + offs * stride_qd, mask=mask, other=0.0).to(tl.float32)
+    seqlen = tl.load(SeqLens + batch)
+    query_i = head // n_q
+    kv_head = (head % n_q) // group
+
+    neg = float("-inf")
+    max_score = neg
+    exp_sum = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for t in range(N_TAIL):
+        pos = seqlen - N_TAIL + t
+        keep = (pos >= 0) & (t < query_i)
+        pos_c = tl.maximum(pos, 0)
+        page = pos_c // page_size
+        offset = pos_c % page_size
+        block = tl.load(BlockTable + batch * stride_tb + page * stride_tp)
+        k = tl.load(
+            Kcache + block * stride_kb + offset * stride_kp + kv_head * stride_kh + offs * stride_kd,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        v = tl.load(
+            Vcache + block * stride_vb + offset * stride_vp + kv_head * stride_vh + offs * stride_vd,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.sum(q * k, axis=0) * softmax_scale
+        new_max = tl.where(keep, tl.maximum(max_score, score), max_score)
+        alpha = tl.where(keep, tl.exp(max_score - new_max), 1.0)
+        prob = tl.where(keep, tl.exp(score - new_max), 0.0)
+        acc = acc * alpha + prob * v
+        exp_sum = exp_sum * alpha + prob
+        max_score = new_max
+
+    has_tail = exp_sum > 0
+    out2 = acc / tl.where(has_tail, exp_sum, 1.0)
+    lse2 = tl.where(has_tail, max_score + tl.log(tl.where(has_tail, exp_sum, 1.0)), neg)
+
+    has_prefix = seqlen > N_TAIL
+    lse1 = tl.where(has_prefix, tl.load(Lse1 + batch * stride_lb + head * stride_lh), neg)
+    out1 = tl.load(
+        Out1 + batch * stride_o1b + head * stride_o1h + offs * stride_o1d,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    out1 = tl.where(has_prefix, out1, 0.0)
+
+    has_any = has_prefix | has_tail
+    peak = tl.maximum(tl.where(has_prefix, lse1, neg), lse2)
+    peak = tl.where(has_any, peak, 0.0)
+    lse = peak + tl.log(tl.exp(tl.where(has_prefix, lse1, neg) - peak) + tl.exp(lse2 - peak))
+    merged = tl.where(has_prefix, tl.exp(lse1 - lse), 0.0) * out1 + tl.where(has_tail, tl.exp(lse2 - lse), 0.0) * out2
+    tl.store(
+        Out + batch * stride_ob + head * stride_oh + offs * stride_od,
+        merged.to(Out.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _merge_causal_tail(q_flat, k_cache, v_cache, out1, lse1, block_table, cache_seqlens, softmax_scale, n_q, n_tail):
+    batch, q_heads, dim = q_flat.shape
+    lse = lse1.float()
+    if lse.shape[-1] == 1:
+        lse = lse.squeeze(-1)
+    else:
+        lse = torch.logsumexp(lse, dim=-1)
+    lse = lse.contiguous()
+    out = torch.empty_like(q_flat)
+    block_d = 1 << (dim - 1).bit_length()
+    _causal_tail_merge_kernel[(batch, q_heads)](
+        q_flat,
+        k_cache,
+        v_cache,
+        out1,
+        lse,
+        out,
+        block_table,
+        cache_seqlens,
+        q_flat.stride(0),
+        q_flat.stride(1),
+        q_flat.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
+        out1.stride(0),
+        out1.stride(1),
+        out1.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        block_table.stride(0),
+        block_table.stride(1),
+        n_q,
+        n_q // k_cache.shape[2],
+        k_cache.shape[1],
+        softmax_scale,
+        DIM=dim,
+        N_TAIL=n_tail,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return out
+
+
+def _maca_decode_num_splits(batch):
+    return 16 if batch >= 64 else 0
+
+
+def maca_grouped_causal_kvcache(q_bshd, k_cache, v_cache, block_table, cache_seqlens, softmax_scale):
+    batch, q_len, n_q, dim = q_bshd.shape
+    qq = q_bshd.reshape(batch, 1, q_len * n_q, dim)
+    prefix = (cache_seqlens - (q_len - 1)).clamp_min(0)
+    out1, lse1 = maca_flash_attn_cuda.fwd_kvcache(
+        qq,
+        k_cache,
+        v_cache,
+        None,
+        None,
+        prefix,
+        None,
+        None,
+        None,
+        None,
+        block_table,
+        None,
+        None,
+        softmax_scale,
+        False,
+        -1,
+        -1,
+        0.0,
+        True,
+        _maca_decode_num_splits(batch),
+    )
+    merged = _merge_causal_tail(
+        qq[:, 0],
+        k_cache,
+        v_cache,
+        out1[:, 0],
+        lse1,
+        block_table,
+        cache_seqlens,
+        softmax_scale,
+        n_q,
+        q_len - 1,
+    )
+    return merged.view(batch, q_len, n_q, dim)
 
 
 @triton.jit
@@ -337,6 +538,47 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             window_size=window_size, softcap=0.0,
         )
 
+    def _maca_kvcache_decode(self, q_bshd, k_cache, v_cache, sm_scale, window_size, alloc_func):
+        q_len = q_bshd.shape[1]
+        group = q_bshd.shape[2] // k_cache.shape[2]
+        if q_len > 1 and group > q_len:
+            if window_size == (-1, -1) and maca_flash_attn_cuda is not None:
+                return maca_grouped_causal_kvcache(
+                    q_bshd,
+                    k_cache,
+                    v_cache,
+                    self.page_table,
+                    self.b_att_seq_len,
+                    sm_scale,
+                )
+            out = alloc_func(q_bshd.shape, dtype=q_bshd.dtype, device=q_bshd.device)
+            for i in range(q_len):
+                seqlens_i = (self.b_att_seq_len - (q_len - 1 - i)).clamp_min(0)
+                out[:, i : i + 1] = maca_flash_attn_with_kvcache(
+                    q=q_bshd[:, i : i + 1],
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=self.page_table,
+                    cache_seqlens=seqlens_i,
+                    softmax_scale=sm_scale,
+                    causal=self.causal,
+                    window_size=window_size,
+                    softcap=0.0,
+                )
+            return out
+        return maca_flash_attn_with_kvcache(
+            q=q_bshd,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=self.page_table,
+            cache_seqlens=self.b_att_seq_len,
+            softmax_scale=sm_scale,
+            causal=self.causal,
+            window_size=window_size,
+            softcap=0.0,
+            num_splits=_maca_decode_num_splits(q_bshd.shape[0]),
+        )
+
     def _normal_decode_att(self, q, k, v, att_control: AttControl, alloc_func=torch.empty):
         if att_control.use_sliding_window:
             window_size = att_control.sliding_window
@@ -361,8 +603,6 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
                 )
 
             if self.has_partial_block:
-                # BSHD kvcache requires a uniform query width; varlen handles
-                # the short trailing HOLD group without adding query rows.
                 return maca_flash_attn_varlen_func(
                     q=q,
                     k=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
@@ -389,16 +629,10 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
             q_bshd = q.view(
                 att_batch_size, self.decode_max_q_seq_len, q.shape[1], q.shape[2]
             )
-            output = maca_flash_attn_with_kvcache(
-                q=q_bshd,
-                k_cache=k.view(-1, self.backend.page_size, k.shape[1], k.shape[2]),
-                v_cache=v.view(-1, self.backend.page_size, v.shape[1], v.shape[2]),
-                block_table=self.page_table,
-                cache_seqlens=self.b_att_seq_len,
-                softmax_scale=sm_scale,
-                causal=self.causal,
-                window_size=window_size,
-                softcap=0.0,
+            k_cache = k.view(-1, self.backend.page_size, k.shape[1], k.shape[2])
+            v_cache = v.view(-1, self.backend.page_size, v.shape[1], v.shape[2])
+            output = self._maca_kvcache_decode(
+                q_bshd, k_cache, v_cache, sm_scale, window_size, alloc_func
             )
             return output.view_as(q)
         return flash_attn_with_kvcache(

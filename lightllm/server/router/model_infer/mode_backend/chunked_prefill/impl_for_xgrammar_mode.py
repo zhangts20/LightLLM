@@ -55,6 +55,8 @@ class XgrammarBackend(ChunkedPrefillBackend):
                     return self.xgrammar_compiler.compile_grammar(grammar)
                 if constraint_type == "schema":
                     return self.xgrammar_compiler.compile_json_schema(grammar)
+                if constraint_type == "regex":
+                    return self.xgrammar_compiler.compile_regex(grammar)
                 raise ValueError(f"Unknown xgrammar type: {constraint_type}")
             except Exception as e:
                 logger.error(f"Failed to compile {constraint_type}: {e}")
@@ -87,19 +89,64 @@ class XgrammarBackend(ChunkedPrefillBackend):
 
     @staticmethod
     def _has_output_constraints(run_reqs: List[InferReq]) -> bool:
-        return any(
-            req.sampling_param.guided_grammar is not None or req.sampling_param.guided_json is not None
-            for req in run_reqs
+        return any(XgrammarBackend._has_output_constraint(req.sampling_param) for req in run_reqs)
+
+    @staticmethod
+    def _has_output_constraint(sample_params) -> bool:
+        return (
+            sample_params.regular_constraint is not None
+            or sample_params.guided_grammar is not None
+            or sample_params.guided_json is not None
         )
 
+    @staticmethod
+    def _record_xgrammar_error(sample_params, exc: BaseException) -> None:
+        sample_params.xgrammar_error = str(exc)
+        logger.exception("Failed to process output grammar: %s", sample_params.xgrammar_error)
+
+    @staticmethod
+    def _accept_xgrammar_token(sample_params, token_id: int) -> bool:
+        if sample_params.xgrammar_in_reasoning:
+            end_ids = sample_params.xgrammar_reasoning_end
+            sample_params.xgrammar_reasoning_tail = (
+                sample_params.xgrammar_reasoning_tail + (int(token_id),)
+            )[-len(end_ids) :]
+            if sample_params.xgrammar_reasoning_tail == end_ids:
+                sample_params.xgrammar_in_reasoning = False
+            return True
+        return sample_params.xgrammar_matcher.accept_token(int(token_id))
+
+    @staticmethod
+    def _fill_xgrammar_mask(sample_params, bitmask: torch.Tensor, row: int) -> bool:
+        if sample_params.xgrammar_error is not None or sample_params.xgrammar_in_reasoning:
+            return False
+        matcher = sample_params.xgrammar_matcher
+        if matcher.is_terminated():
+            return False
+        matcher.fill_next_token_bitmask(bitmask, row)
+        return True
+
     def _update_xgrammar_fsm(self, req_obj: InferReq, next_token_id, next_token_logprob):
-        if not hasattr(req_obj.sampling_param, "xgrammar_matcher"):
+        sample_params = req_obj.sampling_param
+        if not getattr(sample_params, "xgrammar_initialized", False):
             return
 
-        matcher = req_obj.sampling_param.xgrammar_matcher
-        assert matcher.accept_token(next_token_id)
-        if matcher.is_terminated():
-            req_obj.finish_status.set_status(FinishStatus.FINISHED_STOP)
+        if sample_params.xgrammar_error is None:
+            try:
+                if not self._accept_xgrammar_token(sample_params, next_token_id):
+                    raise RuntimeError(f"Grammar rejected sampled token {next_token_id}")
+            except BaseException as exc:
+                self._record_xgrammar_error(sample_params, exc)
+
+        if sample_params.xgrammar_error is not None:
+            req_obj.finish_status.set_status(FinishStatus.FINISHED_ERROR)
+        elif not sample_params.xgrammar_in_reasoning:
+            try:
+                if sample_params.xgrammar_matcher.is_terminated():
+                    req_obj.finish_status.set_status(FinishStatus.FINISHED_STOP)
+            except BaseException as exc:
+                self._record_xgrammar_error(sample_params, exc)
+                req_obj.finish_status.set_status(FinishStatus.FINISHED_ERROR)
 
     def _apply_xgrammar_masks(
         self, run_reqs: List[InferReq], logits: torch.Tensor, b_mtp_index: torch.Tensor = None
@@ -116,10 +163,13 @@ class XgrammarBackend(ChunkedPrefillBackend):
                 if run_obj.get_chuncked_input_token_len() != run_obj.get_cur_total_len():
                     continue
                 sample_params = run_obj.sampling_param
-                if sample_params.guided_grammar is not None or sample_params.guided_json is not None:
-                    sample_params.xgrammar_matcher.fill_next_token_bitmask(bitmask, i)
-                    enabled_flags[i] = True
-                    has_enabled_mask = True
+                if self._has_output_constraint(sample_params) and sample_params.xgrammar_error is None:
+                    try:
+                        if self._fill_xgrammar_mask(sample_params, bitmask, i):
+                            enabled_flags[i] = True
+                            has_enabled_mask = True
+                    except BaseException as exc:
+                        self._record_xgrammar_error(sample_params, exc)
         else:
             next_token_table = (
                 g_infer_context.req_manager.req_sampling_params_manager.req_to_next_token_ids_cpu
@@ -132,7 +182,7 @@ class XgrammarBackend(ChunkedPrefillBackend):
                     group_end += 1
 
                 sample_params = run_obj.sampling_param
-                if sample_params.guided_grammar is not None or sample_params.guided_json is not None:
+                if self._has_output_constraint(sample_params) and sample_params.xgrammar_error is None:
                     matcher = sample_params.xgrammar_matcher
                     group_size = group_end - group_start
                     draft_tokens = (
@@ -140,21 +190,32 @@ class XgrammarBackend(ChunkedPrefillBackend):
                         if group_size > 1
                         else []
                     )
-                    accepted_draft_count = 0
+                    accepted_grammar_count = 0
+                    saved_in_reasoning = sample_params.xgrammar_in_reasoning
+                    saved_reasoning_tail = sample_params.xgrammar_reasoning_tail
                     try:
                         for offset in range(group_size):
-                            if matcher.is_terminated():
+                            if not sample_params.xgrammar_in_reasoning and matcher.is_terminated():
                                 break
-                            matcher.fill_next_token_bitmask(bitmask, group_start + offset)
-                            enabled_flags[group_start + offset] = True
-                            has_enabled_mask = True
+                            if self._fill_xgrammar_mask(sample_params, bitmask, group_start + offset):
+                                enabled_flags[group_start + offset] = True
+                                has_enabled_mask = True
                             if offset < len(draft_tokens):
-                                if not matcher.accept_token(draft_tokens[offset]):
+                                grammar_was_active = not sample_params.xgrammar_in_reasoning
+                                if not self._accept_xgrammar_token(sample_params, draft_tokens[offset]):
                                     break
-                                accepted_draft_count += 1
+                                if grammar_was_active:
+                                    accepted_grammar_count += 1
+                    except BaseException as exc:
+                        self._record_xgrammar_error(sample_params, exc)
                     finally:
-                        if accepted_draft_count:
-                            matcher.rollback(accepted_draft_count)
+                        try:
+                            if accepted_grammar_count:
+                                matcher.rollback(accepted_grammar_count)
+                        except BaseException as exc:
+                            self._record_xgrammar_error(sample_params, exc)
+                        sample_params.xgrammar_in_reasoning = saved_in_reasoning
+                        sample_params.xgrammar_reasoning_tail = saved_reasoning_tail
 
                 group_start = group_end
 
@@ -181,11 +242,23 @@ class XgrammarBackend(ChunkedPrefillBackend):
 
         for run_obj in run_reqs:
             sample_params = run_obj.sampling_param
-            if sample_params.guided_grammar is not None:
-                if not hasattr(sample_params, "xgrammar_matcher"):
+            if not self._has_output_constraint(sample_params) or getattr(
+                sample_params, "xgrammar_initialized", False
+            ):
+                continue
+            sample_params.xgrammar_initialized = True
+            sample_params.xgrammar_error = None
+            sample_params.xgrammar_reasoning_end = tuple(sample_params.guided_reasoning_end)
+            sample_params.xgrammar_reasoning_tail = ()
+            sample_params.xgrammar_in_reasoning = bool(sample_params.xgrammar_reasoning_end)
+            ctx = None
+            try:
+                if sample_params.regular_constraint is not None:
+                    ctx = self.get_cached_grammar("regex", sample_params.regular_constraint)
+                elif sample_params.guided_grammar is not None:
                     ctx = self.get_cached_grammar("grammar", sample_params.guided_grammar)
-                    sample_params.xgrammar_matcher = xgr.GrammarMatcher(ctx)
-            elif sample_params.guided_json is not None:
-                if not hasattr(sample_params, "xgrammar_matcher"):
+                elif sample_params.guided_json is not None:
                     ctx = self.get_cached_grammar("schema", sample_params.guided_json)
-                    sample_params.xgrammar_matcher = xgr.GrammarMatcher(ctx)
+                sample_params.xgrammar_matcher = xgr.GrammarMatcher(ctx)
+            except BaseException as exc:
+                self._record_xgrammar_error(sample_params, exc)

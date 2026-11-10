@@ -17,7 +17,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .op import exp, safe_exp
-from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
+from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_maca, is_nvidia_hopper
 from lightllm.common.triton_utils.autotuner import autotune
 
 
@@ -196,6 +196,11 @@ def chunk_fwd_o(
     num_stages = run_config.get("num_stages", 2)
 
     grid = (triton.cdiv(V, BV), NT, B * H)
+    launch_kwargs = (
+        {"scenario": "mla;cvt_shm_no_pad", "pipeline": "basic"}
+        if is_maca()
+        else {}
+    )
 
     chunk_fwd_kernel_o[grid](
         q,
@@ -217,5 +222,6 @@ def chunk_fwd_o(
         BV=BV,
         num_warps=num_warps,
         num_stages=num_stages,
+        **launch_kwargs,
     )
     return o

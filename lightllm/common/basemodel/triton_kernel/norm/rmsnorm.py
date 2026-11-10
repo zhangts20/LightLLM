@@ -1,10 +1,15 @@
-import torch
-
-import triton
-import triton.language as tl
 import os
 
+import torch
+import triton
+import triton.language as tl
+
 from lightllm.common.triton_utils.autotuner import autotune
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
+
+_flashinfer_rmsnorm = False
 
 rmsnorm_num_warps = int(os.getenv("RMSNORM_WARPS", "8"))
 
@@ -68,7 +73,7 @@ def _rms_norm_fwd_fused(
     static_key_func=_rms_static,
     run_key_func=_rms_run,
 )
-def rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float, out=None, run_config=None):
+def _rmsnorm_forward_triton(x: torch.Tensor, weight: torch.Tensor, eps: float, out=None, run_config=None):
     # allocate output
     y = torch.empty_like(x) if out is None else out
     # reshape input data into 2D tensor
@@ -104,6 +109,50 @@ def rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float, out=None,
         num_warps=rmsnorm_num_warps if run_config is None else int(run_config["num_warps"]),
     )
     return y
+
+
+def _flashinfer_rmsnorm_enabled() -> bool:
+    return os.getenv("LIGHTLLM_FLASHINFER_RMSNORM", "1").upper() in ["ON", "TRUE", "1"]
+
+
+def _load_flashinfer_rmsnorm():
+    global _flashinfer_rmsnorm
+
+    if not _flashinfer_rmsnorm_enabled():
+        return None
+
+    if _flashinfer_rmsnorm is False:
+        try:
+            from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
+
+            _flashinfer_rmsnorm = flashinfer_rmsnorm
+        except Exception as exc:
+            logger.warning("flashinfer RMSNorm unavailable, using Triton: %s", exc)
+            _flashinfer_rmsnorm = None
+
+    return _flashinfer_rmsnorm
+
+
+def _try_flashinfer_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor) -> bool:
+    global _flashinfer_rmsnorm
+    fn = _load_flashinfer_rmsnorm()
+    if weight is None or fn is None:
+        return False
+    hidden = x.shape[-1]
+    try:
+        fn(x.reshape(-1, hidden).contiguous(), weight, eps, out=out.view(-1, hidden))
+    except Exception as exc:
+        logger.warning("flashinfer RMSNorm failed, using Triton: %s", exc)
+        _flashinfer_rmsnorm = None
+        return False
+    return True
+
+
+def rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float, out=None, run_config=None):
+    y = torch.empty_like(x) if out is None else out
+    if run_config is None and _try_flashinfer_rmsnorm(x, weight, eps, y):
+        return y
+    return _rmsnorm_forward_triton(x, weight, eps, out=y, run_config=run_config)
 
 
 def torch_rms_norm(x, weight, eps):

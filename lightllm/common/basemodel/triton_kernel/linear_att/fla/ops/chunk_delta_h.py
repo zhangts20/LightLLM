@@ -15,7 +15,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, safe_exp
-from .utils import check_shared_mem
+from .utils import check_shared_mem, is_maca
 from lightllm.common.triton_utils.autotuner import autotune
 
 NUM_WARPS = [2, 4, 8, 16]
@@ -319,6 +319,7 @@ def chunk_gated_delta_rule_fwd_h(
     num_stages = run_config.get("num_stages", 2)
 
     grid = (triton.cdiv(V, BV), N * H)
+    launch_kwargs = {"pipeline": "cpasync"} if is_maca() else {}
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -341,5 +342,6 @@ def chunk_gated_delta_rule_fwd_h(
         BV=BV,
         num_warps=num_warps,
         num_stages=num_stages,
+        **launch_kwargs,
     )
     return h, v_new, final_state

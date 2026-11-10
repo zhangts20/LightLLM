@@ -123,18 +123,30 @@ class RegularConstraint(ctypes.Structure):
         ("length", ctypes.c_int),
     ]
 
-    def initialize(self, constraint: str):
+    def initialize(self, constraint: str, tokenizer=None):
         constraint_bytes = constraint.encode("utf-8")
         assert len(constraint_bytes) < REGULAR_CONSTRAINT_MAX_LENGTH, "Regular constraint is too long."
 
         ctypes.memmove(self.constraint, constraint_bytes, len(constraint_bytes))
         self.length = len(constraint_bytes)
+        if self.length == 0:
+            return
         try:
-            import interegular
+            if get_env_start_args().output_constraint_mode == "xgrammar":
+                import xgrammar as xgr
+                from transformers import PreTrainedTokenizerBase
 
-            interegular.parse_pattern(constraint)
+                while not isinstance(tokenizer, PreTrainedTokenizerBase) and hasattr(tokenizer, "tokenizer"):
+                    tokenizer = tokenizer.tokenizer
+                tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer)
+                xgrammar_compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=8)
+                xgrammar_compiler.compile_regex(constraint)
+            else:
+                import interegular
+
+                interegular.parse_pattern(constraint)
         except Exception as e:
-            raise ValueError(f"regular_expression '{constraint}' has parse_pattern_error: {str(e)}")
+            raise ValueError(f"regular_expression '{constraint}' has compile_error: {str(e)}")
         return
 
     def to_str(self):
@@ -300,6 +312,9 @@ class SamplingParams(ctypes.Structure):
         ("regular_constraint", RegularConstraint),
         ("guided_grammar", GuidedGrammar),
         ("guided_json", GuidedJsonSchema),
+        # Generated delimiter after which the final answer's grammar applies.
+        # Empty means that the grammar is active immediately.
+        ("guided_reasoning_end", StopSequence),
         # If provided, the engine will construct a logits,
         # processor which only retains scores for the given token ids. Defaults to None.
         # allowed_token_ids only can be used in "--output_constraint_mode outlines" started server.
@@ -376,7 +391,7 @@ class SamplingParams(ctypes.Structure):
         # Initialize regular_constraint
         regular_constraint = kwargs.get("regular_constraint", "")
         self.regular_constraint = RegularConstraint()
-        self.regular_constraint.initialize(regular_constraint)
+        self.regular_constraint.initialize(regular_constraint, tokenizer)
 
         # Initialize guided_grammar
         guided_grammar = kwargs.get("guided_grammar", "")
@@ -387,6 +402,9 @@ class SamplingParams(ctypes.Structure):
         guided_json = kwargs.get("guided_json", "")
         self.guided_json = GuidedJsonSchema()
         self.guided_json.initialize(guided_json, tokenizer)
+
+        self.guided_reasoning_end = StopSequence()
+        self.guided_reasoning_end.initialize(kwargs.get("guided_reasoning_end", []))
 
         # Initialize stop_sequence_groups
         stop_sequences = kwargs.get("stop_sequences", [])
@@ -467,6 +485,7 @@ class SamplingParams(ctypes.Structure):
             raise ValueError("prompt_logprobs requires --enable_prompt_logprobs")
         self._verify_allowed_token_ids()
         self._verify_grammar_constraint()
+        self._verify_constraint_mode()
 
         return
 
@@ -478,11 +497,22 @@ class SamplingParams(ctypes.Structure):
         return seed
 
     def _verify_grammar_constraint(self):
-        if self.guided_grammar.length != 0:
-            if self.regular_constraint.length != 0:
-                raise ValueError("guided_grammar and regular_constraint can not be used in same time")
-            if self.guided_json.length != 0:
-                raise ValueError("guided_grammar and guided_json can not be used in same time")
+        constraint_count = sum(
+            constraint.length != 0
+            for constraint in (self.regular_constraint, self.guided_grammar, self.guided_json)
+        )
+        if constraint_count > 1:
+            raise ValueError("regular_constraint, guided_grammar and guided_json are mutually exclusive")
+        return
+
+    def _verify_constraint_mode(self):
+        mode = get_env_start_args().output_constraint_mode
+        if (self.guided_grammar.length != 0 or self.guided_json.length != 0) and mode != "xgrammar":
+            raise ValueError("guided_grammar and guided_json require --output_constraint_mode xgrammar")
+        if self.regular_constraint.length != 0 and mode not in ("outlines", "xgrammar"):
+            raise ValueError("regular_constraint requires --output_constraint_mode outlines or xgrammar")
+        if self.allowed_token_ids.size != 0 and mode != "outlines":
+            raise ValueError("allowed_token_ids requires --output_constraint_mode outlines")
         return
 
     def _verify_allowed_token_ids(self):
@@ -515,6 +545,7 @@ class SamplingParams(ctypes.Structure):
             "regular_constraint": self.regular_constraint.to_str(),
             "guided_grammar": self.guided_grammar.to_str(),
             "guided_json": self.guided_json.to_str(),
+            "guided_reasoning_end": self.guided_reasoning_end.to_list(),
             "allowed_token_ids": self.allowed_token_ids.to_list(),
             "invalid_token_ids": self.invalid_token_ids.to_list(),
             "group_request_id": self.group_request_id,

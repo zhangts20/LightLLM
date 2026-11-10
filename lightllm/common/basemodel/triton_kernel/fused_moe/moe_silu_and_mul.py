@@ -1,9 +1,16 @@
+import os
+
 import torch
 
 import triton
 import triton.language as tl
 from lightllm.common.triton_utils.autotuner import autotune
 from lightllm.utils.config_utils import ffn_use_tanh_approximate_gelu
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
+
+_flashinfer_silu_and_mul = False  # False = not loaded, None = unavailable, else the function
 
 
 @triton.jit
@@ -114,7 +121,7 @@ def _get_silu_and_mul_static_key(input: torch.Tensor, output: torch.Tensor):
     run_key_func=lambda input: input.shape[0],
     mutates_args=["output"],
 )
-def silu_and_mul_fwd(
+def _silu_and_mul_fwd_triton(
     input: torch.Tensor,
     output: torch.Tensor,
     layout="blocked",
@@ -174,3 +181,52 @@ def silu_and_mul_fwd(
         USE_TANH_APPROXIMATE_GELU=ffn_use_tanh_approximate_gelu(),
     )
     return
+
+
+def _flashinfer_silu_enabled() -> bool:
+    return os.getenv("LIGHTLLM_FLASHINFER_SILU_AND_MUL", "1").upper() in ["ON", "TRUE", "1"]
+
+
+def _load_flashinfer_silu_and_mul():
+    global _flashinfer_silu_and_mul
+    if not _flashinfer_silu_enabled():
+        return None
+    if _flashinfer_silu_and_mul is False:
+        try:
+            from flashinfer.activation import silu_and_mul as flashinfer_silu_and_mul
+
+            _flashinfer_silu_and_mul = flashinfer_silu_and_mul
+        except Exception as exc:
+            logger.warning("flashinfer silu_and_mul unavailable, using Triton: %s", exc)
+            _flashinfer_silu_and_mul = None
+    return _flashinfer_silu_and_mul
+
+
+def _try_flashinfer_silu_and_mul(input: torch.Tensor, output: torch.Tensor, layout, limit, alpha) -> bool:
+    global _flashinfer_silu_and_mul
+    plain_silu = layout == "blocked" and limit is None and alpha is None and not ffn_use_tanh_approximate_gelu()
+    fn = _load_flashinfer_silu_and_mul() if plain_silu else None
+    if fn is None:
+        return False
+    try:
+        fn(input, output)
+    except Exception as exc:
+        logger.warning("flashinfer silu_and_mul failed, using Triton: %s", exc)
+        _flashinfer_silu_and_mul = None
+        return False
+    return True
+
+
+def silu_and_mul_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    layout="blocked",
+    limit=None,
+    alpha=None,
+    run_config=None,
+):
+    if run_config is None and _try_flashinfer_silu_and_mul(input, output, layout, limit, alpha):
+        return
+    return _silu_and_mul_fwd_triton(
+        input, output, layout=layout, limit=limit, alpha=alpha, run_config=run_config
+    )

@@ -1,11 +1,16 @@
 import torch
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
 from lightllm.utils.envs_utils import get_env_start_args
 
 
-def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
+def sample(
+    logits: torch.Tensor,
+    reqs: List[InferReq],
+    eos_id: List[int] = [2],
+    post_penalty_mask_func: Optional[Callable[[torch.Tensor], None]] = None,
+):
     (
         b_req_idx,
         b_temperatures,
@@ -84,6 +89,9 @@ def sample(logits: torch.Tensor, reqs: List[InferReq], eos_id: List[int] = [2]):
         )
 
     logits.div_(b_temperatures.view((-1, 1)))
+    if post_penalty_mask_func is not None:
+        # Hard output constraints must be applied after penalties and temperature.
+        post_penalty_mask_func(logits)
     probs = torch.softmax(logits, dim=-1)
 
     if is_all_greedy:
@@ -120,6 +128,21 @@ def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor
     return probs_sort, probs_idx
 
 
+def _top_p_top_k_maca(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor):
+    vocab_size = probs.shape[-1]
+    max_k = int(top_ks.max().item())
+    if max_k <= 0 or max_k >= vocab_size:
+        return _top_p_top_k(probs, top_ps, top_ks)
+
+    probs_sort, probs_idx = torch.topk(probs, max_k, dim=-1)
+    rank = torch.arange(max_k, device=probs.device).view(1, -1)
+    probs_sort = probs_sort.clone()
+    probs_sort[rank >= top_ks.view(-1, 1)] = 0.0
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    return probs_sort, probs_idx
+
+
 def top_p_top_k_sample_triton(
     *,
     probs: torch.Tensor,
@@ -137,6 +160,22 @@ def top_p_top_k_sample_triton(
             sampled_index = _random_sample(probs_sort, generators).view(-1, 1)
         next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
         next_token_logprobs = torch.log(torch.gather(probs_sort, dim=1, index=sampled_index))
+        return next_token_ids.view(-1), next_token_logprobs.view(-1)
+
+    elif sampling_backend == "maca_triton":
+        probs_sort, probs_idx = _top_p_top_k_maca(probs, top_ps, top_ks)
+        if generators is None:
+            if probs_sort.shape[-1] == probs.shape[-1]:
+                sample_probs = probs_sort
+            else:
+                sample_probs = probs.new_zeros(probs.shape)
+                sample_probs[:, : probs_sort.shape[-1]] = probs_sort
+            sampled_index = torch.multinomial(sample_probs, num_samples=1, replacement=True)
+        else:
+            sampled_index = _random_sample(probs_sort, generators).view(-1, 1)
+        next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
+        next_token_logprobs = torch.log(torch.gather(probs_sort, dim=1, index=sampled_index))
+
         return next_token_ids.view(-1), next_token_logprobs.view(-1)
 
     elif sampling_backend == "flashinfer":

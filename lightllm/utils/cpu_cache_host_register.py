@@ -8,8 +8,18 @@ from typing import Callable, Dict
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.platform import get_backend
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.maca_utils import MACA_RUNTIME_VERSION_3_8, get_maca_runtime_version
 
 logger = init_logger(__name__)
+
+
+def maybe_patch_mc_host_register_gpu_free_check(mc) -> None:
+    version = get_maca_runtime_version(mc)
+    if version is not None and version >= MACA_RUNTIME_VERSION_3_8:
+        logger.info("skip mcHostRegister gpu-free check patch for MACA runtime version %s", version)
+        return
+
+    patch_mc_host_register_gpu_free_check()
 
 
 # 单次注册段长，单位 GB，默认 16。MACA 3.1.0.14 还会要求空闲显存大于这段长度，
@@ -189,7 +199,7 @@ def _metax_ops() -> HostRegisterOps:
             self.device_id = get_current_device_id()
             torch.cuda.set_device(self.device_id)
             if not self.whole_region:
-                patch_mc_host_register_gpu_free_check()
+                maybe_patch_mc_host_register_gpu_free_check(self.mc)
 
         def registration_chunk_bytes(self, size: int) -> int:
             # MACA 3.8 maps a whole registration; splitting it can alias windows.

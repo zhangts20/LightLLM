@@ -181,3 +181,12 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return max_shared_memory >= Backend.get_shared_memory(arch)
     except Exception:
         return False
+
+
+def is_maca() -> bool:
+    try:
+        from lightllm.platform import get_backend
+
+        return get_backend().name == "maca"
+    except Exception:
+        return False

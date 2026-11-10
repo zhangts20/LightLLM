@@ -885,9 +885,15 @@ class ModeBackend:
 
         if mask_func is not None:
             assert len(run_reqs) == logits.shape[0]
-            mask_func(run_reqs, logits)
 
-        next_token_ids, next_token_logprobs = sample(logits, run_reqs, self.eos_id)
+        next_token_ids, next_token_logprobs = sample(
+            logits,
+            run_reqs,
+            self.eos_id,
+            post_penalty_mask_func=(
+                (lambda adjusted_logits: mask_func(run_reqs, adjusted_logits)) if mask_func is not None else None
+            ),
+        )
         next_token_ranks = self._get_next_token_ranks(logits, next_token_ids)
         b_has_out = None
         if is_prefill:

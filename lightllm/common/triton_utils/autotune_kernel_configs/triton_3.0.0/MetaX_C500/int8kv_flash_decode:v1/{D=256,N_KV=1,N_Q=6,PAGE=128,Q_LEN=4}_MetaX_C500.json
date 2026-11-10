@@ -1,8 +1,50 @@
 {
+  "1": {
+    "BLOCK_N": 32,
+    "num_stages": 2,
+    "num_warps": 4,
+    "scenario": "mla;cvt_shm_no_pad"
+  },
+  "2": {
+    "BLOCK_N": 16,
+    "num_stages": 2,
+    "num_warps": 2,
+    "scenario": "mla;cvt_shm_no_pad"
+  },
+  "4": {
+    "BLOCK_N": 16,
+    "num_stages": 2,
+    "num_warps": 2,
+    "scenario": "mla;cvt_shm_no_pad"
+  },
+  "8": {
+    "BLOCK_N": 16,
+    "num_stages": 2,
+    "num_warps": 2,
+    "scenario": "mla;cvt_shm_no_pad"
+  },
+  "16": {
+    "BLOCK_N": 16,
+    "num_stages": 2,
+    "num_warps": 2,
+    "scenario": "mla;cvt_shm_no_pad"
+  },
   "32": {
     "BLOCK_N": 16,
     "num_stages": 2,
     "num_warps": 2,
-    "scenario": "mla"
+    "scenario": "mla;cvt_shm_no_pad"
+  },
+  "48": {
+    "BLOCK_N": 16,
+    "num_stages": 2,
+    "num_warps": 2,
+    "scenario": "mla;cvt_shm_no_pad"
+  },
+  "64": {
+    "BLOCK_N": 16,
+    "num_stages": 2,
+    "num_warps": 2,
+    "scenario": "mla;cvt_shm_no_pad"
   }
 }

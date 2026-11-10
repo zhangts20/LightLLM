@@ -600,6 +600,11 @@ class BaseReasoningFormatDetector:
         self._buffer = ""
         self.stripped_think_start = False
 
+    @property
+    def grammar_start_token(self) -> str:
+        """Generated delimiter after which final-answer constraints apply."""
+        return self.think_end_token
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.

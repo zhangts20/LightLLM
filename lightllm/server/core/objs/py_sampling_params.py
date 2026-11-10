@@ -6,6 +6,7 @@ import os
 from typing import List, Optional, Union, Tuple
 from transformers import GenerationConfig
 from lightllm.server.req_id_generator import MAX_BEST_OF
+from lightllm.utils.envs_utils import get_env_start_args
 from .sampling_params import MAX_SEED
 
 
@@ -51,6 +52,7 @@ class SamplingParams:
         regular_constraint: Optional[str] = None,  # Regular expressions constrain the output.
         guided_grammar: Optional[str] = None,  # EBNF constrain the output.
         guided_json: Optional[Union[str, dict]] = None,  # JSON schema constrain the output.
+        guided_reasoning_end: Optional[List[int]] = None,
         # If provided, the engine will construct a logits,
         # processor which only retains scores for the given token ids. Defaults to None.
         # allowed_token_ids only can be used in "--output_constraint_mode outlines" started server.
@@ -89,6 +91,7 @@ class SamplingParams:
         self.regular_constraint = regular_constraint
         self.guided_grammar = guided_grammar
         self.guided_json = guided_json
+        self.guided_reasoning_end = guided_reasoning_end
         self.allowed_token_ids = allowed_token_ids
         self.invalid_token_ids = invalid_token_ids
         self.group_request_id = group_request_id
@@ -182,7 +185,7 @@ class SamplingParams:
                               but get {str(self.regular_constraint)}"
             )
 
-        if self.regular_constraint is not None:
+        if self.regular_constraint is not None and get_env_start_args().output_constraint_mode != "xgrammar":
             # check regex format
             try:
                 import interegular
@@ -200,8 +203,24 @@ class SamplingParams:
         self._verify_stop_sentences()
 
         self._verify_allowed_token_ids()
+        self._verify_output_constraints()
+        self._verify_constraint_mode()
 
         return
+
+    def _verify_output_constraints(self):
+        constraints = (self.regular_constraint, self.guided_grammar, self.guided_json)
+        if sum(bool(constraint) for constraint in constraints) > 1:
+            raise ValueError("regular_constraint, guided_grammar and guided_json are mutually exclusive")
+
+    def _verify_constraint_mode(self):
+        mode = get_env_start_args().output_constraint_mode
+        if (self.guided_grammar or self.guided_json) and mode != "xgrammar":
+            raise ValueError("guided_grammar and guided_json require --output_constraint_mode xgrammar")
+        if self.regular_constraint and mode not in ("outlines", "xgrammar"):
+            raise ValueError("regular_constraint requires --output_constraint_mode outlines or xgrammar")
+        if self.allowed_token_ids and mode != "outlines":
+            raise ValueError("allowed_token_ids requires --output_constraint_mode outlines")
 
     @staticmethod
     def _normalize_and_verify_seed(seed: Optional[int]) -> int:
@@ -277,6 +296,7 @@ class SamplingParams:
         ret["regular_constraint"] = self.regular_constraint
         ret["guided_grammar"] = self.guided_grammar
         ret["guided_json"] = self.guided_json
+        ret["guided_reasoning_end"] = self.guided_reasoning_end
         ret["allowed_token_ids"] = self.allowed_token_ids
         ret["invalid_token_ids"] = self.invalid_token_ids
         ret["seed"] = self.seed

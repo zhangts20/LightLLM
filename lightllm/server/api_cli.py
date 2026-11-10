@@ -694,9 +694,10 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--sampling_backend",
         type=str,
-        choices=["triton", "flashinfer"],
+        choices=["triton", "maca_triton", "flashinfer"],
         default="triton",
         help="""sampling used impl. 'triton' is use torch and triton kernel,
+        maca_triton uses partial top-k on maca,
         flashinfer use flashinfer sampling impl""",
     )
     parser.add_argument(

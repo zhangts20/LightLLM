@@ -284,12 +284,19 @@ class ChunkedPrefillBackend(ModeBackend):
                 async_selected_row_mask_cpu.wait()
                 selected_rows = async_selected_row_mask_cpu.tensor.tolist()
                 run_reqs = [req for req, selected in zip(run_reqs, selected_rows) if selected]
-            if self.decode_mask_func is not None and self.args.output_constraint_mode == "xgrammar":
-                self.decode_mask_func(run_reqs, model_output.logits, model_input.b_mtp_index)
             next_token_ids, next_token_logprobs = sample(
                 model_output.logits,
                 run_reqs,
                 self.eos_id,
+                post_penalty_mask_func=(
+                    (
+                        lambda adjusted_logits: self.decode_mask_func(
+                            run_reqs, adjusted_logits, model_input.b_mtp_index
+                        )
+                    )
+                    if self.decode_mask_func is not None and self.args.output_constraint_mode == "xgrammar"
+                    else None
+                ),
             )
             next_token_ranks = self._get_next_token_ranks(model_output.logits, next_token_ids)
 

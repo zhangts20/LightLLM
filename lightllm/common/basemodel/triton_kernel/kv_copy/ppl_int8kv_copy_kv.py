@@ -514,6 +514,14 @@ def gather_dequant_int8kv(
     num_groups = block_d // quant_group_size
     block_t = 64 if n_tokens >= 64 else 16
     grid = (triton.cdiv(n_tokens, block_t), n_kv)
+    launch_kwargs = {}
+    try:
+        from lightllm.platform import get_backend
+
+        if get_backend().name == "maca":
+            launch_kwargs = {"scenario": "mla;cvt_shm_no_pad", "pipeline": "basic"}
+    except Exception:
+        pass
     _gather_dequant_int8kv[grid](
         k,
         k_scale,
@@ -548,6 +556,7 @@ def gather_dequant_int8kv(
         BLOCK_T=block_t,
         num_warps=4,
         num_stages=2,
+        **launch_kwargs,
     )
     return k_out, v_out
 
