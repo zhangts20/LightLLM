@@ -375,3 +375,8 @@ def get_target_device(device_id: Optional[int] = None) -> torch.device:
     if device_id is None:
         device_id = get_current_device_id()
     return get_backend().runtime.target_device(device_id)
+
+
+@lru_cache(maxsize=1)
+def is_corex() -> bool:
+    return get_backend().name == "corex"

@@ -525,6 +525,161 @@ def _fwd_kernel_contiguous_kv(
     tl.store(out_ptrs, acc, mask=offs_m[:, None] < cur_batch_seq_len)
 
 
+@triton.jit
+def _fwd_kernel_contiguous_kv_gqa(
+    Q,
+    K,
+    V,
+    sm_scale,
+    Out,
+    B_Start_Loc,
+    B_kv_start_loc,
+    B_Seqlen,
+    b_prompt_cache_len,
+    stride_qbs,
+    stride_qh,
+    stride_qd,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    stride_obs,
+    stride_oh,
+    stride_od,
+    H: tl.constexpr,
+    GROUP: tl.constexpr,
+    KV_GROUP: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    pid = tl.program_id(1)
+    n_groups = H // GROUP
+    cur_batch = pid // n_groups
+    query_group = pid % n_groups
+    head_base = query_group * GROUP
+    cur_kv_head = head_base // KV_GROUP
+
+    prompt_cache_len = tl.load(b_prompt_cache_len + cur_batch)
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch) - prompt_cache_len
+    kv_start_loc = tl.load(B_kv_start_loc + cur_batch)
+
+    block_start_loc = BLOCK_M * start_m
+    offs_row = tl.arange(0, ROWS)
+    offs_m = block_start_loc + offs_row % BLOCK_M
+    head_off = offs_row // BLOCK_M
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+
+    off_q = (
+        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
+        + (head_base + head_off[:, None]) * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(Q + off_q, mask=offs_m[:, None] < cur_batch_seq_len, other=0.0)
+
+    m_i = tl.zeros([ROWS], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([ROWS], dtype=tl.float32)
+    acc = tl.zeros([ROWS, BLOCK_DMODEL], dtype=tl.float32)
+
+    stride_ks = tl.cast(stride_ks, tl.int64)
+    stride_vs = tl.cast(stride_vs, tl.int64)
+
+    block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
+    block_end_loc = tl.minimum(block_start_loc + BLOCK_M + prompt_cache_len, cur_batch_seq_len + prompt_cache_len)
+    for start_n in range(0, block_mask * block_end_loc, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        off_k = (
+            (kv_start_loc + start_n + offs_n[None, :]) * stride_ks
+            + cur_kv_head * stride_kh
+            + offs_d[:, None] * stride_kd
+        )
+        k = tl.load(K + off_k, mask=(start_n + offs_n[None, :]) < block_end_loc, other=0.0)
+        off_v = (
+            (kv_start_loc + start_n + offs_n[:, None]) * stride_vs
+            + cur_kv_head * stride_vh
+            + offs_d[None, :] * stride_vd
+        )
+        v = tl.load(V + off_v, mask=(start_n + offs_n[:, None]) < block_end_loc, other=0.0)
+
+        qk = tl.dot(q, k)
+        mask = (offs_m[:, None] + prompt_cache_len) >= (start_n + offs_n[None, :])
+        qk = tl.where(mask, qk * sm_scale, -1.0e8)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+        p = p.to(v.dtype)
+        acc = tl.dot(p, v, acc)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    off_o = (
+        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
+        + (head_base + head_off[:, None]) * stride_oh
+        + offs_d[None, :] * stride_od
+    )
+    tl.store(Out + off_o, acc, mask=offs_m[:, None] < cur_batch_seq_len)
+
+
+def _use_corex_contiguous_kv_gqa(q, k, head_dim):
+    if get_backend().name != "corex" or head_dim != 256:
+        return False
+    kv_group_num = q.shape[1] // k.shape[1]
+    return kv_group_num >= 2 and kv_group_num % 2 == 0
+
+
+def _launch_corex_contiguous_kv_gqa(
+    q, k, v, o, b_start_loc, b_kv_start_loc, b_seq_len, max_q_input_len, b_prompt_cache_len
+):
+    head = q.shape[1]
+    kv_group_num = head // k.shape[1]
+    group = 2
+    block_m = 64
+    batch = b_seq_len.shape[0]
+    sm_scale = 1.0 / (q.shape[-1] ** 0.5) * 1.4426950408889634
+    _fwd_kernel_contiguous_kv_gqa[(triton.cdiv(max_q_input_len, block_m), batch * (head // group), 1)](
+        Q=q,
+        K=k,
+        V=v,
+        sm_scale=sm_scale,
+        Out=o,
+        B_Start_Loc=b_start_loc,
+        B_kv_start_loc=b_kv_start_loc,
+        B_Seqlen=b_seq_len,
+        b_prompt_cache_len=b_prompt_cache_len,
+        stride_qbs=q.stride(0),
+        stride_qh=q.stride(1),
+        stride_qd=q.stride(2),
+        stride_ks=k.stride(0),
+        stride_kh=k.stride(1),
+        stride_kd=k.stride(2),
+        stride_vs=v.stride(0),
+        stride_vh=v.stride(1),
+        stride_vd=v.stride(2),
+        stride_obs=o.stride(0),
+        stride_oh=o.stride(1),
+        stride_od=o.stride(2),
+        H=head,
+        GROUP=group,
+        KV_GROUP=kv_group_num,
+        ROWS=group * block_m,
+        BLOCK_DMODEL=q.shape[-1],
+        BLOCK_M=block_m,
+        BLOCK_N=64,
+        num_warps=8,
+        num_stages=1,
+    )
+
+
 @torch.no_grad()
 def context_attention_fwd_contiguous_kv(
     q, k, v, o, b_start_loc, b_kv_start_loc, b_seq_len, max_q_input_len, b_prompt_cache_len
@@ -533,6 +688,11 @@ def context_attention_fwd_contiguous_kv(
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128, 256, 512}
+    if _use_corex_contiguous_kv_gqa(q, k, Lk):
+        _launch_corex_contiguous_kv_gqa(
+            q, k, v, o, b_start_loc, b_kv_start_loc, b_seq_len, max_q_input_len, b_prompt_cache_len
+        )
+        return
     BLOCK_M = _prefill_block_m(Lk)
     # Larger head_dim needs smaller tiles to fit in SM shared memory.
     # H100/H200 has ~228KB shared memory per SM; a 128x512 bf16 tile already

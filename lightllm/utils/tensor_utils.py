@@ -1,5 +1,6 @@
 import torch
 
+from lightllm.utils.device_utils import is_corex
 
 def ptr_to_tensor(device_ptr: int, nbytes: int) -> torch.Tensor:
     import cupy as cp
@@ -27,7 +28,10 @@ def tensor_to_no_ref_tensor(origin_tensor: torch.Tensor) -> torch.Tensor:
         torch.Tensor: 无引用计数的tensor
     """
     assert origin_tensor.is_contiguous(), "Only support contiguous tensor"
-    if origin_tensor.device.type in ("musa", "mlu"):
+    # CoreX reports device type cuda, so the platform flag is checked once and cached.
+    if origin_tensor.device.type in ("musa", "mlu") or (
+        origin_tensor.device.type == "cuda" and is_corex()
+    ):
         return _musa_no_ref_tensor(origin_tensor)
     device_ptr = origin_tensor.data_ptr()
     nbytes = origin_tensor.numel() * origin_tensor.element_size()

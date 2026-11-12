@@ -14,6 +14,7 @@ from lightllm.models.qwen3next.infer_struct import Qwen3NextInferStateInfo
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.envs_utils import get_added_mtp_kv_layer_num, get_env_start_args
 from lightllm.common.kv_cache_mem_manager.qwen3next_mem_manager import (
+    CoreXQwen3NextMemManager,
     Qwen3NextInt8KVMemoryManager,
     Qwen3NextMemManager,
 )
@@ -90,6 +91,8 @@ class Qwen3NextTpPartModel(Qwen3MOEModel):
 
         if start_args.llm_kv_type == "int8kv":
             mem_manager_class = Qwen3NextInt8KVMemoryManager
+        elif CoreXQwen3NextMemManager.supported(self.data_type):
+            mem_manager_class = CoreXQwen3NextMemManager
         else:
             mem_manager_class = Qwen3NextMemManager
 

@@ -1,5 +1,6 @@
 import torch
 import triton
+import triton.language as tl
 from typing import List
 from typing import TYPE_CHECKING
 from .base import BaseMemManagerOperator
@@ -403,3 +404,97 @@ class NpuLinearAttMemOperator(LinearAttMemOperator):
             return super().offload_gpu_kv_to_cpu_cache(remap, page_indexes, page_readies, cpu_cache_client, req)
         finally:
             self.mem_manager.kv_buffer = old_kv
+
+
+def _packed_heads(x: torch.Tensor) -> torch.Tensor:
+    if x.stride(-1) == 1 and x.stride(-2) == x.shape[-1]:
+        return x
+    return x.contiguous()
+
+
+@triton.jit
+def _copy_paged_kv_kernel(
+    k_ptr,
+    v_ptr,
+    src_ptr,
+    dst_ptr,
+    heads,
+    page,
+    dim,
+    stride_l,
+    stride_b,
+    stride_h,
+    stride_p,
+    stride_d,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    layer = tl.program_id(1)
+    tile = tl.program_id(2)
+    src = tl.load(src_ptr + token)
+    dst = tl.load(dst_ptr + token)
+    src_base = layer * stride_l + (src // page) * stride_b + (src % page) * stride_p
+    dst_base = layer * stride_l + (dst // page) * stride_b + (dst % page) * stride_p
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < heads * dim
+    head = offs // dim
+    col = offs % dim
+    idx = head * stride_h + col * stride_d
+    tl.store(k_ptr + dst_base + idx, tl.load(k_ptr + src_base + idx, mask=mask), mask=mask)
+    tl.store(v_ptr + dst_base + idx, tl.load(v_ptr + src_base + idx, mask=mask), mask=mask)
+
+
+def _copy_corex_paged_kv(k_cache: torch.Tensor, v_cache: torch.Tensor, src: torch.Tensor, dst: torch.Tensor) -> None:
+    if src.numel() == 0:
+        return
+    layers, _, heads, page, dim = k_cache.shape
+    block = 256
+    _copy_paged_kv_kernel[(src.shape[0], layers, triton.cdiv(heads * dim, block))](
+        k_cache,
+        v_cache,
+        src,
+        dst,
+        heads,
+        page,
+        dim,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        k_cache.stride(4),
+        BLOCK=block,
+    )
+
+
+class CoreXLinearAttMemOperator(LinearAttMemOperator):
+
+    def copy_kv_to_mem_manager(self, layer_index: int, mem_index: torch.Tensor, kv: torch.Tensor):
+        if mem_index.numel() == 0:
+            return
+
+        mem_manager = self.mem_manager
+        layer_index = self.linear_config.get_full_att_kv_layer_index(layer_index)
+        heads = mem_manager.head_num
+        # reshape_and_cache reads stride(0) and assumes each head is packed.
+        key = _packed_heads(kv[:, :heads, :])
+        value = _packed_heads(kv[:, heads:, :])
+        slot = mem_index if mem_index.dtype == torch.int64 else mem_index.to(dtype=torch.int64)
+
+        from ixformer.inference.functions import reshape_and_cache_flash
+
+        reshape_and_cache_flash(
+            key,
+            value,
+            mem_manager.k_cache[layer_index],
+            mem_manager.v_cache[layer_index],
+            slot,
+            "auto",
+            1.0,
+            1.0,
+        )
+
+    def copy_mem_to_mem(self, src_mem_index: torch.Tensor, dst_mem_index: torch.Tensor):
+        device = self.mem_manager.target_device
+        src = src_mem_index.to(device=device, dtype=torch.int64, non_blocking=True)
+        dst = dst_mem_index.to(device=device, dtype=torch.int64, non_blocking=True)
+        _copy_corex_paged_kv(self.mem_manager.k_cache, self.mem_manager.v_cache, src, dst)

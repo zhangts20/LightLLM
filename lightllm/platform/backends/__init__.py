@@ -27,6 +27,11 @@ class MacaBackend(CudaBackend):
     pass
 
 
+@register_platform("corex", ops_fallback=("corex", "cuda_like"), sampling_fallback=("cuda_like",))
+class CorexBackend(CudaBackend):
+    pass
+
+
 @register_platform("musa", ops_fallback=("cuda_like",), sampling_fallback=("cuda_like",))
 class MusaBackend(Backend):
 

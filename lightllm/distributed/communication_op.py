@@ -58,6 +58,7 @@ class CustomProcessGroup:
     def __init__(self):
         self.symm_mem_reduce = None
         self.flashinfer_reduce = None
+        self.ixformer_reduce = None
         self.pynccl_reduce = None
         self.dp_world_size = get_dp_world_size()
         dist_backend = get_backend().runtime.dist_backend
@@ -121,8 +122,18 @@ class CustomProcessGroup:
             device,
         )
 
+    def init_ixformer_reduce(self) -> None:
+        from .ixformer_all_reduce import IxformerAllReduce
+
+        ix = IxformerAllReduce(self.device_group, self.backend_runtime.current_device())
+        if not ix.disabled:
+            self.ixformer_reduce = ix
+
     def all_reduce(self, input_: torch.Tensor) -> None:
-        # Dispatch chain: FlashInfer -> SymmMem -> PyNccl(MCCL/NCCL) -> dist.
+        # Dispatch chain: ixformer -> FlashInfer -> SymmMem -> PyNccl(MCCL/NCCL) -> dist.
+        if self.ixformer_reduce is not None and self.ixformer_reduce.should_use(input_):
+            self.ixformer_reduce.all_reduce(input_)
+            return
         if self.flashinfer_reduce is not None and self.flashinfer_reduce.should_use(input_):
             input_.data = self.flashinfer_reduce.all_reduce(input_)
             return
@@ -157,6 +168,7 @@ class DistributeGroupManager:
                 group.init_symm_mem_reduce()
             if not args.disable_flashinfer_allreduce:
                 group.init_flashinfer_reduce()
+            group.init_ixformer_reduce()
             group.init_pynccl_reduce()
             self.groups.append(group)
         return

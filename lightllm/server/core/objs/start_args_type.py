@@ -222,7 +222,7 @@ class StartArgs:
     enable_rl: bool = field(default=False)
     enable_torch_memory_saver: bool = field(default=False)
     enable_weight_cpu_backup: bool = field(default=False)
-    hardware_platform: str = field(default="cuda", metadata={"choices": ["cuda", "musa", "ascend", "maca", "mlu"]})
+    hardware_platform: str = field(default="cuda", metadata={"choices": ["cuda", "musa", "ascend", "maca", "mlu", "corex"]})
     disable_npu_mm_all_reduce: bool = field(default=False)
     extra_ops_plugins: Optional[str] = field(default=None)
     extra_ops_modules: Optional[str] = field(default=None)

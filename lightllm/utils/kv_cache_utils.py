@@ -70,7 +70,7 @@ def calcu_cpu_cache_meta() -> "CpuKVCacheMeta":
     else:
         mem_manager_class = select_mem_manager_class()
 
-    if mem_manager_class is Qwen3NextMemManager:
+    if issubclass(mem_manager_class, Qwen3NextMemManager):
         linear_config = LinearAttCacheConfig.load_from_args()
         cpu_cache_meta = CpuKVCacheMeta(
             page_num=0,

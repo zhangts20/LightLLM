@@ -64,13 +64,16 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
 
         return o
 
+    def _add_and_ffn_norm(self, hidden, delta, infer_state: InferStateInfo, layer_weight):
+        hidden.add_(delta.view(-1, self.embed_dim_))
+        return self._ffn_norm(hidden, infer_state, layer_weight)
+
     def context_forward(self, input_embdings, infer_state: InferStateInfo, layer_weight):
         input1 = self._att_norm(input_embdings, infer_state, layer_weight)
         o = self.context_attention_forward(input1, infer_state, layer_weight)
-        input_embdings.add_(o.view(-1, self.embed_dim_))
+        input1 = self._add_and_ffn_norm(input_embdings, o, infer_state, layer_weight)
         o = None
 
-        input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
         ffn_out = self._ffn(input1, infer_state, layer_weight)
         input1 = None
 
@@ -89,10 +92,9 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
     def token_forward(self, input_embdings, infer_state: InferStateInfo, layer_weight):
         input1 = self._att_norm(input_embdings, infer_state, layer_weight)
         o = self.token_attention_forward(input1, infer_state, layer_weight)
-        input_embdings.add_(o.view(-1, self.embed_dim_))
+        input1 = self._add_and_ffn_norm(input_embdings, o, infer_state, layer_weight)
         o = None
 
-        input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
         ffn_out = self._ffn(input1, infer_state, layer_weight)
 
         input_embdings.add_(ffn_out.view(-1, self.embed_dim_))
