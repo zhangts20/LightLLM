@@ -42,6 +42,7 @@ from lightllm.models.tarsier2.model import (
 from lightllm.models.gpt_oss.model import GptOssTpPartModel
 from lightllm.models.qwen3_omni_moe_thinker.model import Qwen3OmniMOETpPartModel
 from lightllm.models.qwen3_5.model import Qwen3_5TpPartModel
+from lightllm.models.minicpmv4_6.model import MiniCPMV4_6TpPartModel
 from lightllm.models.qwen3_5_moe.model import Qwen3_5MOETpPartModel
 from lightllm.models.deepseek_mtp.model import Deepseek3MTPModel
 from lightllm.models.glm4_moe_lite_mtp.model import Glm4MoeLiteMTPModel

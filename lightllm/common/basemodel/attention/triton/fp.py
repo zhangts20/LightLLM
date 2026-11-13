@@ -493,7 +493,7 @@ class CoreXTritonDecodeAttState(TritonDecodeAttState):
         group_seq_len = self.infer_state.b_seq_len.index_select(0, last_rows).int()
         self.b_group_seq_len = group_seq_len.clamp_min(self.query_width).contiguous()
         self.b1_cu_group_q_lens = torch.arange(
-            0, groups + 1, 
+            0, groups + 1,
             dtype=torch.int32,
             device=self.infer_state.b_seq_len.device,
         ) * self.query_width

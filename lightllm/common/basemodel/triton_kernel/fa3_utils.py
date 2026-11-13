@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 import triton
 import triton.language as tl
@@ -270,7 +271,11 @@ def build_dynamic_spec_fa3_decode_params(
     multiple attention groups. Fixed output shapes let one CUDA Graph replay
     different speculative verify layouts.
     """
-    assert b_req_idx.is_cuda and b_seq_len.is_cuda and b_mark_mtp_shared_group.is_cuda
+    assert (
+        get_backend().runtime.is_device_tensor(b_req_idx)
+        and get_backend().runtime.is_device_tensor(b_seq_len)
+        and get_backend().runtime.is_device_tensor(b_mark_mtp_shared_group)
+    )
     assert b_req_idx.shape == b_seq_len.shape == b_mark_mtp_shared_group.shape
     assert b_req_idx.shape[0] == att_batch_size
     assert att_batch_size > 0

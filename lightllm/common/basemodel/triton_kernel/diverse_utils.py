@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 import triton
 import triton.language as tl
@@ -71,7 +72,7 @@ def build_diverse_shared_group_markers(
     的组，最后两个 ``-1`` 则分别作为独立的一行组。
     """
 
-    assert b_shared_radix_node_id.is_cuda
+    assert get_backend().runtime.is_device_tensor(b_shared_radix_node_id)
     batch_size = b_shared_radix_node_id.shape[0]
     if batch_size == 0:
         return torch.empty((0,), dtype=torch.int32, device=b_shared_radix_node_id.device)

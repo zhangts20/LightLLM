@@ -10,14 +10,11 @@ from .graph_utils import weak_ref_tensor
 from ..base_att import AttControl
 
 
-@register_att_backend(name="paged_fa3", category="standard", platforms=("ascend",), validate_name="fa3")
+@register_att_backend(name="paged_fa3", category="standard", platforms=("ascend",), validate_name="ascend_fia")
 class PagedFa3AscendAttBackend(PagedFa3AttBackend):
-
     def get_causal_attn_mask(self, device):
         if not hasattr(self, "_causal_attn_mask"):
-            self._causal_attn_mask = torch.triu(
-                torch.ones((2048, 2048), dtype=torch.int8, device=device), diagonal=1
-            )
+            self._causal_attn_mask = torch.triu(torch.ones((2048, 2048), dtype=torch.int8, device=device), diagonal=1)
         return self._causal_attn_mask
 
     def get_decode_seq_len_cpu_buffers(self, min_len: int):
@@ -36,7 +33,6 @@ class PagedFa3AscendAttBackend(PagedFa3AttBackend):
 
 @dataclasses.dataclass
 class PagedFa3AscendPrefillAttState(PagedFa3PrefillAttState):
-
     def init_state(self):
         super().init_state()
         self.atten_mask = self.backend.get_causal_attn_mask(self.infer_state.input_ids.device)
@@ -69,7 +65,6 @@ class PagedFa3AscendPrefillAttState(PagedFa3PrefillAttState):
 
 @dataclasses.dataclass
 class PagedFa3AscendDecodeAttState(PagedFa3DecodeAttState):
-
     def init_state(self):
         args_mtp_step, _, rows, att_batch_size, last_rows, b_kv_seq_len = self._init_decode_layout()
         self.use_mtp_bnsd = args_mtp_step > 0 or not self.causal

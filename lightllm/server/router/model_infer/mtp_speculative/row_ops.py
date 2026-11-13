@@ -1,4 +1,5 @@
 """Row operations with CUDA/MACA kernels and portable accelerator fallbacks."""
+from lightllm.platform import get_backend
 
 import torch
 
@@ -9,16 +10,14 @@ def select_accepted_tail_rows(b_req_mtp_start_loc, accept_len, **tensors):
         select_accepted_tail_rows as select_kernel,
     )
 
-    if tensors["input_ids"].is_cuda:
-        return select_kernel(
-            b_req_mtp_start_loc=b_req_mtp_start_loc, accept_len=accept_len, **tensors
-        )
+    if get_backend().runtime.is_device_tensor(tensors["input_ids"]):
+        return select_kernel(b_req_mtp_start_loc=b_req_mtp_start_loc, accept_len=accept_len, **tensors)
     rows = (b_req_mtp_start_loc + accept_len - 1).long()
     return SelectedMtpRows(**{name: value.index_select(0, rows) for name, value in tensors.items()})
 
 
 def build_chained_mtp_decode_input_inplace(input_ids, draft_token_ids, b_req_mtp_start_loc, accept_len):
-    if input_ids.is_cuda:
+    if get_backend().runtime.is_device_tensor(input_ids):
         from lightllm.common.basemodel.triton_kernel.build_chained_mtp_decode_input import (
             build_chained_mtp_decode_input_inplace as build_kernel,
         )

@@ -60,6 +60,7 @@ API 返回。
            ▼
     final_token_metadata shm  ──HTTP──►  response["routed_experts"]
 """
+from lightllm.platform import get_backend
 
 import json
 import os
@@ -223,7 +224,7 @@ class MoeRouteInfoManager:
         moe_layer_index = self.layer_index_to_moe_index.get(layer_index)
         if moe_layer_index is None:
             return None
-        if not mem_indexes.is_cuda:
+        if not get_backend().runtime.is_device_tensor(mem_indexes):
             mem_indexes = mem_indexes.cuda(non_blocking=True)
 
         # Captures MoE topk ids for this layer and scatters them into the pinned CPU buffer.
@@ -251,7 +252,7 @@ class MoeRouteInfoManager:
     def extract(self, mem_indexes: torch.Tensor) -> np.ndarray:
         if not self.is_buffer_initialized():
             return
-        cpu_indexes = mem_indexes.cpu() if mem_indexes.is_cuda else mem_indexes
+        cpu_indexes = mem_indexes.cpu() if get_backend().runtime.is_device_tensor(mem_indexes) else mem_indexes
         return self.routing_buffer[cpu_indexes, :, :].numpy()
 
 
