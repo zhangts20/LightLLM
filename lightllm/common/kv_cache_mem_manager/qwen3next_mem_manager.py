@@ -5,7 +5,11 @@ from lightllm.common.kv_cache_mem_manager.mem_manager import MemoryManager
 from lightllm.utils.envs_utils import get_env_start_args, get_page_size
 from lightllm.common.linear_att_cache_manager import LinearAttCacheConfig, LinearAttCacheManager
 from .operator import LinearAttMemOperator
-from .operator.linear_att import Int8KVLinearAttMemOperator, NpuLinearAttMemOperator
+from .operator.linear_att import (
+    CoreXLinearAttMemOperator,
+    Int8KVLinearAttMemOperator,
+    NpuLinearAttMemOperator,
+)
 from .npu_mem_manager import NPUInt8KVMemoryManager, NPUInt8KVOperator
 from lightllm.utils.device_utils import get_target_device
 from typing import Tuple, Any, List
@@ -656,3 +660,85 @@ class Qwen3NextInt8KVMemoryManager(Qwen3NextMemManager):
             raise NotImplementedError("Qwen3.5 INT8 KV cache does not support prompt-cache import yet")
         self.kv_buffer[:, index].copy_(load_tensor_dict["kv_buffer"])
         self.scale_buffer[:, index].copy_(load_tensor_dict["scale_buffer"])
+
+
+class CoreXQwen3NextMemManager(Qwen3NextMemManager):
+    operator_class = CoreXLinearAttMemOperator
+    _split_full_att_kv = False
+
+    @staticmethod
+    def supported(dtype: torch.dtype) -> bool:
+        start_args = get_env_start_args()
+        return (
+            start_args.hardware_platform == "corex"
+            and get_page_size() > 1
+            and not start_args.enable_cpu_cache
+            and dtype in (torch.float16, torch.bfloat16)
+        )
+
+    def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:
+        layer_index = self.get_full_att_cache_layer_index(layer_index)
+        return self.k_cache[layer_index], self.v_cache[layer_index]
+
+    def _init_buffers(self, size: int, dtype: torch.dtype, head_num: int, head_dim: int, layer_num: int) -> None:
+        page = get_page_size()
+        alloc_size = ((size // page) + 1) * page
+        num_blocks = alloc_size // page
+        shape = (layer_num, num_blocks, head_num, page, head_dim)
+        self.k_cache = torch.empty(shape, dtype=dtype, device=self.target_device)
+        self.v_cache = torch.empty(shape, dtype=dtype, device=self.target_device)
+
+        self.kv_buffer = self.k_cache
+        logger.info(f"CoreX paged KV cache {tuple(shape)} page {page}")
+        from lightllm.common.basemodel.attention.ixformer_corex import CorexBlockTable
+
+        self.block_table = CorexBlockTable(self.target_device)
+        logger.info(
+            f"CoreX block table rows {self.block_table.rows} pages {self.block_table.pages}"
+        )
+        self._init_linear_att_buffers()
+
+    def _token_index(self, index) -> torch.Tensor:
+        if not torch.is_tensor(index):
+            index = torch.tensor(index, dtype=torch.int64, device=self.k_cache.device)
+        return index.to(device=self.k_cache.device, dtype=torch.int64)
+
+    def _page_slot(self, index) -> Tuple[torch.Tensor, torch.Tensor]:
+        token = self._token_index(index)
+        page = self.k_cache.shape[3]
+        block = torch.div(token, page, rounding_mode="floor")
+        offset = token.remainder(page)
+        return block, offset
+
+    def _gather_heads(self, cache: torch.Tensor, index) -> torch.Tensor:
+        block, offset = self._page_slot(index)
+        picked = cache[:, block, :, offset, :]
+        if block.ndim == 0:
+            return picked
+        return picked.movedim(0, 1)
+
+    def _scatter_heads(self, cache: torch.Tensor, index, values: torch.Tensor) -> None:
+        block, offset = self._page_slot(index)
+        if block.ndim != 0:
+            values = values.movedim(0, 1)
+        cache[:, block, :, offset, :] = values
+
+    def _packed_token_kv(self, index) -> torch.Tensor:
+        k = self._gather_heads(self.k_cache, index)
+        v = self._gather_heads(self.v_cache, index)
+        return torch.cat((k, v), dim=-2)
+
+    def get_index_kv_buffer(self, index: Any) -> dict[str, torch.Tensor]:
+        return {"kv_buffer": self._packed_token_kv(index)}
+
+    def load_index_kv_buffer(self, index, load_tensor_dict):
+        kv = load_tensor_dict["kv_buffer"]
+        self._scatter_heads(self.k_cache, index, kv[..., : self.head_num, :])
+        self._scatter_heads(self.v_cache, index, kv[..., self.head_num :, :])
+
+    def _free_buffers(self):
+        self.k_cache = None
+        self.v_cache = None
+        self.kv_buffer = None
+        self.block_table = None
+        self._free_linear_att_buffers()

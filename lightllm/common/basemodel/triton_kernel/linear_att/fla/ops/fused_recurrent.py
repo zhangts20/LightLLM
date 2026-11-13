@@ -15,6 +15,8 @@ import triton.language as tl
 
 from .op import exp
 
+from lightllm.utils.device_utils import is_corex
+
 
 @triton.heuristics(
     {
@@ -338,6 +340,134 @@ def _mlu_decode_recurrent(
     return o.squeeze(0), state
 
 
+def _as_ixf_seq(x: torch.Tensor) -> torch.Tensor:
+    assert x.shape[1] == 1, f"decode expects one query per request, got {tuple(x.shape)}"
+    if x.is_contiguous():
+        # (B, 1, H, D) contiguous and (1, B, H, D) share one memory layout.
+        return x.view(1, x.shape[0], *x.shape[2:])
+    return x.contiguous().view(1, x.shape[0], *x.shape[2:])
+
+
+def _flat_head_weight(weight: torch.Tensor, heads: int) -> torch.Tensor | None:
+    flat = weight.reshape(-1)
+    if flat.numel() != heads:
+        return None
+    return flat if flat.stride(0) == 1 else flat.contiguous()
+
+
+@triton.jit
+def _gdn_gate_beta_kernel(
+    a_ptr,
+    b_ptr,
+    a_log_ptr,
+    dt_ptr,
+    g_ptr,
+    beta_ptr,
+    stride_a,
+    stride_b,
+    heads,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < heads
+    a = tl.load(a_ptr + row * stride_a + offs, mask=mask, other=0).to(tl.float32)
+    b = tl.load(b_ptr + row * stride_b + offs, mask=mask, other=0).to(tl.float32)
+    a_log = tl.load(a_log_ptr + offs, mask=mask, other=0).to(tl.float32)
+    dt = tl.load(dt_ptr + offs, mask=mask, other=0).to(tl.float32)
+    x = a + dt
+    soft = tl.where(x <= 20, tl.log(1 + tl.exp(tl.minimum(x, 20))), x)
+    g = -tl.exp(a_log) * soft
+    beta = tl.sigmoid(b)
+    base = row * heads + offs
+    tl.store(g_ptr + base, g, mask=mask)
+    tl.store(beta_ptr + base, beta.to(beta_ptr.dtype.element_ty), mask=mask)
+
+
+def _gdn_gate_beta(
+    a_raw: torch.Tensor,
+    b_raw: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    heads = a_raw.shape[-1]
+    a_log = _flat_head_weight(A_log, heads)
+    dt = _flat_head_weight(dt_bias, heads)
+    if a_log is None or dt is None or a_raw.stride(-1) != 1 or b_raw.stride(-1) != 1:
+        x = a_raw.float() + dt_bias.float()
+        soft = torch.where(x <= 20, torch.log1p(torch.exp(x.clamp(max=20))), x)
+        g = (-torch.exp(A_log.float()) * soft).view(1, a_raw.shape[0], heads)
+        beta = torch.sigmoid(b_raw.float()).to(dtype=dtype).view(1, a_raw.shape[0], heads)
+        return g, beta
+    batch = a_raw.shape[0]
+    g = torch.empty((1, batch, heads), dtype=torch.float32, device=a_raw.device)
+    beta = torch.empty((1, batch, heads), dtype=dtype, device=a_raw.device)
+    block = 128
+    _gdn_gate_beta_kernel[(batch, triton.cdiv(heads, block))](
+        a_raw,
+        b_raw,
+        a_log,
+        dt,
+        g,
+        beta,
+        a_raw.stride(0),
+        b_raw.stride(0),
+        heads,
+        BLOCK=block,
+    )
+    return g, beta
+
+
+_decode_cu_seqlens_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _decode_cu_seqlens(batch: int, device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index, batch)
+    cu = _decode_cu_seqlens_cache.get(key)
+    if cu is None:
+        cu = torch.arange(batch + 1, device=device, dtype=torch.int32)
+        _decode_cu_seqlens_cache[key] = cu
+    return cu
+
+
+def _corex_decode_recurrent(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    a_raw: torch.Tensor,
+    b_raw: torch.Tensor,
+    scale: float,
+    state: torch.Tensor,
+    indices: torch.Tensor,
+    B: int,
+    HV: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import ixformer.inference.functions as ixf
+
+    q_i = _as_ixf_seq(q)
+    k_i = _as_ixf_seq(k)
+    v_i = _as_ixf_seq(v)
+    g, beta = _gdn_gate_beta(a_raw, b_raw, A_log, dt_bias, q.dtype)
+    o, _ = ixf.fused_recurrent_gated_delta_rule(
+        q_i,
+        k_i,
+        v_i,
+        g,
+        beta,
+        scale=scale,
+        initial_state=state,
+        inplace_final_state=True,
+        cu_seqlens=_decode_cu_seqlens(B, q.device),
+        ssm_state_indices=indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+    return o.view(B, 1, HV, o.shape[-1]), state
+
+
 def _ensure_qkv_token_strided(x: torch.Tensor, inner_numel: int):
     """Return q/k/v and per-token stride, copying only when needed.
 
@@ -395,6 +525,26 @@ def fused_recurrent_gated_delta_rule_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
+    if (
+        is_corex()
+        and T == 1
+        and A_log is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+    ):
+        return _corex_decode_recurrent(
+            q,
+            k,
+            v,
+            A_log,
+            dt_bias,
+            a_raw,
+            b_raw,
+            scale,
+            initial_state,
+            ssm_state_indices,
+            B,
+            HV,
+        )
     # Decode passes cu_seqlens=None (equal-length one-token sequences); the
     # Qwen3Next MTP verify path passes cu_seqlens for variable-length verify
     # chunks. Both flow through the per-token strided-view path below.
@@ -452,7 +602,6 @@ def fused_recurrent_gated_delta_rule_fwd(
         num_warps = 1
         num_stages = 1 if T == 1 else 3
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
-    fuse_gating = A_log is not None
 
     if out is not None:
         o = out.unsqueeze(0) if out.ndim == v.ndim else out
@@ -485,6 +634,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         assert ssm_state_write_indices.stride(-1) == 1, "2D ssm_state_write_indices must have contiguous rows"
         stride_write_indices_seq, stride_write_indices_tok = ssm_state_write_indices.stride()
 
+    fuse_gating = A_log is not None
     grid = (NK, NV, N * HV)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,

@@ -214,3 +214,48 @@ class Int8kvTritonDecodeAttState(BaseDecodeAttState):
             cache_v_scale=v_scale,
             alloc_tensor_func=alloc_func,
         )
+
+
+def _corex_verify_width(state: "CoreXInt8kvTritonDecodeAttState") -> int:
+    if state.backend.model.is_mtp_draft_model:
+        return 1
+    args = state.backend.model.args
+    if args.mtp_mode != "eagle_with_att" or args.mtp_dynamic_verify:
+        return 1
+    if args.enable_decode_microbatch_overlap or args.enable_tpsp_mix_mode:
+        return 1
+    return args.mtp_step + 1
+
+
+@dataclasses.dataclass
+class CoreXInt8kvTritonDecodeAttState(Int8kvTritonDecodeAttState):
+
+    def normal_decode_att(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        v: torch.Tensor,
+        v_scale: torch.Tensor,
+        alloc_func=torch.empty,
+    ):
+        from ...triton_kernel.att.decode_att.int8kv.corex_int8kv_flash_decoding import (
+            token_decode_attention_flash_decoding,
+        )
+
+        return token_decode_attention_flash_decoding(
+            q=q,
+            infer_state=self.infer_state,
+            cache_k=k,
+            cache_k_scale=k_scale,
+            cache_v=v,
+            cache_v_scale=v_scale,
+            alloc_tensor_func=alloc_func,
+            verify_width=_corex_verify_width(self),
+        )
+
+
+@register_att_backend(name="triton", category="standard", kv_types=("int8kv",), platforms=("corex"))
+class CoreXInt8kvTritonAttBackend(Int8kvTritonAttBackend):
+    def create_att_decode_state(self, infer_state) -> "CoreXInt8kvTritonDecodeAttState":
+        return CoreXInt8kvTritonDecodeAttState(backend=self, infer_state=infer_state)

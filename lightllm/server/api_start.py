@@ -30,6 +30,11 @@ from lightllm.utils.cpu_cache_host_register import MACA_HOST_REGISTER_LIMIT_BYTE
 logger = init_logger(__name__)
 
 
+def _check_corex_pd_kv(args: StartArgs):
+    if args.hardware_platform == "corex" and args.run_mode in ("prefill", "decode"):
+        raise NotImplementedError("CoreX does not support PD KV transfer")
+
+
 def _check_maca_embed_cache_size(args: StartArgs):
     if args.hardware_platform != "maca":
         return
@@ -46,6 +51,7 @@ def _set_envs_and_config(args: StartArgs):
 
 
 def _launch_subprocesses(args: StartArgs):
+    _check_corex_pd_kv(args)
     _set_envs_and_config(args)
 
     if args.mtp_mode is not None:

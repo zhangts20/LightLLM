@@ -28,6 +28,11 @@ class MacaBackend(Backend):
         super().__init__(MacaRuntime(), CudaGraphBackend())
 
 
+@register_platform("corex", ops_fallback=("corex", "cuda_like"), sampling_fallback=("cuda_like",))
+class CorexBackend(CudaBackend):
+    pass
+
+
 @register_platform("musa", ops_fallback=("cuda_like",), sampling_fallback=("cuda_like",))
 class MusaBackend(Backend):
     def __init__(self) -> None:

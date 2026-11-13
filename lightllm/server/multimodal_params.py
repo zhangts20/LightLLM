@@ -1,7 +1,6 @@
 """Multimodal parameters for text generation."""
 import asyncio
 import os
-import librosa
 import base64
 import numpy as np
 from typing import List, Tuple, Optional
@@ -44,6 +43,8 @@ class AudioItem:
             return
 
         try:
+            import librosa
+
             if self._type == "url":
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
                 proxy = os.getenv("REQUEST_PROXY", None)

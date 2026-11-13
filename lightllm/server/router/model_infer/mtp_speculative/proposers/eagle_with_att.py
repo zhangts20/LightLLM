@@ -11,6 +11,7 @@ from lightllm.server.router.model_infer.mtp_speculative.proposers.base import (
 )
 from lightllm.server.router.model_infer.mtp_speculative.proposers.proposal_type import EagleSpecProposal
 from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
+from lightllm.utils.envs_utils import get_env_start_args
 
 
 class EagleWithAttProposer(BaseSpecProposer):
@@ -70,6 +71,22 @@ class EagleWithAttProposer(BaseSpecProposer):
         accepted_tail_rows = (b_req_mtp_start_loc + accept_len - 1).long()
         draft_model = self.backend.draft_models[0]
 
+        tail_seq_cpu = None
+        tail_mem_ready = None
+        if (
+            draft_step > 1
+            and get_env_start_args().hardware_platform == "corex"
+            and target_model_input.b_seq_len.device.type != "cpu"
+        ):
+            tail_seq_cpu = g_pin_mem_manager.async_copy_from_gpu_tensor(
+                key="eagle_tail_seq",
+                gpu_tensor=target_model_input.b_seq_len.index_select(0, accepted_tail_rows),
+            )
+            tail_mem_ready = g_pin_mem_manager.async_copy_from_gpu_tensor_with_event(
+                key="eagle_tail_mem",
+                gpu_tensor=target_model_input.mem_indexes.index_select(0, accepted_tail_rows),
+            )
+
         # target verify 的 mem_indexes 正是已验证 token 应写入的 KV slot。
         # 仅替换 token 和 hidden，其他布局 tensor 与 target 共享；浅副本保证
         # draft forward 不会改变 target_model_input 对象自身的字段。
@@ -114,9 +131,16 @@ class EagleWithAttProposer(BaseSpecProposer):
             b_position_delta=target_model_input.b_position_delta,
         )
         extra_allocations = []
+        if tail_mem_ready is not None:
+            tail_mem_ready.wait()
+            alloc_seq_len = tail_seq_cpu
+            alloc_mem_indexes = tail_mem_ready.tensor
+        else:
+            alloc_seq_len = selected_rows.b_seq_len
+            alloc_mem_indexes = selected_rows.mem_indexes
         extra_mem_indexes_cpu = mtp_utils.alloc_eagle_mem_indexes(
-            selected_rows.b_seq_len,
-            selected_rows.mem_indexes,
+            alloc_seq_len,
+            alloc_mem_indexes,
             draft_step - 1,
             allocations=extra_allocations,
         )

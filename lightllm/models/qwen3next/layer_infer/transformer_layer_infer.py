@@ -23,6 +23,7 @@ from lightllm.models.qwen3next.triton_kernel.shared_expert_gate import sigmoid_m
 from lightllm.distributed import all_reduce
 from lightllm.utils.envs_utils import get_env_start_args
 from functools import partial
+from lightllm.utils.device_utils import is_corex
 
 logger = init_logger(__name__)
 
@@ -38,6 +39,7 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         )
         self.num_experts_per_tok = network_config.get("num_experts_per_tok", 1)
         self.norm_topk_prob = network_config.get("norm_topk_prob", False)
+        self._residual_rms_norm = None
 
         super().__init__(layer_num, network_config)
         self.head_dim_ = network_config.get(
@@ -45,6 +47,10 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         )
         num_full_attention_layers = network_config["full_attention_interval"]
         self.is_linear_attention_layer = (layer_num + 1) % num_full_attention_layers != 0
+        if is_corex():
+            from lightllm.platform.ops.corex import residual_rms_norm
+
+            self._residual_rms_norm = residual_rms_norm
         return
 
     def _bind_func(self):
@@ -62,6 +68,23 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         else:
             self._ffn = partial(LlamaTransformerLayerInfer._ffn, self)
         return
+
+    def _add_and_ffn_norm(self, hidden, delta, infer_state, layer_weight):
+        hidden_2d = hidden.view(-1, self.embed_dim_)
+        delta_2d = delta.view(-1, self.embed_dim_)
+        if self._residual_rms_norm is None or hidden_2d.dtype not in (torch.float16, torch.bfloat16):
+            return super()._add_and_ffn_norm(hidden, delta, infer_state, layer_weight)
+        if not delta_2d.is_contiguous():
+            delta_2d = delta_2d.contiguous()
+        out = self.alloc_tensor(hidden_2d.shape, dtype=hidden_2d.dtype, device=hidden_2d.device)
+        return self._residual_rms_norm(
+            input=delta_2d,
+            weight=layer_weight.ffn_norm_weight_.weight,
+            eps=self.eps_,
+            residual=hidden_2d,
+            out=out,
+            residual_out=hidden_2d,
+        )
 
     def _ffn_tp_impl(
         self, input: torch.Tensor, infer_state: Qwen3NextInferStateInfo, layer_weight: Qwen3NextTransformerLayerWeight
@@ -139,28 +162,20 @@ class Qwen3NextTransformerLayerInfer(LlamaTransformerLayerInfer):
         input = input.view(-1, self.embed_dim_)
         input = self._tpsp_allgather(input=input, infer_state=infer_state)
         qkv_gate_out = layer_weight.qkvo_gate_proj.mm(input)
-        qkv_out, o_gate = qkv_gate_out.split(
-            [
-                self.tp_q_head_num_ * self.head_dim_ * 2 + (self.tp_k_head_num_ + self.tp_v_head_num_) * self.head_dim_,
-                self.tp_q_head_num_ * self.head_dim_,
-            ],
-            dim=-1,
-        )
-        q, cache_kv = qkv_out.split(
-            [self.tp_q_head_num_ * self.head_dim_ * 2, (self.tp_k_head_num_ + self.tp_v_head_num_) * self.head_dim_],
-            dim=-1,
-        )
+        q_size = self.tp_q_head_num_ * self.head_dim_
+        kv_size = (self.tp_k_head_num_ + self.tp_v_head_num_) * self.head_dim_
+        q, cache_kv, o_gate = qkv_gate_out.split([q_size, kv_size, q_size], dim=-1)
         infer_state.gate_logics_value = o_gate
         layer_weight.qk_norm_weight_(
             q,
             cache_kv[:, : self.tp_k_head_num_ * self.head_dim_],
             eps=self.eps_,
         )
-        cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_), self.head_dim_)
+        cache_kv = cache_kv.view(q.shape[0], self.tp_k_head_num_ + self.tp_v_head_num_, self.head_dim_)
         self.platform_backend.ops.rotary_emb(
             is_prefill=infer_state.is_prefill,
             batch_size=infer_state.batch_size,
-            q=q.view(-1, self.tp_q_head_num_, self.head_dim_),
+            q=q.view(q.shape[0], self.tp_q_head_num_, self.head_dim_),
             k=cache_kv[:, : self.tp_k_head_num_, :],
             cos=infer_state.position_cos,
             sin=infer_state.position_sin,

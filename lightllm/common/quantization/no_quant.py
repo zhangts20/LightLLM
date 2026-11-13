@@ -63,3 +63,37 @@ class NoQuantization(QuantizationMethod):
     @property
     def method_name(self):
         return "none"
+
+
+@QUANTMETHODS.register("none", platform="corex")
+class CorexNoQuantization(NoQuantization):
+
+    def apply(
+        self,
+        input_tensor: torch.Tensor,
+        weight_pack: WeightPack,
+        out: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
+        use_custom_tensor_mananger: bool = True,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        weight = weight_pack.weight
+        if weight.dim() != 2 or input_tensor.dtype not in (torch.float16, torch.bfloat16):
+            return super().apply(
+                input_tensor,
+                weight_pack,
+                out=out,
+                workspace=workspace,
+                use_custom_tensor_mananger=use_custom_tensor_mananger,
+                bias=bias,
+            )
+        from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_manager
+        import ixformer.inference.functions as ixf
+
+        if out is None:
+            shape = (input_tensor.shape[0], weight.shape[0])
+            if use_custom_tensor_mananger:
+                out = g_cache_manager.alloc_tensor(shape, input_tensor.dtype, device=input_tensor.device)
+            else:
+                out = torch.empty(shape, dtype=input_tensor.dtype, device=input_tensor.device)
+        return ixf.linear(input_tensor, weight, bias=bias, output=out)

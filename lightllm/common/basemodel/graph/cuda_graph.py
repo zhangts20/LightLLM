@@ -1,7 +1,7 @@
 from lightllm.common.basemodel.graph.base.decode_graph import DecodeGraph, register_decode_graph
 
 
-@register_decode_graph("cuda", "musa", "maca", "mlu")
+@register_decode_graph("cuda", "musa", "maca", "mlu", "corex")
 class CudaGraph(DecodeGraph):
     pass
 

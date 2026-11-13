@@ -135,6 +135,99 @@ class w8a8QuantizationMethod(BaseQuantizationMethod):
         return mm_param, mm_param_list
 
 
+# One workspace for every layer. Each get() builds a new method object, so a
+# per-instance buffer would keep a padded copy of every linear_in weight.
+_corex_pad_w = None
+_corex_pad_s = None
+_corex_pad_b = None
+
+
+@QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="corex")
+class w8a8CorexQuantizationMethod(w8a8QuantizationMethod):
+    def apply(
+        self,
+        input_tensor: torch.Tensor,
+        weight_pack: WeightPack,
+        out: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
+        use_custom_tensor_mananger: bool = True,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        import ixformer.inference.functions as ixf
+
+        x = input_tensor.contiguous()
+        weight = weight_pack.weight
+        m, n = x.shape[0], weight.shape[0]
+        x_q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+        x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
+        ixf.dynamic_scaled_int8_quant(x_q, x, x_scale)
+        if out is None:
+            if use_custom_tensor_mananger:
+                out = self.cache_manager.alloc_tensor((m, n), x.dtype, device=x.device)
+            else:
+                out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        align = 128
+        if weight.ndim == 2 and m >= 128 and n >= 1024 and n % align != 0:
+            global _corex_pad_w, _corex_pad_s, _corex_pad_b
+            n_pad = (n + align - 1) // align * align
+            scale = weight_pack.weight_scale
+            w_buf = _corex_pad_w
+            if (
+                w_buf is None
+                or w_buf.shape != (n_pad, weight.shape[1])
+                or w_buf.device != weight.device
+                or w_buf.dtype != weight.dtype
+            ):
+                _corex_pad_w = torch.empty((n_pad, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+                _corex_pad_s = torch.empty((n_pad,), dtype=scale.dtype, device=weight.device)
+                _corex_pad_b = None
+            w_buf = _corex_pad_w
+            s_buf = _corex_pad_s
+            w_buf[:n].copy_(weight)
+            w_buf[n:].zero_()
+            s_buf[:n].copy_(scale.reshape(-1))
+            s_buf[n:].zero_()
+            b_buf = None
+            if bias is not None:
+                if (
+                    _corex_pad_b is None
+                    or _corex_pad_b.numel() != n_pad
+                    or _corex_pad_b.dtype != bias.dtype
+                    or _corex_pad_b.device != bias.device
+                ):
+                    _corex_pad_b = torch.empty((n_pad,), dtype=bias.dtype, device=bias.device)
+                b_buf = _corex_pad_b
+                b_buf[:n].copy_(bias.reshape(-1))
+                b_buf[n:].zero_()
+            out_pad = torch.empty((m, n_pad), dtype=x.dtype, device=x.device)
+            ixf.w8a8(
+                x_q,
+                w_buf,
+                x_scale,
+                s_buf,
+                bias=b_buf,
+                output=out_pad,
+                format="TN",
+                out_dtype=x.dtype,
+            )
+            out.copy_(out_pad[:, :n])
+            return out
+        return ixf.w8a8(
+            x_q,
+            weight,
+            x_scale,
+            weight_pack.weight_scale,
+            bias=bias,
+            output=out,
+            format="TN",
+            out_dtype=x.dtype,
+        )
+
+    @property
+    def method_name(self):
+        return "w8a8-corex"
+
+
 @QUANTMETHODS.register(["w8a8-vllm", "w8a8"], platform="maca")
 class w8a8MacaQuantizationMethod(w8a8QuantizationMethod):
     @staticmethod

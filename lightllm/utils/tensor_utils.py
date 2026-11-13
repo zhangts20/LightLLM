@@ -1,5 +1,7 @@
 import torch
 
+from lightllm.utils.device_utils import is_corex
+
 
 class _RawDevicePtrHolder:
     """Expose a device pointer without retaining the allocation it references."""
@@ -48,7 +50,8 @@ def tensor_to_no_ref_tensor(origin_tensor: torch.Tensor) -> torch.Tensor:
         from torch_npu._C import _weak_ref_tensor
 
         return _weak_ref_tensor(origin_tensor)
-    if origin_tensor.device.type in ("musa", "mlu"):
+    # CoreX reports device type cuda, so the platform flag is checked once and cached.
+    if origin_tensor.device.type in ("musa", "mlu") or (origin_tensor.device.type == "cuda" and is_corex()):
         return _musa_no_ref_tensor(origin_tensor)
     device_ptr = origin_tensor.data_ptr()
     nbytes = origin_tensor.numel() * origin_tensor.element_size()

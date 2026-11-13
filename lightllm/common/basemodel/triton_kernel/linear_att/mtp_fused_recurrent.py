@@ -17,6 +17,7 @@ import triton.language as tl
 
 from lightllm.common.triton_utils.autotuner import autotune
 from lightllm.platform import get_backend
+from lightllm.utils.device_utils import is_corex
 
 
 def _mtp_configs():
@@ -354,10 +355,10 @@ def mtp_fused_recurrent_gated_delta_rule(
             num_warps = int(run_config["num_warps"])
             num_stages = int(run_config["num_stages"])
     else:
-        BV = min(triton.next_power_of_2(V), 8)
+        BV = min(triton.next_power_of_2(V), 16 if is_corex() else 8)
         if run_config is None:
             num_warps = 1
-            num_stages = 3
+            num_stages = 1 if is_corex() else 3
         else:
             num_warps = int(run_config["num_warps"])
             num_stages = int(run_config["num_stages"])
