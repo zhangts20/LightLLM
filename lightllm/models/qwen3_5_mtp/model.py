@@ -10,7 +10,7 @@ from lightllm.models.qwen3_5_mtp.layer_infer.pre_layer_infer import Qwen3_5MTPPr
 
 
 @DraftModelRegistry(
-    model_type=("qwen3_5", "qwen3_5_text"),
+    model_type=("qwen3_5", "qwen3_5_text", "sensenova_loop"),
     spec_modes=("vanilla_with_att", "eagle_with_att"),
 )
 class Qwen3_5MTPModel(Qwen3_5TpPartModel):

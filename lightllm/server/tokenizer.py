@@ -122,6 +122,12 @@ def get_tokenizer(
         tokenizer = QWen3_5Tokenizer(
             tokenizer=tokenizer, image_processor=processor.image_processor, model_cfg=model_cfg
         )
+    elif model_type == "sensenova_loop" and "vision_config" in model_cfg:
+        from transformers import AutoImageProcessor
+        from ..models.qwen3_5.model import QWen3_5Tokenizer
+
+        image_processor = AutoImageProcessor.from_pretrained(tokenizer_name)
+        tokenizer = QWen3_5Tokenizer(tokenizer=tokenizer, image_processor=image_processor, model_cfg=model_cfg)
     elif model_cfg.get("thinker_config") is not None:
         from transformers import AutoProcessor
 

@@ -41,7 +41,9 @@ class _DraftModelRegistry:
                 target_model_cfg.get("model_type", ""),
                 (target_model_cfg.get("text_config") or {}).get("model_type", ""),
             }
-            if target_types.intersection({"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}):
+            if target_types.intersection(
+                {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "sensenova_loop"}
+            ):
                 model_type = "qwen3_5"
 
         try:

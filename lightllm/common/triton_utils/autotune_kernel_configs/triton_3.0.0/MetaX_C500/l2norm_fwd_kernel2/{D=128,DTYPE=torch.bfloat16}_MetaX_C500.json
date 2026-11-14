@@ -5,14 +5,23 @@
   "128": {
     "num_warps": 4
   },
+  "131072": {
+    "num_warps": 4
+  },
   "16": {
     "num_warps": 8
   },
   "16384": {
     "num_warps": 4
   },
+  "2048": {
+    "num_warps": 8
+  },
   "256": {
     "num_warps": 8
+  },
+  "262144": {
+    "num_warps": 4
   },
   "32": {
     "num_warps": 8
@@ -31,6 +40,9 @@
   },
   "64": {
     "num_warps": 8
+  },
+  "8": {
+    "num_warps": 4
   },
   "8192": {
     "num_warps": 8
