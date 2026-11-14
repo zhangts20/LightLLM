@@ -15,6 +15,10 @@
     "BLOCK_N": 64,
     "num_warps": 1
   },
+  "131072": {
+    "BLOCK_N": 128,
+    "num_warps": 1
+  },
   "1536": {
     "BLOCK_N": 256,
     "num_warps": 1
@@ -106,6 +110,10 @@
   "768": {
     "BLOCK_N": 128,
     "num_warps": 1
+  },
+  "8": {
+    "BLOCK_N": 1024,
+    "num_warps": 8
   },
   "8192": {
     "BLOCK_N": 128,
