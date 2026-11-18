@@ -110,6 +110,12 @@ def _fwd_int8kv_decode_stage1(
     n_kv_blocks = tl.cdiv(kv_len, PAGE_SIZE)
     if split_id >= n_kv_blocks:
         return
+    block_bias = 0
+    span_blocks = n_kv_blocks
+    if USE_SLIDING_WINDOW:
+        window_lo = tl.maximum(kv_len - Q_LEN - sliding_left, 0)
+        block_bias = window_lo // PAGE_SIZE
+        span_blocks = tl.maximum(n_kv_blocks - block_bias, 0)
 
     offs_d = tl.arange(0, BLOCK_D)
     offs_g = tl.arange(0, NUM_GROUPS)
@@ -140,7 +146,8 @@ def _fwd_int8kv_decode_stage1(
     l_i = tl.zeros([Q_ROWS], dtype=tl.float32)
     q_pos = kv_len - Q_LEN + q_s
 
-    for kv_block in range(split_id, n_kv_blocks, n_splits):
+    for local_block in range(split_id, span_blocks, n_splits):
+        kv_block = block_bias + local_block
         block_start = kv_block * PAGE_SIZE
         block_end = tl.minimum(kv_len, block_start + PAGE_SIZE)
         n_tiles = tl.cdiv(block_end - block_start, BLOCK_N)
@@ -281,6 +288,12 @@ def _fwd_int8kv_decode_stage1_fp16(
     n_kv_blocks = tl.cdiv(kv_len, PAGE_SIZE)
     if split_id >= n_kv_blocks:
         return
+    block_bias = 0
+    span_blocks = n_kv_blocks
+    if USE_SLIDING_WINDOW:
+        window_lo = tl.maximum(kv_len - Q_LEN - sliding_left, 0)
+        block_bias = window_lo // PAGE_SIZE
+        span_blocks = tl.maximum(n_kv_blocks - block_bias, 0)
 
     offs_d = tl.arange(0, BLOCK_D)
     offs_g = tl.arange(0, NUM_GROUPS)
@@ -312,7 +325,8 @@ def _fwd_int8kv_decode_stage1_fp16(
     l_i = tl.zeros([Q_ROWS], dtype=tl.float32)
     q_pos = kv_len - Q_LEN + q_s
 
-    for kv_block in range(split_id, n_kv_blocks, n_splits):
+    for local_block in range(split_id, span_blocks, n_splits):
+        kv_block = block_bias + local_block
         block_start = kv_block * PAGE_SIZE
         block_end = tl.minimum(kv_len, block_start + PAGE_SIZE)
         n_tiles = tl.cdiv(block_end - block_start, BLOCK_N)
@@ -537,6 +551,8 @@ def int8kv_flash_decode(
 
     if max_kv_len is None:
         max_kv_len = int(cache_seqlens.max().item())
+    if use_swa:
+        max_kv_len = min(int(max_kv_len), sliding_left + q_len + page_size)
     n_splits = int(cfg["n_splits"]) if cfg.get("n_splits") else _split_count(batch, max_kv_len, page_size)
     n_splits = max(1, n_splits)
 

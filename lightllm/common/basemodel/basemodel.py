@@ -443,7 +443,7 @@ class TpPartBaseModel:
             if query_group_size > get_page_size():
                 raise ValueError("grouped draft decode requires a HOLD page large enough for its query group")
             return query_group_size
-        if getattr(getattr(self, "args", None), "mtp_mode", None) not in ("dspark", "dflash"):
+        if getattr(getattr(self, "args", None), "mtp_mode", None) not in ("dspark", "dflash", "dflash2"):
             return 1
         if get_page_size() == 1:
             return 1

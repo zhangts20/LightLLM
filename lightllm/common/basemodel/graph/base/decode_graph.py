@@ -406,7 +406,7 @@ class DecodeGraph:
         from lightllm.common.basemodel.basemodel import TpPartBaseModel
 
         model: TpPartBaseModel = model
-        if self.args.mtp_mode in ("dspark", "dflash"):
+        if self.args.mtp_mode in ("dspark", "dflash", "dflash2"):
             self._warmup_block_graphs(model, overlap=False)
             return
         # decode cuda graph init
@@ -477,7 +477,7 @@ class DecodeGraph:
         from lightllm.common.basemodel.basemodel import TpPartBaseModel
 
         model: TpPartBaseModel = model
-        if self.args.mtp_mode in ("dspark", "dflash"):
+        if self.args.mtp_mode in ("dspark", "dflash", "dflash2"):
             self._warmup_block_graphs(model, overlap=True)
             return
 

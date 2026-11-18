@@ -383,7 +383,7 @@ class PagedFa3DecodeAttState(BaseDecodeAttState):
     def _init_decode_layout(self):
         args = get_env_start_args()
         model = self.backend.model
-        is_block_mode = args.mtp_mode in ("dspark", "dflash")
+        is_block_mode = args.mtp_mode in ("dspark", "dflash", "dflash2")
         # Proposers and graph capture use model-local widths: recurrent and
         # chained drafts use one row, block drafts mtp_step, main mtp_step + 1.
         args_mtp_step = model.mtp_manager.get_decode_draft_step(model.is_mtp_draft_model)
