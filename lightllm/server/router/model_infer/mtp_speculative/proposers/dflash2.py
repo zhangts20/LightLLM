@@ -15,6 +15,7 @@ class DFlash2Proposer(DFlashProposer):
         req_num: int,
         block_size: int,
         draft_step: int,
+        extra_allocations,
     ) -> DFlashSpecProposal:
         mtp_collector = draft_output.mtp_collector
         flat_token_ids = mtp_collector.draft_token_ids
@@ -32,5 +33,6 @@ class DFlash2Proposer(DFlashProposer):
 
         return DFlashSpecProposal(
             token_ids=selected_token_ids[:, :draft_step].contiguous(),
+            extra_mem_indexes_cpu=extra_allocations,
             schedule_scores=schedule_scores,
         )

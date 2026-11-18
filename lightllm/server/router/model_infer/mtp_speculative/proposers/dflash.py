@@ -163,6 +163,7 @@ class DFlashProposer(BaseSpecProposer):
             req_num=req_num,
             block_size=block_size,
             draft_step=draft_step,
+            extra_allocations=extra_allocations,
         )
 
     def _build_proposal(
@@ -171,6 +172,7 @@ class DFlashProposer(BaseSpecProposer):
         req_num: int,
         block_size: int,
         draft_step: int,
+        extra_allocations,
     ) -> DFlashSpecProposal:
         if self.enable_dynmaic_mtp:
             flat_draft_token_ids, flat_draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
