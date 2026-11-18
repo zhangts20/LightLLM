@@ -4,7 +4,10 @@ from lightllm.platform.base.runtime import BackendRuntime
 
 
 class AscendRuntime(BackendRuntime):
-    
+    def __init__(self) -> None:
+        # Register NPU devices and HCCL only when this runtime is selected.
+        import torch_npu  # noqa: F401
+
     @property
     def device_type(self) -> str:
         return "npu"
@@ -25,7 +28,7 @@ class AscendRuntime(BackendRuntime):
 
     def device_count(self) -> int:
         return torch.npu.device_count()
-    
+
     def is_available(self) -> bool:
         return torch.npu.is_available()
 

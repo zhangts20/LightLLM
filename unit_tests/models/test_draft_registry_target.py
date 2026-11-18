@@ -22,30 +22,36 @@ def registry(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["dspark", "dflash"])
-@pytest.mark.parametrize("target_type", ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"])
+@pytest.mark.parametrize(
+    "target_type", ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "sensenova_loop"]
+)
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_qwen3_checkpoint_uses_qwen35_target_adapter(registry, mode, target_type, wrapped):
     target = {"model_type": target_type}
     if wrapped:
         target = {"model_type": "multimodal", "text_config": target}
-    draft = {"model_type": "qwen3", "rope_parameters": {"partial_rotary_factor": .25}}
+    draft = {"model_type": "qwen3", "rope_parameters": {"partial_rotary_factor": 0.25}}
     selected = registry_module.get_draft_model_class(draft, mode, target_model_cfg=target)
     assert selected is registry._registry[("qwen3_5", mode)]
-    assert draft == {"model_type": "qwen3", "rope_parameters": {"partial_rotary_factor": .25}}
+    assert draft == {"model_type": "qwen3", "rope_parameters": {"partial_rotary_factor": 0.25}}
 
 
-@pytest.mark.parametrize("draft_type, mode, target", [
-    ("qwen3", "dspark", None),
-    ("qwen3", "dflash", {"model_type": "qwen3"}),
-    ("qwen3", "eagle3", {"model_type": "qwen3_5"}),
-    ("deepseek_v3", "vanilla_with_att", {"model_type": "qwen3_5"}),
-    ("qwen3_5_moe", "vanilla_with_att", {"model_type": "qwen3_5_moe"}),
-    ("qwen3_5", "dspark", {"model_type": "qwen3_5"}),
-])
+@pytest.mark.parametrize(
+    "draft_type, mode, target",
+    [
+        ("qwen3", "dspark", None),
+        ("qwen3", "dflash", {"model_type": "qwen3"}),
+        ("qwen3", "eagle3", {"model_type": "qwen3_5"}),
+        ("deepseek_v3", "vanilla_with_att", {"model_type": "qwen3_5"}),
+        ("qwen3_5_moe", "vanilla_with_att", {"model_type": "qwen3_5_moe"}),
+        ("qwen3_5", "dspark", {"model_type": "qwen3_5"}),
+    ],
+)
 def test_other_registrations_unchanged(registry, draft_type, mode, target):
-    assert registry_module.get_draft_model_class(
-        {"model_type": draft_type}, mode, target_model_cfg=target
-    ) is registry._registry[(draft_type, mode)]
+    assert (
+        registry_module.get_draft_model_class({"model_type": draft_type}, mode, target_model_cfg=target)
+        is registry._registry[(draft_type, mode)]
+    )
 
 
 def test_unknown_draft_still_errors(registry):

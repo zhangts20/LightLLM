@@ -1,4 +1,5 @@
 """仅动态 MTP verify 使用的选行与 ModelInput 压缩算子。"""
+from lightllm.platform import get_backend
 
 from typing import Optional
 
@@ -54,7 +55,7 @@ def sample_dynamic_mtp_row_mask(
     pre_draft_step = max_draft_step if pre_draft_step is None else int(pre_draft_step)
     assert 0 <= pre_draft_step <= max_draft_step
     assert b_req_idx.shape[0] % (max_draft_step + 1) == 0
-    assert req_to_next_token_scores.is_cuda
+    assert get_backend().runtime.is_device_tensor(req_to_next_token_scores)
     assert dynamic_batch_size <= b_req_idx.shape[0]
     req_num = len(b_req_idx) // (max_draft_step + 1)
     valid_row_num = req_num * (pre_draft_step + 1)
@@ -174,10 +175,10 @@ def _pack_selected_hidden(
     selected_dst_pos: torch.Tensor,
     dynamic_batch_size: int,
 ):
-    assert hidden.is_cuda
+    assert get_backend().runtime.is_device_tensor(hidden)
     assert hidden.ndim == 2
-    assert selected_row_mask.is_cuda
-    assert selected_dst_pos.is_cuda
+    assert get_backend().runtime.is_device_tensor(selected_row_mask)
+    assert get_backend().runtime.is_device_tensor(selected_dst_pos)
     assert hidden.shape[0] == selected_row_mask.shape[0]
 
     selected_row_mask = selected_row_mask.to(torch.int32)
@@ -208,12 +209,12 @@ def _compact_decode_model_input(
     dynamic_batch_size: int,
 ) -> ModelInput:
     assert not model_input.is_prefill
-    assert selected_row_mask.is_cuda
-    assert model_input.b_req_idx.is_cuda
-    assert model_input.b_mtp_index.is_cuda
-    assert model_input.b_seq_len.is_cuda
-    assert model_input.b_shared_seq_len.is_cuda
-    assert model_input.b_shared_radix_node_id.is_cuda
+    assert get_backend().runtime.is_device_tensor(selected_row_mask)
+    assert get_backend().runtime.is_device_tensor(model_input.b_req_idx)
+    assert get_backend().runtime.is_device_tensor(model_input.b_mtp_index)
+    assert get_backend().runtime.is_device_tensor(model_input.b_seq_len)
+    assert get_backend().runtime.is_device_tensor(model_input.b_shared_seq_len)
+    assert get_backend().runtime.is_device_tensor(model_input.b_shared_radix_node_id)
 
     # Dynamic scheduling guarantees exactly dynamic_batch_size selected rows.
     selected_row_mask = selected_row_mask.to(torch.int32)
@@ -222,7 +223,7 @@ def _compact_decode_model_input(
 
     out_input_ids = None
     if model_input.input_ids is not None:
-        assert model_input.input_ids.is_cuda
+        assert get_backend().runtime.is_device_tensor(model_input.input_ids)
         out_input_ids = torch.empty(
             (dynamic_batch_size,), dtype=model_input.input_ids.dtype, device=model_input.input_ids.device
         )
@@ -247,7 +248,7 @@ def _compact_decode_model_input(
     )
     out_b_position_delta = None
     if model_input.b_position_delta is not None:
-        assert model_input.b_position_delta.is_cuda
+        assert get_backend().runtime.is_device_tensor(model_input.b_position_delta)
         out_b_position_delta = torch.empty(
             (dynamic_batch_size,),
             dtype=model_input.b_position_delta.dtype,
@@ -291,7 +292,7 @@ def _compact_decode_model_input(
     model_input.b_shared_radix_node_id = out_b_shared_radix_node_id
 
     if model_input.mtp_draft_input_hiddens is not None:
-        assert model_input.mtp_draft_input_hiddens.is_cuda
+        assert get_backend().runtime.is_device_tensor(model_input.mtp_draft_input_hiddens)
         model_input.mtp_draft_input_hiddens = _pack_selected_hidden(
             model_input.mtp_draft_input_hiddens,
             selected_row_mask,

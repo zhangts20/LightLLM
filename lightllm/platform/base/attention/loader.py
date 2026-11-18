@@ -11,6 +11,7 @@ _BUILTIN_ATT_DIRS: tuple[str, ...] = (
     "nsa",
     "paged_fa3",
     "triton",
+    "mlu",
 )
 
 
@@ -31,12 +32,8 @@ def _load_att_backends(modules: tuple[str, ...] = ()) -> None:
 
     from lightllm.platform.base.attention.registry import att_backend_registry
 
-    registered_modules = {
-        spec.backend_cls.__module__ for spec in att_backend_registry.list_specs()
-    }
-    missing = [
-        module_name for module_name in modules if module_name not in registered_modules
-    ]
+    registered_modules = {spec.backend_cls.__module__ for spec in att_backend_registry.list_specs()}
+    missing = [module_name for module_name in modules if module_name not in registered_modules]
     if missing:
         raise RuntimeError(
             f"{ATT.name}: {ATT.cli_flag('modules')} modules not registered "

@@ -63,6 +63,42 @@ def _validate_fa3():
     return True, None
 
 
+def _validate_ascend_fia():
+    """Check the Ascend operator rather than attempting CUDA FlashAttention."""
+    import torch_npu
+
+    if not torch.npu.is_available():
+        return False, "Ascend NPU not available"
+    heads, kv_heads, seq, dim = 4, 2, 5, 64
+    key = torch.randn(1, kv_heads, seq, dim, dtype=torch.bfloat16, device="npu")
+    value = torch.randn_like(key)
+    mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device="npu"), diagonal=1)
+    for causal, query_len in ((True, seq), (False, 1)):
+        query = torch.randn(1, heads, query_len, dim, dtype=key.dtype, device=key.device)
+        expected = _compute_ground_truth(
+            query.cpu().float(),
+            key.cpu().float().repeat_interleave(heads // kv_heads, dim=1),
+            value.cpu().float().repeat_interleave(heads // kv_heads, dim=1),
+            is_causal=causal,
+        )
+        actual = torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key,
+            value=value,
+            input_layout="BNSD",
+            num_heads=heads,
+            num_key_value_heads=kv_heads,
+            scale=dim ** -0.5,
+            actual_seq_lengths_kv=[seq],
+            atten_mask=mask if causal else None,
+            sparse_mode=3 if causal else 0,
+            next_tokens=0 if causal else 2147483647,
+        )[0]
+        if not torch.allclose(actual.cpu().float(), expected, rtol=2e-2, atol=2e-2):
+            return False, f"Ascend FIA {'prefill' if causal else 'decode'} output mismatch"
+    return True, None
+
+
 def _validate_flashinfer():
     """Validate FlashInfer with ground truth."""
     capability = torch.cuda.get_device_capability()
@@ -301,6 +337,8 @@ def _run_in_subprocess(backend_name, pipe):
             success, err = _validate_xformers()
         elif backend_name == "sdpa":
             success, err = _validate_sdpa()
+        elif backend_name == "ascend_fia":
+            success, err = _validate_ascend_fia()
         elif backend_name == "flashinfer":
             success, err = _validate_flashinfer()
         elif backend_name == "flashqla":

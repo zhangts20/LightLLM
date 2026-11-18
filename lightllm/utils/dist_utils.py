@@ -63,6 +63,9 @@ def _setup_distributed(*, host: str, port: int, rank: int, world_size: int, devi
         world_size=world_size,
         device_id=device_id,
     )
+    # The MACA single-rank communicator does not need a warmup collective.
+    if get_backend().name == "maca" and world_size == 1:
+        return
     _a = torch.zeros([1], device=target_device)
     dist.all_reduce(_a)
     del _a
@@ -164,6 +167,7 @@ def init_distributed_env(kvargs):
         world_size=kvargs["world_size"],
         device_id=device_id,
     )
+
 
 def set_global_rank(global_rank: int):
     set_environ("LIGHTLLM_GLOBAL_RANK", global_rank)

@@ -7,7 +7,7 @@ from lightllm.distributed import CustomProcessGroup
 from typing import Tuple, Any, Optional, List
 
 from lightllm.platform import get_backend
-from .triton_kernel.gen_prefill_params import gen_prefill_params 
+from .triton_kernel.gen_prefill_params import gen_prefill_params
 from .triton_kernel.gen_decode_params import gen_decode_params
 from .triton_kernel.multimodal_emb import mark_multimodal_obj
 from .batch_objs import ModelInput
@@ -148,8 +148,8 @@ class InferStateInfo:
             self.seq_len_manager.update(self.b1_cu_q_seq_len, self.b_kv_seq_len)
             self.b1_cu_q_seq_len_cpu, self.b_cu_kv_seq_len_cpu = self.seq_len_manager.get_tensor_slices()
         else:
-            self.b1_cu_q_seq_len_cpu = [] 
-            self.b_cu_kv_seq_len_cpu = [] 
+            self.b1_cu_q_seq_len_cpu = []
+            self.b_cu_kv_seq_len_cpu = []
 
     def init_att_state(self):
         if self.is_prefill:
@@ -162,11 +162,15 @@ class InferStateInfo:
                 self.decode_att_state1.init_state()
 
     def copy_for_cuda_graph(self, new_infer_state: "InferStateInfo"):
+        destinations, sources = [], []
         for attr_name, attr_value in vars(new_infer_state).items():
             if isinstance(attr_value, torch.Tensor):
                 attr_ = getattr(self, attr_name, None)
                 if attr_ is not None and attr_.data_ptr() != attr_value.data_ptr():
-                    attr_.copy_(attr_value, non_blocking=True)
+                    destinations.append(attr_)
+                    sources.append(attr_value)
+
+        self.platform_backend.runtime.copy_tensors(destinations, sources)
 
         self.decode_att_state.copy_for_decode_cuda_graph(new_infer_state.decode_att_state)
         if self.decode_att_state1 is not None:

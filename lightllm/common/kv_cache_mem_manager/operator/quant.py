@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 from typing import TYPE_CHECKING, List
 from .base import BaseMemManagerOperator
@@ -24,7 +25,9 @@ class QuantScaleMemOperator(BaseMemManagerOperator):
         cpu_cache_client: "CpuKvCacheClient",
         req: "InferReq",
     ):
-        assert mem_indexes.is_cuda and page_indexes.is_cuda
+        assert get_backend().runtime.is_device_tensor(mem_indexes) and get_backend().runtime.is_device_tensor(
+            page_indexes
+        )
         args = get_env_start_args()
         assert len(mem_indexes) % args.cpu_cache_token_page_size == 0
         from lightllm.common.kv_cache_mem_manager.mem_manager import MemoryManager
@@ -71,7 +74,11 @@ class QuantScaleMemOperator(BaseMemManagerOperator):
         cpu_cache_client: "CpuKvCacheClient",
         req: "InferReq",
     ):
-        assert mem_indexes.is_cuda and page_indexes.is_cuda and page_readies.is_cuda
+        assert (
+            get_backend().runtime.is_device_tensor(mem_indexes)
+            and get_backend().runtime.is_device_tensor(page_indexes)
+            and get_backend().runtime.is_device_tensor(page_readies)
+        )
         args = get_env_start_args()
         assert len(mem_indexes) % args.cpu_cache_token_page_size == 0
         assert len(mem_indexes) // args.cpu_cache_token_page_size == len(page_indexes)
