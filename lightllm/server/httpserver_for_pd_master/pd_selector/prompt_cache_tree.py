@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass, field
 from threading import Lock, RLock
 from typing import Dict, Optional, Tuple
@@ -18,6 +19,8 @@ class PromptCacheMatchResult:
     matched_char_count: int
     # 输入 prompt 的原始字符数 len(text)。
     input_char_count: int
+    # 命中节点最近一次被 prompt 写入的单调时钟。停在 root 时为 None。
+    last_insert_time: Optional[float] = None
 
 
 @dataclass(slots=True)
@@ -28,6 +31,7 @@ class _PromptCacheNode:
     parent: Optional["_PromptCacheNode"] = None
     edge_char: Optional[str] = None
     last_prefill_node: Optional[str] = None
+    last_insert_time: Optional[float] = None
     last_time_mark: int = 0
 
 
@@ -117,6 +121,7 @@ class PromptCacheTree:
         finally:
             if node is not self.root:
                 node.last_prefill_node = prefill_node
+                node.last_insert_time = time.monotonic()
             if node.last_time_mark in self._leaf_lru:
                 self._leaf_lru.pop(node.last_time_mark, None)
             node.last_time_mark = self._gen_time_mark()
@@ -154,8 +159,10 @@ class PromptCacheTree:
             node, matched = self._match_at(self.root, key, 0)
             if node is self.root:
                 prefill_node = None
+                last_insert_time = None
             else:
                 prefill_node = node.last_prefill_node
+                last_insert_time = node.last_insert_time
             if matched <= 0:
                 matched_char_count = 0
             else:
@@ -164,6 +171,7 @@ class PromptCacheTree:
                 prefill_node=prefill_node,
                 matched_char_count=matched_char_count,
                 input_char_count=len(text),
+                last_insert_time=last_insert_time,
             )
 
     def _match_at(self, node: _PromptCacheNode, key: str, depth: int) -> Tuple[_PromptCacheNode, int]:

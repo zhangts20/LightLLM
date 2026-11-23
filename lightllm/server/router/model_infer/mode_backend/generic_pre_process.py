@@ -7,6 +7,32 @@ from lightllm.common.basemodel.batch_objs import ModelInput
 INT64_MAX = torch.iinfo(torch.int64).max
 
 
+def _stash_maca_pd_mem_indexes(run_reqs, b_q_seq_len, mem_indexes) -> None:
+    # 分配时下标就在 CPU 上。PD 组传输任务再从 GPU 表里 .cpu()，每个请求一次同步。
+    try:
+        from lightllm.utils.device_utils import is_maca
+
+        if not is_maca():
+            return
+    except Exception:
+        return
+    if mem_indexes is None or mem_indexes.numel() == 0 or not run_reqs:
+        return
+    q_lens = [int(x) for x in b_q_seq_len.tolist()]
+    if sum(q_lens) != int(mem_indexes.numel()):
+        return
+    flat = mem_indexes.tolist()
+    offset = 0
+    for req, q_len in zip(run_reqs, q_lens):
+        chunk = flat[offset : offset + q_len]
+        offset += q_len
+        if getattr(req, "_maca_pd_mem_indexes", None) is None:
+            req._maca_pd_mem_base = req.cur_kv_len
+            req._maca_pd_mem_indexes = chunk
+        else:
+            req._maca_pd_mem_indexes.extend(chunk)
+
+
 def prepare_prefill_inputs(req_objs: List[InferReq], is_chuncked_mode: bool) -> Tuple[ModelInput, List[InferReq]]:
     run_reqs = []
     total_token_num = 0
@@ -80,6 +106,7 @@ def prepare_prefill_inputs(req_objs: List[InferReq], is_chuncked_mode: bool) -> 
     )
     for i, req in enumerate(req_objs):
         req.last_kv_mem_index = b_last_mem_index[i].item()
+    _stash_maca_pd_mem_indexes(run_reqs, b_q_seq_len, mem_indexes)
 
     model_input = ModelInput(
         batch_size=b_seq_len.shape[0],

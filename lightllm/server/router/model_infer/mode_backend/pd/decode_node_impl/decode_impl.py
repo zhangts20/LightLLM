@@ -65,8 +65,16 @@ class PDDecodeNode(ChunkedPrefillBackend):
         for request_id in req_ids:
             req_obj: InferReq = g_infer_context.requests_mapping[request_id]
 
-            if self.is_master_in_dp and req_obj.infer_aborted and req_obj.pd_task_num != 0:
+            # 请求未结束时会反复进这个过滤。最多发 6 次，避免每步都往队列里塞 abort。
+            pd_abort_req_send_count = getattr(req_obj, "pd_abort_req_send_count", 0)
+            if (
+                self.is_master_in_dp
+                and req_obj.infer_aborted
+                and req_obj.pd_task_num != 0
+                and pd_abort_req_send_count < 6
+            ):
                 self.info_queue.put(PDAbortReq(request_id=req_obj.req_id, device_id=req_obj.pd_trans_device_id))
+                req_obj.pd_abort_req_send_count = pd_abort_req_send_count + 1
 
             if req_obj.pd_task_num != (req_obj.pd_task_failed_num + req_obj.pd_task_success_num):
                 continue
@@ -103,7 +111,8 @@ class PDDecodeNode(ChunkedPrefillBackend):
                         .detach()
                         .cpu()
                     )
-                    self.model.mem_manager.free(mem_indexes)
+                    # 按页释放，把页内没记入请求的槽位一并还回去。
+                    self.model.req_manager.free_token(mem_indexes)
                     if self.is_master_in_dp:
                         req_obj.shm_req.shm_cur_kv_len = req_obj.cur_kv_len
 
@@ -123,13 +132,19 @@ class PDDecodeNode(ChunkedPrefillBackend):
             need_mem_size = input_len - req_obj.cur_kv_len
 
             if need_mem_size > 0:
+                # 按整页申请，请求长度只记录真实 token 数。
+                alloc_mem_size = self.model.req_manager.get_page_aligned_mem_size(need_mem_size)
                 if self.radix_cache is not None:
-                    self.radix_cache.free_radix_cache_to_get_enough_token(need_mem_size)
+                    self.radix_cache.free_radix_cache_to_get_enough_token(alloc_mem_size)
 
-                mem_indexes = self.model.req_manager.mem_manager.alloc(need_size=need_mem_size)
+                allocated_mem_indexes = self.model.req_manager.alloc_page_aligned_mem_indices(need_mem_size)
+                mem_indexes = allocated_mem_indexes[:need_mem_size]
                 self.model.req_manager.req_to_token_indexs[
                     req_obj.req_idx, req_obj.cur_kv_len : (req_obj.cur_kv_len + need_mem_size)
                 ] = mem_indexes
+                # 下一次 decode 从本页已申请的下一个槽接着走。停在 -1 时，
+                # alloc 会算出 mem index 0，释放时被当成另一页的页头。
+                req_obj.last_kv_mem_index = int(mem_indexes[-1].item())
 
                 while req_obj.pd_trans_kv_start_index < input_len:
                     cur_page_size = min(page_size, input_len - req_obj.pd_trans_kv_start_index)
@@ -147,7 +162,7 @@ class PDDecodeNode(ChunkedPrefillBackend):
                     # update
                     req_obj.pd_trans_kv_start_index += cur_page_size
 
-                req_obj.cur_kv_len += len(mem_indexes)
+                req_obj.cur_kv_len += need_mem_size
 
                 # 如果当前是linear att 混合模型，则需要创建一个linear att 状态的传输任务
                 if g_infer_context.is_linear_att_mixed_model:

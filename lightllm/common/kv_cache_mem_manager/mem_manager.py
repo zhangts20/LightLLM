@@ -112,6 +112,7 @@ class MemoryManager:
         dp_world_size: int,
         page_kind: str = "kv",
         req_idx: int = None,
+        target_tp_index: int = None,
     ):
         assert page_kind == "kv", f"{type(self).__name__} does not support page_kind={page_kind}"
         cur_page = self.kv_move_buffer[page_index]
@@ -121,6 +122,8 @@ class MemoryManager:
         repeat_count = dp_world_size * self.kv_buffer.shape[2] // self.kv_move_buffer.shape[3]
         dp_mems = mem_managers[(dp_index * dp_world_size) : ((dp_index + 1) * dp_world_size)]
         for tp_index in range(dp_world_size):
+            if target_tp_index is not None and tp_index != target_tp_index:
+                continue
             if tp_index % repeat_count == 0:
                 page_io(
                     mem_indexes=mem_indexes_gpu,
@@ -129,6 +132,9 @@ class MemoryManager:
                     tp_index=tp_index,
                     tp_world_size=dp_world_size,
                     mode="write",
+                )
+                self._page_io_scale(
+                    mem_indexes_gpu, page_index, dp_mems[tp_index], tp_index, dp_world_size, "write"
                 )
         # keep for debug
         # logger.info(f"src token tensor {self.kv_buffer[:, mem_indexes[0], 0, 0]}")
@@ -144,6 +150,7 @@ class MemoryManager:
         dp_world_size: int,
         page_kind: str = "kv",
         req_idx: int = None,
+        target_tp_index: int = None,
     ):
         assert page_kind == "kv", f"{type(self).__name__} does not support page_kind={page_kind}"
         cur_page = self.kv_move_buffer[page_index]
@@ -151,10 +158,9 @@ class MemoryManager:
         pin_mem_indexes.numpy()[:] = mem_indexes
         mem_indexes_gpu = pin_mem_indexes.to(device=self.target_device, non_blocking=True)
         dp_mems = mem_managers[(dp_index * dp_world_size) : ((dp_index + 1) * dp_world_size)]
-        mem_indexes_gpu = torch.tensor(mem_indexes, dtype=torch.int64, device="cpu", pin_memory=True).to(
-            device=self.target_device, non_blocking=True
-        )
         for tp_index in range(dp_world_size):
+            if target_tp_index is not None and tp_index != target_tp_index:
+                continue
             page_io(
                 mem_indexes=mem_indexes_gpu,
                 page_tensor=cur_page,
@@ -163,9 +169,24 @@ class MemoryManager:
                 tp_world_size=dp_world_size,
                 mode="read",
             )
+            self._page_io_scale(mem_indexes_gpu, page_index, dp_mems[tp_index], tp_index, dp_world_size, "read")
         # keep for debug
         # logger.info(f"dst token tensor {self.kv_buffer[:, mem_indexes[0], 0, 0]}")
         # logger.info(f"dst page token tensor {cur_page[0, :, 0, 0]}")
+
+    def _page_io_scale(self, mem_indexes_gpu, page_index, mem, tp_index, dp_world_size, mode):
+        scale_pages = getattr(self, "scale_move_buffer", None)
+        scale_buf = getattr(mem, "scale_buffer", None)
+        if scale_pages is None or scale_buf is None:
+            return
+        page_io(
+            mem_indexes=mem_indexes_gpu,
+            page_tensor=scale_pages[page_index],
+            kv_buffer=scale_buf,
+            tp_index=tp_index,
+            tp_world_size=dp_world_size,
+            mode=mode,
+        )
 
     def _free_buffers(self):
         self.kv_buffer = None

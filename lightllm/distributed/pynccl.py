@@ -124,11 +124,26 @@ class StatelessP2PProcessGroup:
 
 
 class PyNcclCommunicator:
+    @staticmethod
+    def unique_id_to_bytes(unique_id: ncclUniqueId) -> bytes:
+        # ctypes 里是有符号字节。大于 127 的先转成无符号，控制通道才能原样送出去。
+        return bytes(value & 0xFF for value in unique_id.internal)
+
+    @staticmethod
+    def unique_id_from_bytes(raw: bytes) -> ncclUniqueId:
+        unique_id = ncclUniqueId()
+        for index, value in enumerate(raw):
+            unique_id.internal[index] = value if value < 128 else value - 256
+        return unique_id
+
     def __init__(
         self,
-        group: Union[ProcessGroup, StatelessP2PProcessGroup],
+        group: Union[ProcessGroup, StatelessP2PProcessGroup, None],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+        unique_id: Optional[ncclUniqueId] = None,
     ):
         """
         Args:
@@ -141,7 +156,12 @@ class PyNcclCommunicator:
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
-        if not isinstance(group, StatelessP2PProcessGroup):
+        self.group = group
+        if unique_id is not None:
+            # uid 已经发给每个成员。这里不再走两两交换。
+            self.rank = rank
+            self.world_size = world_size
+        elif not isinstance(group, StatelessP2PProcessGroup):
             assert dist.is_initialized()
             assert (
                 dist.get_backend(group) != dist.Backend.NCCL
@@ -152,8 +172,6 @@ class PyNcclCommunicator:
         else:
             self.rank = group.rank
             self.world_size = group.world_size
-
-        self.group = group
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:
@@ -174,14 +192,19 @@ class PyNcclCommunicator:
 
         logger.info("LightLLM is using collective lib version %s", self.nccl.ncclGetVersion())
 
-        if self.rank == 0:
+        if unique_id is not None:
+            self.unique_id = unique_id
+        elif self.rank == 0:
             # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
         else:
             # construct an empty unique id
             self.unique_id = ncclUniqueId()
 
-        if not isinstance(group, StatelessP2PProcessGroup):
+        if unique_id is not None:
+            # 调用方已经把同一份 id 分给每个成员，这里不再 broadcast，也不再两两交换。
+            pass
+        elif not isinstance(group, StatelessP2PProcessGroup):
             tensor = torch.ByteTensor(list(self.unique_id.internal))
             ranks = dist.get_process_group_ranks(group)
             # arg `src` in `broadcast` is the global rank

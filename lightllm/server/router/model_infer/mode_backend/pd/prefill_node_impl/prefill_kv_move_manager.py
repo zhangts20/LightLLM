@@ -1,15 +1,18 @@
+import copy
 import inspect
+import logging
 import setproctitle
 import torch.multiprocessing as mp
 import time
 from typing import List, Dict, Union, Callable
 from lightllm.utils.log_utils import init_logger
-from lightllm.server.pd_io_struct import PDChunckedTransTask
+from lightllm.server.pd_io_struct import PDAbortReq, PDChunckedTransTask
 from lightllm.utils.graceful_utils import graceful_registry
 from lightllm.server.core.objs import StartArgs
 from ..trans_process_obj import KVTransProcess
 from ..base_kv_move_manager import BaseKVMoveManager
 from lightllm.utils.error_utils import log_exception
+from lightllm.utils.device_utils import is_maca
 from lightllm.utils.envs_utils import get_unique_server_name
 from lightllm.utils.process_check import start_parent_check_thread
 
@@ -58,12 +61,38 @@ class PrefillKVMoveManager(BaseKVMoveManager):
     def task_dispatcher_loop(self):
         # 获取任务，并分发给相关卡的处理队列
         while True:
-            task: PDChunckedTransTask = self.info_queue.get()
+            task: Union[PDChunckedTransTask, PDAbortReq] = self.info_queue.get()
 
-            device_id = task.src_device_id
             try:
-                trans_process: KVTransProcess = self.kv_trans_processes[device_id]
-                trans_process.task_in_queue.put(task)
-                logger.info(f"kv move manager dispatch task {task.to_str()} to device {device_id}")
+                if isinstance(task, PDAbortReq):
+                    # 沐曦每个 rank 各自有传输任务，abort 要送到每一张卡。
+                    device_ids = (
+                        range(self.node_world_size)
+                        if is_maca() and self.node_world_size > 1
+                        else (task.device_id,)
+                    )
+                    for device_id in device_ids:
+                        self.kv_trans_processes[device_id].task_in_queue.put(task)
+                    continue
+
+                # vLLM 是每个 TP rank 把自己的 KV 送给同号 decode rank。不能只挑一张卡把其它卡的显存搬过来。
+                if is_maca() and self.node_world_size > 1:
+                    node_name = task.decode_agent_name.rsplit("_", 1)[0]
+                    agents = task.decode_agents or {}
+                    for device_id in range(self.node_world_size):
+                        shard = copy.copy(task)
+                        shard.src_device_id = device_id
+                        # decode 卡更少时，同号 agent 不存在。先留着 master 给的名字，后面按 head 区间改目标。
+                        metadata = agents.get(device_id)
+                        if metadata is not None:
+                            shard.decode_agent_name = f"{node_name}_{device_id}"
+                            shard.decode_agent_metadata = metadata
+                        self.kv_trans_processes[device_id].task_in_queue.put(shard)
+                else:
+                    device_id = task.src_device_id
+                    trans_process: KVTransProcess = self.kv_trans_processes[device_id]
+                    trans_process.task_in_queue.put(task)
+                    if self.args.pd_detail_log and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"kv move manager dispatch task {task.to_str()} to device {device_id}")
             except BaseException as e:
                 logger.exception(str(e))

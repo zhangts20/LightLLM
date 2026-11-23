@@ -79,6 +79,11 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--disable_pd_master_decode_capacity_limit",
+        action="store_true",
+        help="Disable PD master admission control based on the total capacity of registered decode nodes.",
+    )
+    parser.add_argument(
         "--pd_trans_mode",
         type=str,
         choices=["nccl", "nixl", "mooncake"],
@@ -301,6 +306,14 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
     )
     parser.add_argument("--detail_log", action="store_true", help="enable to print input infos in requests.")
+    parser.add_argument(
+        "--pd_detail_log",
+        action="store_true",
+        help=(
+            "enable verbose per-block PD KV transfer debug logs. "
+            "Request-level debug logs and warning/error logs do not require this flag."
+        ),
+    )
     parser.add_argument(
         "--disable_shm_warning",
         action="store_true",

@@ -181,6 +181,8 @@ class PDChunckedTransTask:
     page_kind: str = "kv"
     # Only valid for the local task owner; remote notify copies may carry the sender-local req_idx.
     req_idx: Optional[int] = None
+    # decode 本节点每个 tp rank 的控制口。只在 prefill 本地任务上用，通知里清掉。
+    decode_agents: Optional[Dict[int, bytes]] = None
 
     def __post_init__(self):
         if self.start_kv_index < 0 or self.end_kv_index < self.start_kv_index:
@@ -214,6 +216,15 @@ class PDChunckedTransTask:
     def transfer_time(self):
         return time.time() - self.start_trans_time
 
+    def copy_for_notify(self) -> "PDChunckedTransTask":
+        # 控制通知只带页身份和阶段。超时标记、本卡槽位、NCCL 句柄和全量控制口留在本进程。
+        task = copy.copy(self)
+        task.__dict__.pop("shared_time_out_mark", None)
+        task.mem_indexes = None
+        task.xfer_handle = None
+        task.decode_agents = None
+        return task
+
     def get_key(self) -> str:
         return f"{self.request_id}_{self.page_kind}_{self.start_kv_index}_{self.end_kv_index}"
 
@@ -228,6 +239,7 @@ class PDChunckedTransTask:
             obj.decode_page_reg_desc = b"xxx"
         if obj.prefill_page_reg_desc is not None:
             obj.prefill_page_reg_desc = b"xxx"
+        obj.decode_agents = None
         return obj.__str__()
 
     def transfer_kv_num(self):
@@ -247,6 +259,7 @@ class PDChunckedTransTask:
             error_info=self.error_info,
             first_gen_token_id=self.first_gen_token_id,
             first_gen_token_logprob=self.first_gen_token_logprob,
+            page_kind=self.page_kind,
         )
         return ret
 
@@ -276,9 +289,10 @@ class PDChunckedTransTaskRet:
     error_info: str = None
     first_gen_token_id: Optional[int] = None
     first_gen_token_logprob: Optional[float] = None
+    page_kind: str = "kv"
 
     def get_key(self) -> str:
-        return f"{self.request_id}_{self.start_kv_index}_{self.end_kv_index}"
+        return f"{self.request_id}_{self.page_kind}_{self.start_kv_index}_{self.end_kv_index}"
 
 
 @dataclass

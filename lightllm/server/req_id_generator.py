@@ -26,11 +26,35 @@ class ReqIDGenerator:
             self.args.config_server_host and self.args.config_server_port and self.args.run_mode == "pd_master"
         )
         self.current_id = ShmArray(f"{get_unique_server_name()}_req_id_gen", (2,), dtype=np.int64)
-        self.current_id.create_shm()
-        self.current_id.arr[0] = 0
-        self.current_id.arr[1] = 0
         self.lock = AtomicShmLock(f"{get_unique_server_name()}_req_id_gen_lock")
-        self._wait_all_workers_ready()
+        worker_index = os.environ.get("LIGHTLLM_PD_MASTER_WORKER_INDEX")
+        # 多 worker 不共父进程，不能靠兄弟进程对齐。只让 worker 0 建共享号段，
+        # 其他 worker 看到上界已写成最大值再使用，避免后启动的进程把号清零。
+        if worker_index is None:
+            self.current_id.create_shm()
+            self.current_id.arr[0] = 0
+            self.current_id.arr[1] = 0
+            self._wait_all_workers_ready()
+        else:
+            from filelock import FileLock
+
+            ready_value = np.iinfo(np.int64).max
+            id_lock = FileLock(f"/tmp/{get_unique_server_name()}_req_id_gen.lock")
+            if worker_index == "0":
+                with id_lock:
+                    self.current_id.create_shm()
+                    self.current_id.arr[0] = 0
+                    self.current_id.arr[1] = ready_value
+            else:
+                for _ in range(600):
+                    with id_lock:
+                        self.current_id.create_shm()
+                        if int(self.current_id.arr[1]) == ready_value:
+                            break
+                    time.sleep(0.1)
+                else:
+                    logger.error("wait pd master worker 0 to init request ids failed")
+                    sys.exit(-1)
         logger.info("ReqIDGenerator init finished")
 
     def _wait_all_workers_ready(self):

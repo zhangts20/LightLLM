@@ -19,6 +19,8 @@ from websockets import ClientConnection
 from fastapi import Request
 from ..tokenizer import get_tokenizer
 from ..pd_io_struct import NodeRole, ObjType, PDDecodeNodeInfo
+from lightllm.utils.device_utils import is_maca
+from lightllm.utils.log_utils import init_logger
 from ..embed_cache.utils import get_shm_name_data, create_shm
 from ..multimodal_params import AudioItem, MultimodalParams, ImageItem
 from ..req_id_generator import ReqIDGenerator
@@ -30,13 +32,12 @@ from lightllm.server.core.objs.io_objs import GroupReqObjs
 from lightllm.server.core.objs.shm_req_manager import ShmReqManager
 from lightllm.server.core.objs.atomic_array_lock import AtomicShmArrayLock, AsyncLock, AtomicLockItem
 from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
-from lightllm.utils.log_utils import init_logger
 from lightllm.server.metrics.manager import MetricClient
 from .rl_controller import HttpRlController
 from .manager_ext import HttpRlManagerHelper
 from lightllm.utils.statics_utils import MovingAverage
 from lightllm.utils.config_utils import get_vocab_size
-from lightllm.utils.envs_utils import get_unique_server_name
+from lightllm.utils.envs_utils import decode_handshake_timeout_seconds, get_unique_server_name
 from lightllm.utils.shm_port_args import get_shm_port_args
 from lightllm.utils.error_utils import ClientDisconnected, InvalidRequestError, PDPrefillNodeStopGenToken
 from rpyc.utils.classic import obtain
@@ -338,6 +339,9 @@ class HttpServerManager(HttpRlManagerHelper, object):
         )
 
         running_request_registered = False
+        maca_fill_task = None
+        maca_pd_stop = None
+        maca_overlap_release_pending = False
         if not self.pd_mode.is_P():
             await self._register_running_request()
             running_request_registered = True
@@ -390,6 +394,7 @@ class HttpServerManager(HttpRlManagerHelper, object):
                 "check_and_repair_length_done",
             )
 
+            maca_overlap = False
             if pd_upload_websocket is not None and self.pd_mode.is_P():
                 # 在 pd 模式下的 prefill 节点，为了兼容多模态推理流程，需要先上报 encode 好的 prompt ids，
                 # 再等待 pd_master 下发对应请求的 decode 节点信息，然后执行后续流程。
@@ -399,19 +404,30 @@ class HttpServerManager(HttpRlManagerHelper, object):
                 await pd_upload_websocket.send(
                     pickle.dumps((ObjType.PD_UPLOAD_PREFILL_PROMPT_IDS, group_request_id, array("q", prompt_ids)))
                 )
-                try:
-                    await asyncio.wait_for(pd_event.wait(), timeout=180)
-                except asyncio.TimeoutError:
-                    logger.error(f"pd prefill node wait pd_event 180s time out, group_req_id {group_request_id}")
-                    raise Exception(f"group_req_id {group_request_id} wait pd_event time out")
+                # 沐曦：decode 节点信息只在建 KV 传输任务时才读，先开算，握手和 forward 叠在一起。
+                # 同时开算的请求不超过 graph batch，再多的请求退回下面原来的等待。
+                if is_maca() and self._maca_pd_overlap_acquire():
+                    maca_overlap = True
+                    maca_overlap_release_pending = True
+                if not maca_overlap:
+                    try:
+                        resource_wait_seconds = sampling_params.pd_node_resource_wait_timeout_seconds
+                        prefill_handshake_timeout = decode_handshake_timeout_seconds(resource_wait_seconds) + 5
+                        await asyncio.wait_for(pd_event.wait(), timeout=prefill_handshake_timeout)
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            f"pd prefill node wait pd_event {prefill_handshake_timeout}s time out, "
+                            f"group_req_id {group_request_id}"
+                        )
+                        raise Exception(f"group_req_id {group_request_id} wait pd_event time out")
 
-                decode_node_info: PDDecodeNodeInfo = pd_event.decode_node_info
-                sampling_params.pd_kv_trans_params.set(pickle.dumps(decode_node_info))
+                    decode_node_info: PDDecodeNodeInfo = pd_event.decode_node_info
+                    sampling_params.pd_kv_trans_params.set(pickle.dumps(decode_node_info))
 
-                if decode_node_info.ready_kv_len == len(prompt_ids) - 1:
-                    # 如果 decode 节点的 ready_kv_len 和 prefill encode 的 len(prompt ids) -1 相等，说明不需要进行 prefill
-                    # 直接 raise PDPrefillNodeStopGenToken
-                    raise PDPrefillNodeStopGenToken(group_request_id=group_request_id)
+                    if decode_node_info.ready_kv_len == len(prompt_ids) - 1:
+                        # 如果 decode 节点的 ready_kv_len 和 prefill encode 的 len(prompt ids) -1 相等，说明不需要进行 prefill
+                        # 直接 raise PDPrefillNodeStopGenToken
+                        raise PDPrefillNodeStopGenToken(group_request_id=group_request_id)
 
             if self.pd_mode.is_P():
                 # PD Prefill 节点上报 prompt ids 后，需要等待 PD master 从 Decode 节点取得
@@ -463,6 +479,20 @@ class HttpServerManager(HttpRlManagerHelper, object):
 
             req_status = ReqStatus(group_request_id, multimodal_params, req_objs, start_time)
             self.req_id_to_out_inf[group_request_id] = req_status
+            if maca_overlap:
+                maca_pd_stop = asyncio.Event()
+                maca_fill_task = asyncio.create_task(
+                    self._maca_write_decode_node_when_ready(
+                        pd_event,
+                        req_objs,
+                        sampling_params,
+                        group_request_id,
+                        len(prompt_ids),
+                        pd_upload_websocket,
+                        maca_pd_stop,
+                    )
+                )
+                maca_overlap_release_pending = False
             # RL：请求已登记到 req_id_to_out_inf 并即将转发下游，从 admission gate
             # 注销，避免 pause 统计里仍把它算作“等待准入”的 pending 请求。
             if self.rl_controller is not None:
@@ -496,7 +526,10 @@ class HttpServerManager(HttpRlManagerHelper, object):
             }
 
             is_first_gen_token = True
-            async for sub_req_id, request_output, metadata, finish_status in results_generator:
+            token_iter = results_generator
+            if maca_pd_stop is not None:
+                token_iter = self._maca_iter_tokens_until_stop(results_generator, maca_pd_stop, group_request_id)
+            async for sub_req_id, request_output, metadata, finish_status in token_iter:
                 # 只有第一个生成的 token 的 metadata 中包含 input_usage
                 if is_first_gen_token:
                     metadata["input_usage"] = input_usage
@@ -505,6 +538,11 @@ class HttpServerManager(HttpRlManagerHelper, object):
                 yield sub_req_id, request_output, metadata, finish_status
 
         except (asyncio.CancelledError, BaseException) as e:
+            if maca_overlap_release_pending:
+                self._maca_pd_overlap_release()
+                maca_overlap_release_pending = False
+            if maca_fill_task is not None and not maca_fill_task.done():
+                maca_fill_task.cancel()
             if isinstance(e, ClientDisconnected):
                 logger.warning(f"group_request_id: {group_request_id} {e.reason}")
             elif isinstance(e, asyncio.CancelledError):
@@ -528,6 +566,88 @@ class HttpServerManager(HttpRlManagerHelper, object):
             if running_request_registered:
                 await self._unregister_running_request()
         return
+
+    def _maca_pd_overlap_acquire(self) -> bool:
+        limit = int(getattr(self.args, "graph_max_batch_size", 32) or 32)
+        limit = max(1, limit)
+        current = getattr(self, "_maca_pd_overlap_inflight", 0)
+        if current >= limit:
+            logger.info("maca pd overlap cap reached, wait decode node before forward")
+            return False
+        self._maca_pd_overlap_inflight = current + 1
+        return True
+
+    def _maca_pd_overlap_release(self):
+        current = getattr(self, "_maca_pd_overlap_inflight", 0)
+        if current > 0:
+            self._maca_pd_overlap_inflight = current - 1
+
+    async def _maca_write_decode_node_when_ready(
+        self,
+        pd_event,
+        req_objs: List[Req],
+        sampling_params: SamplingParams,
+        group_request_id: int,
+        prompt_len: int,
+        pd_upload_websocket: ClientConnection,
+        pd_stop_gen: asyncio.Event,
+    ):
+        wait_start = time.time()
+        try:
+            try:
+                resource_wait_seconds = sampling_params.pd_node_resource_wait_timeout_seconds
+                prefill_handshake_timeout = decode_handshake_timeout_seconds(resource_wait_seconds) + 5
+                await asyncio.wait_for(pd_event.wait(), timeout=prefill_handshake_timeout)
+            except Exception as e:
+                logger.error(f"maca pd handshake failed group_req_id {group_request_id}: {e}")
+                for req in req_objs:
+                    if req.group_req_id == group_request_id:
+                        req.is_aborted = True
+                try:
+                    await pd_upload_websocket.send(
+                        pickle.dumps((ObjType.PD_UPLOAD_GENERATE_ERROR, group_request_id, f"{type(e).__name__}: {e}"))
+                    )
+                except Exception:
+                    logger.exception(f"report maca pd handshake error failed, group_req_id {group_request_id}")
+                pd_stop_gen.set()
+                return
+            decode_node_info: PDDecodeNodeInfo = pd_event.decode_node_info
+            payload = pickle.dumps(decode_node_info)
+            full_prefix_cached = decode_node_info.ready_kv_len == prompt_len - 1
+            for req in req_objs:
+                if req.group_req_id != group_request_id:
+                    continue
+                req.sample_params.pd_kv_trans_params.set(payload)
+                if full_prefix_cached:
+                    req.is_aborted = True
+            logger.info(
+                f"maca pd decode node attached group_req_id {group_request_id} "
+                f"wait_ms {(time.time() - wait_start) * 1000:.1f} ready_kv_len {decode_node_info.ready_kv_len}"
+            )
+            if full_prefix_cached:
+                pd_stop_gen.set()
+        finally:
+            self._maca_pd_overlap_release()
+
+    async def _maca_iter_tokens_until_stop(self, results_generator, pd_stop_gen: asyncio.Event, group_request_id: int):
+        token_iter = results_generator.__aiter__()
+        while True:
+            if pd_stop_gen.is_set():
+                raise PDPrefillNodeStopGenToken(group_request_id=group_request_id)
+            next_task = asyncio.create_task(token_iter.__anext__())
+            stop_task = asyncio.create_task(pd_stop_gen.wait())
+            done, pending = await asyncio.wait({next_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if pd_stop_gen.is_set() and next_task not in done:
+                raise PDPrefillNodeStopGenToken(group_request_id=group_request_id)
+            try:
+                item = next_task.result()
+            except StopAsyncIteration:
+                return
+            if pd_stop_gen.is_set():
+                raise PDPrefillNodeStopGenToken(group_request_id=group_request_id)
+            yield item
 
     def _count_multimodal_tokens(self, multimodal_params: MultimodalParams) -> Tuple[int, int]:
         image_tokens = 0

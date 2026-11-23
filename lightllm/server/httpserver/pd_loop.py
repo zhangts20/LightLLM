@@ -16,6 +16,7 @@ from lightllm.server.httpserver.async_queue import AsyncQueue
 from lightllm.utils.net_utils import get_hostname_ip
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.envs_utils import get_lightllm_websocket_max_message_size
+from lightllm.utils.websocket_utils import PD_WEBSOCKET_WRITE_LIMIT, websocket_message_exceeds_limit
 from lightllm.server.httpserver.manager import HttpServerManager
 from ..pd_io_struct import PD_Master_Obj
 from lightllm.server.core.objs import StartArgs
@@ -89,7 +90,11 @@ async def _pd_handle_task(manager: HttpServerManager, pd_master_obj: PD_Master_O
             uri = f"ws://{pd_master_obj.host_ip_port}/pd_register"
             async with websockets.connect(
                 uri,
+                # 压缩跑在事件循环上，长 prompt 会把心跳堵住。
+                compression=None,
                 max_size=get_lightllm_websocket_max_message_size(),
+                # 写缓冲太小，控制消息要等套接字腾出来，token 上报会被拖住。
+                write_limit=PD_WEBSOCKET_WRITE_LIMIT,
                 max_queue=(2048 * 1024, 2048 * 1023),  # 关键修改
                 # 下方应用层心跳已负责存活检测，禁用协议层 keepalive，避免繁忙连接被误断。
                 ping_interval=None,
@@ -201,8 +206,26 @@ async def _get_pd_master_objs(args: StartArgs) -> Optional[Dict[int, PD_Master_O
     # --pd_master_ip 和--pd_master_port 设置的唯一pd_master来进行连接, 其默认
     # node_id 为 0
     if not use_config_server:
+        endpoint = f"{args.pd_master_ip}:{get_shm_port_args().pd_master_port}"
+        # 多 worker 时对外只有一个端口。这里问到每个 worker 的端口，P/D 直接连过去。
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://{endpoint}/get_server_info")
+                response.raise_for_status()
+                info = response.json()
+                worker_count = int(info.get("httpserver_workers", 1))
+                if worker_count > 1:
+                    return {
+                        int(worker_port): PD_Master_Obj(
+                            node_id=int(worker_port),
+                            host_ip_port=f"{args.pd_master_ip}:{int(worker_port)}",
+                        )
+                        for worker_port in info["pd_master_multi_ports"]
+                    }
+        except Exception as e:
+            logger.info(f"pd master worker discovery fallback to {endpoint}: {e}")
         ans = dict()
-        ans[0] = PD_Master_Obj(node_id=0, host_ip_port=f"{args.pd_master_ip}:{get_shm_port_args().pd_master_port}")
+        ans[0] = PD_Master_Obj(node_id=0, host_ip_port=endpoint)
         return ans
 
     # 使用 config_server 服务来发现所有的 pd_master 节点。
@@ -270,7 +293,18 @@ async def _up_tokens_to_pd_master(forwarding_queue: AsyncQueue, websocket: Clien
 
         if handle_list:
             load_info: dict = _get_load_info()
-            await websocket.send(pickle.dumps((ObjType.TOKEN_PACKS, handle_list, load_info)))
+            await _send_token_packs(websocket=websocket, handle_list=handle_list, load_info=load_info)
+
+
+async def _send_token_packs(websocket: ClientConnection, handle_list: list, load_info: dict) -> None:
+    # 一包超过 WebSocket 上限就对半拆。只剩一条还超限时拆不开，原样发送。
+    payload = pickle.dumps((ObjType.TOKEN_PACKS, handle_list, load_info))
+    if len(handle_list) > 1 and websocket_message_exceeds_limit(payload=payload):
+        midpoint = len(handle_list) // 2
+        await _send_token_packs(websocket=websocket, handle_list=handle_list[:midpoint], load_info=load_info)
+        await _send_token_packs(websocket=websocket, handle_list=handle_list[midpoint:], load_info=load_info)
+    else:
+        await websocket.send(payload)
 
 
 async def _send_heartbeat_to_pd_master(websocket: ClientConnection):

@@ -892,8 +892,12 @@ class InferReq:
         # 本地已由 stop / eos / length 等正确结束，保留原 shm finish_status。
         if self.finish_status.is_finished():
             return
+        if getattr(self, "finished_by_pd_decode_capacity", False):
+            finish_status = FinishStatus.FINISHED_PD_DECODE_CAPACITY
+        else:
+            finish_status = FinishStatus.FINISHED_ABORTED
         self.shm_req.mark_simulated_finished(
-            FinishStatus.FINISHED_ABORTED,
+            finish_status,
             output_len=self.cur_output_len,
         )
         return
@@ -966,6 +970,19 @@ class InferReqUpdatePack:
         # 分块 prefill 后，形成对应的pd 分块传输处理。
         if pd_prefill_chunked_handle_func is not None:
             pd_prefill_chunked_handle_func(self.req_obj, next_token_id, next_token_logprob, self.output_len)
+
+        # 沐曦握手还没写进 shm 时，先别把 token 交出去。其它平台不会置这两个标记。
+        if getattr(self.req_obj, "pd_skip_token_output", False):
+            return
+        if getattr(self.req_obj, "pd_hold_token_output", False):
+            self.req_obj.pd_deferred_publish = (
+                next_token_id,
+                next_token_logprob,
+                next_token_rank,
+                self.output_len,
+                extra_post_req_handle_func,
+            )
+            return
 
         if self.output_len <= 0:
             return

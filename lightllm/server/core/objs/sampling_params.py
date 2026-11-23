@@ -340,6 +340,8 @@ class SamplingParams(ctypes.Structure):
         ("seed", ctypes.c_int64),  # random seed
         # -1 disables prompt logprobs; K >= 0 returns only the top-K prompt tokens.
         ("prompt_logprobs", ctypes.c_int),
+        # PD master 下发。非负值是节点资源等待上限；负数表示不按这个预算放宽握手。
+        ("pd_node_resource_wait_timeout_seconds", ctypes.c_int),
     ]
 
     _do_sample: bool = False
@@ -367,6 +369,7 @@ class SamplingParams(ctypes.Structure):
         self.min_new_tokens = kwargs.get("min_new_tokens", 1)
         self.input_penalty = kwargs.get("input_penalty", DEFAULT_INPUT_PENALTY)
         self.group_request_id = kwargs.get("group_request_id", -1)
+        self.pd_node_resource_wait_timeout_seconds = kwargs.get("pd_node_resource_wait_timeout_seconds", -1)
         self.suggested_dp_index = kwargs.get("suggested_dp_index", -1)
 
         self.skip_special_tokens = kwargs.get("skip_special_tokens", SKIP_SPECIAL_TOKENS)

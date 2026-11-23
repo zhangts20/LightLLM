@@ -11,7 +11,7 @@ from .operator.linear_att import (
     NpuLinearAttMemOperator,
 )
 from .npu_mem_manager import NPUInt8KVMemoryManager, NPUInt8KVOperator
-from lightllm.utils.device_utils import get_target_device
+from lightllm.utils.device_utils import get_target_device, is_maca
 from typing import Tuple, Any, List
 
 logger = init_logger(__name__)
@@ -162,6 +162,7 @@ class Qwen3NextMemManager(MemoryManager):
         dp_world_size: int,
         page_kind: str = "kv",
         req_idx: int = None,
+        target_tp_index: int = None,
     ):
         if page_kind == "kv":
             return super().write_mem_to_page_kv_move_buffer(
@@ -172,12 +173,15 @@ class Qwen3NextMemManager(MemoryManager):
                 dp_world_size=dp_world_size,
                 page_kind=page_kind,
                 req_idx=req_idx,
+                target_tp_index=target_tp_index,
             )
         assert page_kind == "linear_att_state", f"unknown page_kind={page_kind}"
         assert req_idx is not None
         helper = Qwen3NextLinearAttPageHelper(self)
         dp_mems = helper.get_dp_mems(mem_managers, dp_index, dp_world_size)
-        helper.write_req_to_page(page_index=page_index, req_idx=req_idx, dp_mems=dp_mems)
+        helper.write_req_to_page(
+            page_index=page_index, req_idx=req_idx, dp_mems=dp_mems, target_tp_index=target_tp_index
+        )
         return
 
     def read_page_kv_move_buffer_to_mem(
@@ -189,6 +193,7 @@ class Qwen3NextMemManager(MemoryManager):
         dp_world_size: int,
         page_kind: str = "kv",
         req_idx: int = None,
+        target_tp_index: int = None,
     ):
         if page_kind == "kv":
             return super().read_page_kv_move_buffer_to_mem(
@@ -199,12 +204,15 @@ class Qwen3NextMemManager(MemoryManager):
                 dp_world_size=dp_world_size,
                 page_kind=page_kind,
                 req_idx=req_idx,
+                target_tp_index=target_tp_index,
             )
         assert page_kind == "linear_att_state", f"unknown page_kind={page_kind}"
         assert req_idx is not None
         helper = Qwen3NextLinearAttPageHelper(self)
         dp_mems = helper.get_dp_mems(mem_managers, dp_index, dp_world_size)
-        helper.read_page_to_req(page_index=page_index, req_idx=req_idx, dp_mems=dp_mems)
+        helper.read_page_to_req(
+            page_index=page_index, req_idx=req_idx, dp_mems=dp_mems, target_tp_index=target_tp_index
+        )
         return
 
 
@@ -261,6 +269,8 @@ class Qwen3NextLinearAttPageHelper:
         dp_mems = mem_managers[(dp_index * dp_world_size) : ((dp_index + 1) * dp_world_size)]
         assert len(dp_mems) == dp_world_size
         for mem in dp_mems:
+            if mem is None:
+                continue
             assert hasattr(mem, "req_to_conv_state") and hasattr(mem, "req_to_ssm_state")
             assert mem.linear_config.linear_layer_num == self.linear_config.linear_layer_num
             assert mem.linear_config.conv_kernel_size == self.linear_config.conv_kernel_size
@@ -285,9 +295,12 @@ class Qwen3NextLinearAttPageHelper:
         page_index: int,
         req_idx: int,
         dp_mems: List["Qwen3NextMemManager"],
+        target_tp_index: int = None,
     ):
         conv_page, ssm_page = self.view_page_to_linear_att_state(page_index)
         for tp_index, mem in enumerate(dp_mems):
+            if target_tp_index is not None and tp_index != target_tp_index:
+                continue
             self._write_one_rank(mem, tp_index, req_idx, conv_page, ssm_page)
         return
 
@@ -296,9 +309,12 @@ class Qwen3NextLinearAttPageHelper:
         page_index: int,
         req_idx: int,
         dp_mems: List["Qwen3NextMemManager"],
+        target_tp_index: int = None,
     ):
         conv_page, ssm_page = self.view_page_to_linear_att_state(page_index)
         for tp_index, mem in enumerate(dp_mems):
+            if target_tp_index is not None and tp_index != target_tp_index:
+                continue
             self._read_one_rank(mem, tp_index, req_idx, conv_page, ssm_page)
         return
 
@@ -509,6 +525,181 @@ class Qwen3NextLinearAttPageHelper:
         self._copy_page_to_ssm_state(ssm_page, ssm_state, mem, tp_index)
         return
 
+    def copy_rank_slice(self, dst_page: int, src_page: int, src_rank: int, src_world: int) -> None:
+        # 把 prefill rank 写在全局页上的 linear head 挪到 decode 的累积页。其余 head 不动。
+        k_local = self.global_linear_k_heads // src_world
+        v_local = self.global_linear_v_heads // src_world
+        k0 = src_rank * k_local
+        v0 = src_rank * v_local
+        head_k = self.linear_config.head_linear_k_dim
+        head_v = self.linear_config.head_linear_v_dim
+        src_conv, src_ssm = self.view_page_to_linear_att_state(src_page)
+        dst_conv, dst_ssm = self.view_page_to_linear_att_state(dst_page)
+        k_off = self.global_q_dim
+        v_off = self.global_q_dim + self.global_k_dim
+        q_slice = slice(k0 * head_k, (k0 + k_local) * head_k)
+        k_slice = slice(k_off + k0 * head_k, k_off + (k0 + k_local) * head_k)
+        v_slice = slice(v_off + v0 * head_v, v_off + (v0 + v_local) * head_v)
+        dst_conv[:, q_slice, :].copy_(src_conv[:, q_slice, :], non_blocking=True)
+        dst_conv[:, k_slice, :].copy_(src_conv[:, k_slice, :], non_blocking=True)
+        dst_conv[:, v_slice, :].copy_(src_conv[:, v_slice, :], non_blocking=True)
+        dst_ssm[:, v0 : v0 + v_local, :, :].copy_(src_ssm[:, v0 : v0 + v_local, :, :], non_blocking=True)
+
+    def _local_linear_pieces(self, page_index: int, tp_index: int) -> List[torch.Tensor]:
+        # 页上按全局 head 排布，本 rank 只写了自己那一段。把这几段按固定顺序收出来，NCCL 就不用送整页。
+        conv_page, ssm_page = self.view_page_to_linear_att_state(page_index)
+
+        pieces: List[torch.Tensor] = []
+        qk_head_slice = self._get_head_slice(
+            tp_index,
+            self.linear_config.num_linear_k_heads,
+            self.global_linear_k_heads,
+            self.linear_config.tp_world_size,
+            is_write=True,
+        )
+        if qk_head_slice is not None:
+            _, _, global_head_start, global_head_end = qk_head_slice
+            global_dim_start = global_head_start * self.linear_config.head_linear_k_dim
+            global_dim_end = global_head_end * self.linear_config.head_linear_k_dim
+            global_q_page = conv_page[:, 0 : self.global_q_dim, :]
+            global_k_page = conv_page[:, self.global_q_dim : self.global_q_dim + self.global_k_dim, :]
+            pieces.append(global_q_page[:, global_dim_start:global_dim_end, :])
+            pieces.append(global_k_page[:, global_dim_start:global_dim_end, :])
+
+        v_head_slice = self._get_head_slice(
+            tp_index,
+            self.linear_config.num_linear_v_heads,
+            self.global_linear_v_heads,
+            self.linear_config.tp_world_size,
+            is_write=True,
+        )
+        if v_head_slice is not None:
+            _, _, global_head_start, global_head_end = v_head_slice
+            global_dim_start = global_head_start * self.linear_config.head_linear_v_dim
+            global_dim_end = global_head_end * self.linear_config.head_linear_v_dim
+            global_v_page = conv_page[:, self.global_q_dim + self.global_k_dim :, :]
+            pieces.append(global_v_page[:, global_dim_start:global_dim_end, :])
+            pieces.append(ssm_page[:, global_head_start:global_head_end, :, :])
+
+        return pieces
+
+    def _pack_buf_for(self, nbytes: int, device: torch.device) -> torch.Tensor:
+        buf = getattr(self, "_pack_buf", None)
+        if buf is None or buf.numel() < nbytes or buf.device != device:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            self._pack_buf = buf
+        return buf
+
+    def linear_pack_buffer(self, page_index: int, tp_index: int) -> torch.Tensor:
+        cached = getattr(self, "_pack_nbytes", None)
+        if cached is None or cached[0] != tp_index:
+            pieces = self._local_linear_pieces(page_index, tp_index)
+            nbytes = sum(piece.numel() * piece.element_size() for piece in pieces)
+            self._pack_nbytes = (tp_index, nbytes)
+        else:
+            nbytes = cached[1]
+        page = self.mem_manager.kv_move_buffer[page_index]
+        return self._pack_buf_for(nbytes, page.device)[:nbytes]
+
+    def _rank_linear_views(self, page_index: int, rank: int, world: int) -> List[torch.Tensor]:
+        # 不等 TP 时按目的 rank 的 head 取段。2p4d 不用把 150MB 整页发给每张 decode 卡。
+        if world <= 0 or self.global_linear_k_heads % world != 0 or self.global_linear_v_heads % world != 0:
+            return []
+        k_local = self.global_linear_k_heads // world
+        v_local = self.global_linear_v_heads // world
+        k0 = rank * k_local
+        v0 = rank * v_local
+        head_k = self.linear_config.head_linear_k_dim
+        head_v = self.linear_config.head_linear_v_dim
+        conv_page, ssm_page = self.view_page_to_linear_att_state(page_index)
+        k_off = self.global_q_dim
+        v_off = self.global_q_dim + self.global_k_dim
+        return [
+            conv_page[:, k0 * head_k : (k0 + k_local) * head_k, :],
+            conv_page[:, k_off + k0 * head_k : k_off + (k0 + k_local) * head_k, :],
+            conv_page[:, v_off + v0 * head_v : v_off + (v0 + v_local) * head_v, :],
+            ssm_page[:, v0 : v0 + v_local, :, :],
+        ]
+
+    def rank_linear_buffer(self, page_index: int, rank: int, world: int, slot=None) -> torch.Tensor:
+        # 4p2d 的一张 decode 卡同时收两路 prefill。缓冲只按 rank 留一份时，两路 stream 会互相盖掉。
+        pieces = self._rank_linear_views(page_index, rank, world)
+        nbytes = sum(piece.numel() * piece.element_size() for piece in pieces)
+        page = self.mem_manager.kv_move_buffer[page_index]
+        bufs = getattr(self, "_rank_recv_bufs", None)
+        if bufs is None:
+            bufs = {}
+            self._rank_recv_bufs = bufs
+        key = (slot, rank)
+        buf = bufs.get(key)
+        if buf is None or buf.numel() < nbytes or buf.device != page.device:
+            buf = torch.empty(max(nbytes, 1), dtype=torch.uint8, device=page.device)
+            bufs[key] = buf
+        return buf[:nbytes]
+
+    def pack_rank_linear(self, page_index: int, rank: int, world: int) -> torch.Tensor:
+        pieces = self._rank_linear_views(page_index, rank, world)
+        flats = [piece.contiguous().view(torch.uint8).reshape(-1) for piece in pieces]
+        nbytes = sum(piece.numel() for piece in flats)
+        page = self.mem_manager.kv_move_buffer[page_index]
+        bufs = getattr(self, "_rank_pack_bufs", None)
+        if bufs is None:
+            bufs = {}
+            self._rank_pack_bufs = bufs
+        buf = bufs.get(rank)
+        if buf is None or buf.numel() < nbytes or buf.device != page.device:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=page.device)
+            bufs[rank] = buf
+        offset = 0
+        for piece in flats:
+            n = piece.numel()
+            buf[offset : offset + n].copy_(piece)
+            offset += n
+        return buf[:nbytes]
+
+    def unpack_rank_linear(self, page_index: int, rank: int, world: int, packed: torch.Tensor) -> None:
+        pieces = self._rank_linear_views(page_index, rank, world)
+        offset = 0
+        for piece in pieces:
+            nbytes = piece.numel() * piece.element_size()
+            src = packed[offset : offset + nbytes].view(piece.dtype).reshape(piece.shape)
+            piece.copy_(src)
+            offset += nbytes
+
+    def pack_local_linear(self, page_index: int, tp_index: int) -> torch.Tensor:
+        pieces = self._local_linear_pieces(page_index, tp_index)
+        flats = [piece.contiguous().view(torch.uint8).reshape(-1) for piece in pieces]
+        nbytes = sum(piece.numel() for piece in flats)
+        page = self.mem_manager.kv_move_buffer[page_index]
+        buf = self._pack_buf_for(nbytes, page.device)
+        offset = 0
+        for piece in flats:
+            n = piece.numel()
+            buf[offset : offset + n].copy_(piece)
+            offset += n
+        return buf[:nbytes]
+
+    def unpack_local_linear(self, page_index: int, tp_index: int, packed: torch.Tensor) -> None:
+        pieces = self._local_linear_pieces(page_index, tp_index)
+        offset = 0
+        for piece in pieces:
+            nbytes = piece.numel() * piece.element_size()
+            src = packed[offset : offset + nbytes].view(piece.dtype).reshape(piece.shape)
+            piece.copy_(src)
+            offset += nbytes
+
+
+def attach_maca_linear_pack(transporter, mem_manager) -> None:
+    if not is_maca() or not hasattr(mem_manager, "linear_config"):
+        return
+    helper = Qwen3NextLinearAttPageHelper(mem_manager)
+    transporter.maca_linear_pack = helper.pack_local_linear
+    transporter.maca_linear_unpack = helper.unpack_local_linear
+    transporter.maca_linear_buffer = helper.linear_pack_buffer
+    transporter.maca_linear_pack_rank = helper.pack_rank_linear
+    transporter.maca_linear_unpack_rank = helper.unpack_rank_linear
+    transporter.maca_linear_rank_buffer = helper.rank_linear_buffer
+
 
 class Qwen3NextInt8KVMemoryManager(Qwen3NextMemManager):
 
@@ -592,6 +783,16 @@ class Qwen3NextInt8KVMemoryManager(Qwen3NextMemManager):
             self.kv_buffer[layer_index][:, self.head_num :, :],
             self.scale_buffer[layer_index][:, self.head_num :, :],
         )
+
+    def alloc_paged_kv_move_buffer(self, page_num, page_size) -> torch.Tensor:
+        kv_move_buffer = super().alloc_paged_kv_move_buffer(page_num, page_size)
+        scale_dim = self.scale_buffer.shape[-1]
+        self.scale_move_buffer = torch.empty(
+            (page_num, page_size, kv_move_buffer.shape[2], kv_move_buffer.shape[3], scale_dim),
+            dtype=self.scale_dtype,
+            device=self.target_device,
+        )
+        return kv_move_buffer
 
     def _init_buffers(
         self,

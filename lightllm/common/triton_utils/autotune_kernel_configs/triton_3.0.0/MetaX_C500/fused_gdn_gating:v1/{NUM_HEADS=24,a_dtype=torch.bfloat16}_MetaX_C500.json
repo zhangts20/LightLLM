@@ -15,6 +15,10 @@
     "BLK_HEADS": 32,
     "num_warps": 1
   },
+  "16384": {
+    "BLK_HEADS": 32,
+    "num_warps": 1
+  },
   "2048": {
     "BLK_HEADS": 32,
     "num_warps": 1

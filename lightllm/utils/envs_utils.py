@@ -303,8 +303,28 @@ def _get_mtp_draft_backbone_layer_num(draft_model_dir: str) -> int:
 
 
 @lru_cache(maxsize=None)
-def get_pd_split_max_new_tokens() -> int:
-    return int(os.getenv("LIGHTLLM_PD_SPLIT_MAX_NEW_TOKENS", 2048))
+def get_pd_node_resource_wait_timeout_seconds() -> int:
+    """P/D 节点资源等待上限，单位秒。负数表示不按这个预算放宽握手。"""
+    return int(os.getenv("LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS", 20))
+
+
+@lru_cache(maxsize=None)
+def get_pd_node_busy_retry_timeout_seconds() -> int:
+    """节点报忙后 master 换一台重试的最长时间，单位秒。0 表示不重试。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS", 0)))
+
+
+@lru_cache(maxsize=None)
+def get_pd_long_prefix_affinity_max_age_seconds() -> int:
+    """长前缀缓存记录还能优先于空闲卡的最长时间，单位秒。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_LONG_PREFIX_AFFINITY_MAX_AGE_SECONDS", 600)))
+
+
+def decode_handshake_timeout_seconds(resource_wait_seconds: int) -> int:
+    """Decode 握手等待。资源预算小于 0 时保持 180 秒，否则至少覆盖两倍资源等待。"""
+    if resource_wait_seconds < 0:
+        return 180
+    return max(180, 2 * int(resource_wait_seconds) + 15)
 
 
 @lru_cache(maxsize=None)

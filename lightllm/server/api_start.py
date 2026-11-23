@@ -7,7 +7,13 @@ from lightllm.utils.start_utils import process_manager
 from .metrics.manager import start_metric_manager
 from .embed_cache.manager import start_cache_manager
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.envs_utils import get_page_size, set_env_start_args, set_unique_server_name, get_unique_server_name
+from lightllm.utils.envs_utils import (
+    get_env_start_args,
+    get_page_size,
+    set_env_start_args,
+    set_unique_server_name,
+    get_unique_server_name,
+)
 from lightllm.utils.shm_port_args import get_shm_port_args
 from lightllm.utils.net_utils import validate_ports
 from .detokenization.manager import start_detokenization_process
@@ -205,12 +211,7 @@ def _launch_subprocesses(args: StartArgs):
     # In visual proxy mode keep the caller-provided visual_dp / visual_tp.
     if not args.visual_use_proxy_mode and args.visual_tp < args.tp and args.tp % args.visual_tp == 0:
         args.visual_dp = args.tp // args.visual_tp
-    # page_size > 1 compatibility check
     if get_page_size() > 1:
-        assert args.run_mode not in (
-            "prefill",
-            "decode",
-        ), "page_size > 1 is not supported with RPyC PD split mode, please set PAGE_SIZE=1"
         assert args.run_mode not in (
             "nixl_prefill",
             "nixl_decode",
@@ -497,6 +498,36 @@ def normal_or_p_d_start(args: StartArgs):
         process_manager.start_submodule_processes(start_funcs=[start_health_check_process], start_args=[(args,)])
     process_manager.setup_signal_handlers(http_server_process)
     process_manager.supervise_processes(http_server_process)
+
+
+def pd_master_multi_worker_start(args: StartArgs):
+    """多个 PD master worker 挂在 HAProxy 后面。P/D 直接连每个 worker。"""
+    from .httpserver_for_pd_master.multiprocess import (
+        start_multiprocess_pd_master,
+        validate_multiprocess_pd_master_args,
+    )
+    from .httpserver_for_pd_master.pd_master_shared import start_pd_master_shared_state
+
+    haproxy_binary = validate_multiprocess_pd_master_args(args)
+    _set_envs_and_config(args)
+    set_unique_server_name(args)
+    auto_set_max_req_total_len(args)
+    auto_set_response_parsers(args)
+    if args.config_server_host and args.config_server_port:
+        args.pd_node_id = uuid.uuid4().int
+    else:
+        args.pd_node_id = 0
+    set_env_start_args(args)
+    get_env_start_args.cache_clear()
+    ports = get_shm_port_args(create=True)
+    worker_ports = ports.pd_master_multi_ports
+    validate_ports([args.port, *worker_ports])
+    logger.info(f"PD master worker ports: {worker_ports}")
+    process_manager.start_submodule_processes(
+        start_funcs=[start_metric_manager, start_pd_master_shared_state],
+        start_args=[(args,), (args,)],
+    )
+    return start_multiprocess_pd_master(args, ports=ports, haproxy_binary=haproxy_binary)
 
 
 def pd_master_start(args: StartArgs):

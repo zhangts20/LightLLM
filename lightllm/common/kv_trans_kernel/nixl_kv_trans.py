@@ -216,6 +216,28 @@ def page_io(
     return
 
 
+def copy_page_head_slice(
+    kv_move_buffer: torch.Tensor,
+    dst_page: int,
+    src_page: int,
+    src_rank: int,
+    src_world: int,
+    token_num: int,
+) -> None:
+    # 页的 head 维是全局的，K 在前一半，V 在后一半。只拷 src_rank 写下的那一段。
+    src = kv_move_buffer[src_page]
+    dst = kv_move_buffer[dst_page]
+    global_heads = src.shape[2] // 2
+    local_heads = global_heads // src_world
+    start = src_rank * local_heads
+    end = start + local_heads
+    rows = token_num if 0 < token_num < src.shape[0] else src.shape[0]
+    dst[:rows, :, start:end, :].copy_(src[:rows, :, start:end, :], non_blocking=True)
+    dst[:rows, :, global_heads + start : global_heads + end, :].copy_(
+        src[:rows, :, global_heads + start : global_heads + end, :], non_blocking=True
+    )
+
+
 @triton.jit
 def _mla_page_io(
     mem_index_ptr,

@@ -5,6 +5,7 @@ import threading
 import queue
 import torch.multiprocessing as mp
 from typing import List, Dict, Union, Callable, Optional
+from lightllm.utils.device_utils import is_maca
 from lightllm.utils.log_utils import init_logger
 from lightllm.server.pd_io_struct import PDChunckedTransTaskRet
 from lightllm.server.core.objs import StartArgs
@@ -33,6 +34,8 @@ class BaseKVMoveManager:
 
         self.info_queue = info_queue
         self.ret_obj_queue = queue.Queue()
+        self._shard_lock = threading.Lock()
+        self._shard_rets: Dict[tuple, List[PDChunckedTransTaskRet]] = {}
 
         self.kv_trans_processes: List[KVTransProcess] = [None] * self.node_world_size
         for device_id in range(self.node_world_size):
@@ -44,6 +47,12 @@ class BaseKVMoveManager:
                 start_func=start_trans_process_func,
                 up_status_in_queue=up_status_in_queue,
             )
+
+        for trans_process in self.kv_trans_processes:
+            if not trans_process.wait_until_ready():
+                raise RuntimeError(f"KV trans module for device {trans_process.device_id} failed to initialize")
+
+        for trans_process in self.kv_trans_processes:
             threading.Thread(target=self.task_ret_handle_loop, args=(trans_process,), daemon=True).start()
 
         # 通过 io buffer 将命令写入到推理进程中
@@ -98,7 +107,27 @@ class BaseKVMoveManager:
     def task_ret_handle_loop(self, trans_process: KVTransProcess):
         while True:
             ret_obj: PDChunckedTransTaskRet = trans_process.task_out_queue.get()
+            self._merge_rank_ret(ret_obj)
+
+    def _merge_rank_ret(self, ret_obj: PDChunckedTransTaskRet):
+        # 沐曦上一条请求会在每个 rank 各传自己的那一份。推理侧仍按一条任务计数，这里收齐再回一条。
+        need = self.node_world_size if is_maca() else 1
+        if need <= 1:
             self.ret_obj_queue.put(ret_obj)
+            return
+        key = (ret_obj.request_id, ret_obj.page_kind, ret_obj.start_kv_index, ret_obj.end_kv_index)
+        with self._shard_lock:
+            bucket = self._shard_rets.setdefault(key, [])
+            bucket.append(ret_obj)
+            if len(bucket) < need:
+                return
+            done = self._shard_rets.pop(key)
+        merged = done[0]
+        failed = next((item for item in done if item.has_error), None)
+        if failed is not None:
+            merged.has_error = True
+            merged.error_info = failed.error_info
+        self.ret_obj_queue.put(merged)
 
     # ==================================================================================
     # 定时检测传输进程的健康状态，出现问题拉崩整个系统触发重启

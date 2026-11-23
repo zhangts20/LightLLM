@@ -58,16 +58,17 @@ class KvCacheAllocator:
         Args:
             free_index (torch.Tensor): _description_
         """
+        # PAGE_SIZE>1 的整页展开会把同一个页头展开多遍。先去重。
+        if not isinstance(free_index, torch.Tensor):
+            free_index = torch.tensor(free_index, dtype=torch.int32)
+        free_index = torch.unique(free_index)
 
         end = self.mark_start
         start = self.mark_start - len(free_index)
         assert start >= 0, f"error free state start: {self.mark_start} free len {len(free_index)}"
 
-        if isinstance(free_index, list):
-            self.mem_state.numpy()[start:end] = free_index
-        else:
-            # 从 gpu 到 cpu 的拷贝操作是流内阻塞操作
-            self.mem_state[start:end] = free_index
+        # 从 gpu 到 cpu 的拷贝操作是流内阻塞操作
+        self.mem_state[start:end] = free_index
 
         self.mark_start -= len(free_index)
 

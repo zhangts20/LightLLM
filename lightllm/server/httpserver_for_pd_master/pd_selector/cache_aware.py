@@ -19,13 +19,15 @@ PD Master 的 cache-aware prefill 选点策略。
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
 from lightllm.server.pd_io_struct import PD_Client_Obj
+from lightllm.utils.envs_utils import get_pd_long_prefix_affinity_max_age_seconds
 from lightllm.utils.log_utils import init_logger
 
-from .prompt_cache_tree import PromptCacheTree
+from .prompt_cache_tree import PromptCacheMatchResult, PromptCacheTree
 
 
 logger = init_logger(__name__)
@@ -138,51 +140,101 @@ class CacheAwarePolicy:
         if len(request_text) <= 1:
             raise ValueError(f"request_text length must be > 1, got {len(request_text)}")
 
-        # ---- 1. 空闲优先：避免有可用 GPU 闲置 ----
-        idle_worker = self._select_idle_worker(workers, request_text)
+        self._refresh_shared_loads(workers)
+        cache_match = self._prefix_match(request_text)
+        # ---- 1. 空闲优先。足够新的长前缀只把未命中后缀算进负载，避免被空闲卡抢走。 ----
+        idle_worker = self._select_idle_worker(workers, cache_match)
         if idle_worker is not None:
-            self.prompt_cache_tree.insert(request_text, idle_worker.client_ip_port)
+            self._insert_prompt(request_text, idle_worker.client_ip_port)
             return idle_worker
 
         # ---- 2. 所有节点都忙时，在 cache 亲和与负载均衡之间权衡 ----
-        cache_worker = self._get_cache_worker(workers, request_text)
-        selected_worker = self._select_worker_by_cache_and_load(workers, cache_worker, len(request_text))
+        cache_worker = self._worker_from_match(workers, cache_match)
+        request_load = self._request_load(cache_match, cache_worker)
+        selected_worker = self._select_worker_by_cache_and_load(workers, cache_worker, request_load)
 
-        self.prompt_cache_tree.insert(request_text, selected_worker.client_ip_port)
+        self._insert_prompt(request_text, selected_worker.client_ip_port)
         return selected_worker
+
+    def _prefix_match(self, request_text: str) -> PromptCacheMatchResult:
+        from ..pd_master_shared import shared_client
+
+        client = shared_client()
+        if client is None:
+            return self.prompt_cache_tree.prefix_match(request_text)
+        prefill_node, matched_char_count, input_char_count, last_insert_time = client.root.prefix_match(request_text)
+        return PromptCacheMatchResult(
+            prefill_node=prefill_node,
+            matched_char_count=matched_char_count,
+            input_char_count=input_char_count,
+            last_insert_time=last_insert_time,
+        )
+
+    def _insert_prompt(self, request_text: str, prefill_node: str) -> None:
+        from ..pd_master_shared import shared_client
+
+        client = shared_client()
+        if client is None:
+            self.prompt_cache_tree.insert(request_text, prefill_node)
+        else:
+            client.root.insert(request_text, prefill_node)
+
+    def _refresh_shared_loads(self, workers: List[PD_Client_Obj]) -> None:
+        from ..pd_master_shared import shared_client
+
+        client = shared_client()
+        if client is None:
+            return
+        loads = client.root.get_loads(tuple(worker.client_ip_port for worker in workers))
+        for worker, load in zip(workers, loads):
+            worker.dispatched_prompt_chars = int(load[0])
+            worker.dispatched_req_num = int(load[1])
+
+    def _is_fresh_long_prefix(self, cache_match: PromptCacheMatchResult) -> bool:
+        if cache_match.last_insert_time is None:
+            return False
+        match_rate = cache_match.matched_char_count / cache_match.input_char_count
+        cache_age_seconds = max(0.0, time.monotonic() - cache_match.last_insert_time)
+        return (
+            cache_match.matched_char_count >= 65536
+            and match_rate >= 0.8
+            and cache_age_seconds <= get_pd_long_prefix_affinity_max_age_seconds()
+        )
+
+    def _request_load(self, cache_match: PromptCacheMatchResult, cache_worker: Optional[PD_Client_Obj]) -> int:
+        if cache_worker is not None and self._is_fresh_long_prefix(cache_match):
+            return max(1, cache_match.input_char_count - cache_match.matched_char_count)
+        return cache_match.input_char_count
+
+    def _worker_from_match(
+        self, workers: List[PD_Client_Obj], cache_match: PromptCacheMatchResult
+    ) -> Optional[PD_Client_Obj]:
+        match_rate = cache_match.matched_char_count / cache_match.input_char_count
+        if match_rate <= self.config.cache_threshold or cache_match.prefill_node is None:
+            return None
+        for worker in workers:
+            if worker.client_ip_port == cache_match.prefill_node:
+                return worker
+        return None
 
     def record_prompt_cache_hit_rate(self, cache_hit_rate: float) -> None:
         """记录推理侧上报的真实 cache 命中率，并更新动态负载阈值。"""
         self.balance_rel_threshold_controller.append(cache_hit_rate)
         self.balance_rel_threshold_controller.update_config(self.config)
 
-    def _get_cache_worker(self, workers: List[PD_Client_Obj], request_text: str) -> Optional[PD_Client_Obj]:
-        """在指定候选节点中返回达到匹配阈值的 cache 节点。"""
-        result = self.prompt_cache_tree.prefix_match(request_text)
-        match_rate = 0.0 if result.input_char_count == 0 else result.matched_char_count / result.input_char_count
-
-        logger.info(
-            f"CacheAwarePolicy: matched_char_count={result.matched_char_count}, "
-            f"input_char_count={result.input_char_count}, match_rate={match_rate:.4f}, "
-            f"cache_threshold={self.config.cache_threshold:.4f}, "
-            f"prefill_node={result.prefill_node}"
-        )
-
-        if match_rate <= self.config.cache_threshold or result.prefill_node is None:
+    def _select_idle_worker(
+        self,
+        workers: List[PD_Client_Obj],
+        cache_match: PromptCacheMatchResult,
+    ) -> Optional[PD_Client_Obj]:
+        """优先选择空闲节点。长前缀仍在有效期内时，允许命中节点和空闲节点一起比较。"""
+        if self._is_fresh_long_prefix(cache_match):
             return None
-
-        for worker in workers:
-            if worker.client_ip_port == result.prefill_node:
-                return worker
-        return None
-
-    def _select_idle_worker(self, workers: List[PD_Client_Obj], request_text: str) -> Optional[PD_Client_Obj]:
-        """优先选择空闲节点；多个空闲节点之间优先复用 cache。"""
         idle_workers = [worker for worker in workers if worker.dispatched_req_num == 0]
         if not idle_workers:
             return None
 
-        cache_worker = self._get_cache_worker(idle_workers, request_text) if len(idle_workers) > 1 else None
+        cache_worker = self._worker_from_match(idle_workers, cache_match) if len(idle_workers) > 1 else None
         selected_worker = cache_worker or min(
             idle_workers,
             key=lambda worker: (worker.dispatched_prompt_chars, worker.client_ip_port),

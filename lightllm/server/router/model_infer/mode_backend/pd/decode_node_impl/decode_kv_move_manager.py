@@ -1,4 +1,6 @@
+import copy
 import inspect
+import logging
 import pickle
 import setproctitle
 import torch.multiprocessing as mp
@@ -11,6 +13,7 @@ from lightllm.utils.graceful_utils import graceful_registry
 from ..trans_process_obj import KVTransProcess
 from ..base_kv_move_manager import BaseKVMoveManager
 from lightllm.utils.error_utils import log_exception
+from lightllm.utils.device_utils import is_maca
 from lightllm.utils.envs_utils import get_unique_server_name
 from lightllm.utils.process_check import start_parent_check_thread
 
@@ -88,12 +91,34 @@ class DecodeKVMoveManager(BaseKVMoveManager):
                 assert False, f"error obj {task_group}"
 
             try:
-                trans_process: KVTransProcess = self.kv_trans_processes[device_id]
-                trans_process.task_in_queue.put(task_group)
-                if isinstance(task_group, PDChunckedTransTaskGroup):
-                    logger.info(
-                        f"kv move manager dispatch task group {task_group.task_list[0].to_str()} to device {device_id}"
-                    )
+                if (
+                    isinstance(task_group, PDAbortReq)
+                    and is_maca()
+                    and self.node_world_size > 1
+                ):
+                    for shard_device_id in range(self.node_world_size):
+                        self.kv_trans_processes[shard_device_id].task_in_queue.put(task_group)
+                    continue
+
+                # 每个 decode rank 只收同号 prefill rank 的那一份，和 vLLM 的 rank 对 rank 一样。
+                if (
+                    is_maca()
+                    and self.node_world_size > 1
+                    and isinstance(task_group, PDChunckedTransTaskGroup)
+                ):
+                    for shard_device_id in range(self.node_world_size):
+                        cloned = copy.copy(task_group)
+                        cloned.task_list = [copy.copy(task) for task in task_group.task_list]
+                        self.kv_trans_processes[shard_device_id].task_in_queue.put(cloned)
+                else:
+                    trans_process: KVTransProcess = self.kv_trans_processes[device_id]
+                    trans_process.task_in_queue.put(task_group)
+                    # 一组任务覆盖整条请求，不走 --pd_detail_log。
+                    if isinstance(task_group, PDChunckedTransTaskGroup) and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"kv move manager dispatch task group {task_group.task_list[0].to_str()} "
+                            f"to device {device_id}"
+                        )
 
             except BaseException as e:
                 logger.exception(str(e))

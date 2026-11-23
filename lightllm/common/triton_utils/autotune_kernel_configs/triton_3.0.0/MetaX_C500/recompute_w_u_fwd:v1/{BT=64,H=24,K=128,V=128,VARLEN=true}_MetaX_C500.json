@@ -15,6 +15,10 @@
     "num_stages": 3,
     "num_warps": 4
   },
+  "16384": {
+    "num_stages": 2,
+    "num_warps": 2
+  },
   "2048": {
     "num_stages": 2,
     "num_warps": 2

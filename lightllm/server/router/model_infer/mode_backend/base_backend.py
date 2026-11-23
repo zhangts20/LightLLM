@@ -9,6 +9,7 @@ from typing import List, Tuple, Callable, Optional
 from transformers.configuration_utils import PretrainedConfig
 from lightllm.platform import get_backend
 from lightllm.utils.infer_utils import set_random_seed
+from lightllm.utils.device_utils import is_maca
 from lightllm.utils.log_utils import init_logger
 from lightllm.models import get_draft_model_class, get_model
 from lightllm.server.router.model_infer.infer_batch import InferReq, InferReqUpdatePack
@@ -231,6 +232,14 @@ class ModeBackend:
             # 读取
             self.model.mem_manager.write_to_shm(req_manager=self.model.req_manager)
             dist_barrier(group=self.node_nccl_group)
+            # 沐曦上 graph 占满 DMA queue 后，别的进程再 ncclCommInitRank 会卡在建 queue。
+            # 只在 maca + nccl 时把传输线程留在这个已经录过 graph 的进程里。
+            if self.args.pd_trans_mode == "nccl" and is_maca():
+                from lightllm.server.router.model_infer.mode_backend.pd.maca_nccl_in_rank import (
+                    start_maca_nccl_in_rank,
+                )
+
+                start_maca_nccl_in_rank(self)
 
         # 同一 DP 组内只需主 rank 初始化真实的 capture buffer 并执行后续相关操作；
         # 非主 rank 不需要分配 buffer，避免重复占用内存。
@@ -462,6 +471,8 @@ class ModeBackend:
     def _try_read_new_reqs(self):
         if self.is_multinode_tp:
             self._try_read_new_reqs_multinode_tp()
+        elif self.is_pd_mode and is_maca():
+            self._try_read_new_reqs_maca_pd()
         else:
             self._try_read_new_reqs_normal()
 
@@ -469,6 +480,24 @@ class ModeBackend:
         if self.profiler is not None:
             self.profiler.multi_thread_helper()
         return
+
+    def _try_read_new_reqs_maca_pd(self):
+        # 新请求和 KV 传输完成原来各做一次 broadcast + item()。合成一次，每步少一次全卡同步。
+        if self.is_master_in_node:
+            flags = 0
+            if self.shm_reqs_io_buffer.is_ready():
+                flags |= 1
+            if self.shm_pd_trans_io_buffer.is_ready():
+                flags |= 2
+            self.node_broadcast_tensor.fill_(flags)
+
+        src_rank_id = self.args.node_rank * self.node_world_size
+        broadcast(self.node_broadcast_tensor, src=src_rank_id, group=self.node_nccl_group, async_op=False)
+        flags = int(self.node_broadcast_tensor.detach().item())
+        if flags & 1:
+            self._read_reqs_buffer_and_init_reqs()
+        if flags & 2:
+            self._read_pd_trans_io_buffer_and_update_req_status()
 
     def _try_read_new_reqs_normal(self):
         if self.is_master_in_node:
@@ -562,9 +591,8 @@ class ModeBackend:
                                 req_to_next_token_ids = (
                                     self.model.req_manager.req_sampling_params_manager.req_to_next_token_ids
                                 )
-                                # to do 这个地方是否需要加流同步
+                                # 下一次 decode 读这个 tensor 走同一条推理 stream，fill 排在它前面。
                                 req_to_next_token_ids[req.req_idx, 0:1].fill_(obj.first_gen_token_id)
-                                self.backend_runtime.current_stream().synchronize()
                                 InferReqUpdatePack(req_obj=req, output_len=req.cur_output_len).handle(
                                     next_token_id=obj.first_gen_token_id,
                                     next_token_logprob=obj.first_gen_token_logprob,
@@ -715,8 +743,21 @@ class ModeBackend:
                     can_alloc_token_num -= token_num
                 else:
                     if wait_pause_count < pause_max_req_num:
-                        req_obj.wait_pause = True
-                        wait_pause_count += 1
+                        if self.args.run_mode == "decode":
+                            # Decode 容量不够时结束当前分段，master 用剩余额度续跑。
+                            wait_pause_count += 1
+                            setattr(req_obj, "finished_by_pd_decode_capacity", True)
+                            if support_overlap:
+                                req_obj.filter_mark = True
+                            else:
+                                finished_reqs.append(req_obj)
+                            self.logger.info(
+                                f"force early finish for PD decode req_id={req_obj.req_id} "
+                                "because token capacity is insufficient"
+                            )
+                        else:
+                            req_obj.wait_pause = True
+                            wait_pause_count += 1
             else:
                 # 在 diverse mode 模式下，prefill 只会使用 master 状态的请求，slave 请求依靠后续
                 # 的推理代码中将master请求的状态复制到slave请求中去， 所以这里 slave 状态的请求，不
@@ -835,6 +876,14 @@ class ModeBackend:
                 extra_post_req_handle_func=extra_post_req_handle_func,
                 pd_prefill_chunked_handle_func=pd_prefill_chunked_handle_func,
             )
+
+        # token 已经写进 shm。KV 页任务放在这之后，避免每个请求的拷贝和下标同步挡住首 token。
+        for req_obj in run_reqs:
+            builder = getattr(req_obj, "_maca_trans_builder", None)
+            if builder is None:
+                continue
+            req_obj._maca_trans_builder = None
+            builder()
 
         g_infer_context.req_manager.req_sampling_params_manager.update_reqs_token_counter(
             req_objs=run_reqs, next_token_ids=next_token_ids

@@ -27,6 +27,8 @@ class FinishStatus(ctypes.Structure):
     - ``NO_FINISH``: 未结束
     - ``FINISHED_STOP``: 正常停止（EOS / stop 序列等），finish_reason=``stop``
     - ``FINISHED_LENGTH``: 达到 max_new_tokens 等长度上限，finish_reason=``length``
+    - ``FINISHED_PD_DECODE_CAPACITY``: PD Decode 因 token 容量不足提前结束当前分段。
+      该状态只给 master 续跑用，不直接返回给调用方。
     - ``FINISHED_ABORTED``: 客户端/调度主动 abort，finish_reason=``abort``
     - ``FINISHED_ERROR``: 服务端内部错误导致无法继续生成，finish_reason=``error``。
       典型场景：PD 分离 decode 节点 KV 传输失败。与 abort 区分：非用户取消，
@@ -42,19 +44,21 @@ class FinishStatus(ctypes.Structure):
     FINISHED_ABORTED = 3
     # 内部错误结束（如 PD KV 传输失败）；见类文档。
     FINISHED_ERROR = 4
+    # 值 5 放在旧编号后面，避免改掉已经写进共享内存的 3 和 4。
+    FINISHED_PD_DECODE_CAPACITY = 5
 
     def __init__(self, init_state=NO_FINISH):
         self.status = init_state
 
     def set_status(self, new_status):
-        assert 0 <= new_status <= 4
+        assert 0 <= new_status <= self.FINISHED_PD_DECODE_CAPACITY
         self.status = new_status
 
     def get_status(self):
         return self.status
 
     def is_finished(self):
-        return self.FINISHED_STOP <= self.status <= self.FINISHED_ERROR
+        return self.FINISHED_STOP <= self.status <= self.FINISHED_PD_DECODE_CAPACITY
 
     def is_stopped(self):
         return self.status == self.FINISHED_STOP
@@ -65,6 +69,9 @@ class FinishStatus(ctypes.Structure):
     def is_finished_error(self):
         return self.status == self.FINISHED_ERROR
 
+    def is_finished_pd_decode_capacity(self):
+        return self.status == self.FINISHED_PD_DECODE_CAPACITY
+
     def get_finish_reason(self):
         if self.status == self.FINISHED_STOP:
             return "stop"
@@ -74,6 +81,8 @@ class FinishStatus(ctypes.Structure):
             return "abort"
         elif self.status == self.FINISHED_ERROR:
             return "error"
+        elif self.status == self.FINISHED_PD_DECODE_CAPACITY:
+            return "length"
         return None
 
 
