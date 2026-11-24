@@ -60,6 +60,10 @@ def maca_prefill_ranks_for_decode(decode_rank: int, prefill_tp: int, decode_tp: 
     return [decode_rank * prefill_tp // decode_tp]
 
 
+def _maca_node_of(agent_name: str) -> str:
+    return agent_name.rsplit("_", 1)[0]
+
+
 def maca_kv_local_span(global_heads: int, world: int, rank: int):
     # 全局 head 不能整除时（比如 4 个 KV head、TP=8）一张卡会复制 head，不能按段打包。
     if world <= 1 or global_heads <= 0 or global_heads % world != 0:
@@ -160,8 +164,8 @@ class NcclKVTransporter:
         self._maca_copy_events: Dict[tuple, tuple] = {}
         self._maca_q_lock = threading.RLock()
         self._maca_match_cache = None
-        # 沐曦上同一个进程里并发 ncclCommInitRank / ncclSend 会把队列进度卡死。只留一条线程。
-        # 每个 rank 只和同号对端通信，不再做 4 个 rank 的全员 barrier。
+        # 同一台机器上的多卡仍由这一条线程用同一条通信器发送。
+        # 不同节点各起一条线程，和 CUDA 的每个 peer 一条 recv 线程一样。
         if is_maca():
             threading.Thread(
                 target=self._maca_nccl_loop, name=f"maca_nccl_{self.tp_idx}", daemon=True
@@ -450,12 +454,14 @@ class NcclKVTransporter:
             )
 
     def _sorted_peer_names(self) -> List[str]:
-        # 同一个 device_id 只留最后登记的 agent。prefill 重启后旧 node id 还在表里，
-        # 再去跟它对齐会把唯一的 NCCL 线程堵住，活着的那一对永远排不上。
-        latest: Dict[int, str] = {}
+        # device_id 只在一台机器内部区分 rank。两台 decode 的 rank 0 都是 device_id 0，
+        # 按 device_id 去重会把其中一台盖掉，那一台永远等不到 nccl_layout。
+        # 同一个 node id 里 device_id 重复时只留最后登记的，避免重启后的旧名字还占着。
+        latest: Dict[tuple, str] = {}
         for name in list(self.remote_agents.keys()):
-            latest[self._get_remote_metadata(name).device_id] = name
-        return [latest[device_id] for device_id in sorted(latest)]
+            meta = self._get_remote_metadata(name)
+            latest[(_maca_node_of(name), meta.device_id)] = name
+        return [latest[key] for key in sorted(latest)]
 
     def _maca_queue(self, peer_name: str) -> deque:
         # 调用方已经拿着 _maca_q_lock。
@@ -713,13 +719,13 @@ class NcclKVTransporter:
             peer.dst_rank = index + 1
             peer.comm = comm
 
-    def _maca_ensure_pair(self, peer_name: str):
+    def _maca_ensure_pair(self, peer_name: str, timeout: float = 120.0):
         peer = self._get_peer(peer_name)
         if peer.comm is not None:
             return
         stream = peer._get_stream()
         peer._use_stream_for_init(stream)
-        peer._ensure_comm(is_server=self.is_prefill_node)
+        peer._ensure_comm(is_server=self.is_prefill_node, timeout=timeout)
         logger.info(f"maca nccl pair ready peer={peer_name}")
 
     def _maca_peer_posted(self, peer_name: str, epoch: int) -> bool:
@@ -739,7 +745,8 @@ class NcclKVTransporter:
         _NcclControlStore(self, peer_name).set(f"work/{epoch}", json.dumps(keys).encode())
 
     def _maca_wait_keys(self, peer_name: str, epoch: int, timeout: float = 120.0) -> list:
-        raw = _NcclControlStore(self, peer_name).get(f"work/{epoch}", timeout=timeout)
+        # 不弹出。短超时后这一轮作废时，对端仍能读到同一个 key，两边的 epoch 才不会错开。
+        raw = _NcclControlStore(self, peer_name).get(f"work/{epoch}", timeout=timeout, pop=False)
         return [tuple(item) for item in json.loads(raw.decode())]
 
     def _maca_match_items(self, taken: list, other_keys: list):
@@ -792,13 +799,15 @@ class NcclKVTransporter:
             return False
         taken = self._maca_take_tasks(peer_name, 32)
         try:
-            self._maca_ensure_pair(peer_name)
+            self._maca_ensure_pair(peer_name, timeout)
             local_keys = [list(self._maca_task_key(item)) for item in taken]
             other_keys = self._maca_exchange_keys(peer_name, epoch, local_keys, timeout=timeout)
-        except BaseException:
+        except BaseException as exc:
             self._maca_requeue_front(peer_name, taken)
-            logger.exception(f"maca nccl epoch sync failed peer={peer_name} epoch={epoch}")
-            time.sleep(0.05)
+            # 同节点多卡的短轮询超时是正常让路，不打栈。
+            if not isinstance(exc, TimeoutError) or timeout >= 120.0:
+                logger.exception(f"maca nccl epoch sync failed peer={peer_name} epoch={epoch}")
+                time.sleep(0.05)
             return False
         chosen, rest = self._maca_match_items(taken, other_keys)
         try:
@@ -827,9 +836,21 @@ class NcclKVTransporter:
             self._group_rr = (start + offset + 1) % count
             return
 
+    def _maca_pair_loop(self, peer_name: str) -> None:
+        # 和 CUDA 一样：每个对端节点一条线程、一条 world=2 通信器。
+        # 不和别的节点共用线程，就不会在两条通信器之间来回切。
+        torch.cuda.set_device(self.tp_idx)
+        epoch = 0
+        while True:
+            if self._maca_one_peer_step(peer_name, epoch, timeout=120.0):
+                epoch += 1
+            else:
+                time.sleep(0.01)
+
     def _maca_nccl_loop(self):
         torch.cuda.set_device(self.tp_idx)
         epochs: Dict[str, int] = {}
+        pair_threads: Dict[str, threading.Thread] = {}
         last_log = 0.0
         while True:
             try:
@@ -853,22 +874,34 @@ class NcclKVTransporter:
                     last_log = now
                 time.sleep(0.01)
                 continue
-            # 同一条 group 通信器一次只发一路，发完再换。一对一仍按各自的轮次走。
-            if self.is_prefill_node and len(peers) > 1:
-                self._maca_group_turn(peers, epochs)
+            by_node: Dict[str, List[str]] = {}
+            for name in peers:
+                by_node.setdefault(_maca_node_of(name), []).append(name)
+            group_peers: List[str] = []
+            for names in by_node.values():
+                # 同一台机器上的连续几张卡仍共用一条通信器。不同节点走各自的线程。
+                if self.is_prefill_node and len(names) > 1:
+                    group_peers.extend(names)
+                    continue
+                for name in names:
+                    if name in pair_threads:
+                        continue
+                    worker = threading.Thread(
+                        target=self._maca_pair_loop,
+                        args=(name,),
+                        name=f"maca_nccl_{self.tp_idx}_{name[-6:]}",
+                        daemon=True,
+                    )
+                    worker.start()
+                    pair_threads[name] = worker
+            if not group_peers:
+                time.sleep(0.01)
+                continue
+            if any(self._maca_inflight(name) for name in group_peers):
                 time.sleep(0.001)
                 continue
-            posted_any = False
-            for peer_name in peers:
-                if self._maca_inflight(peer_name):
-                    continue
-                epoch = epochs.get(peer_name, 0)
-                if not self._maca_one_peer_step(peer_name, epoch):
-                    continue
-                epochs[peer_name] = epoch + 1
-                posted_any = True
-            if not posted_any:
-                time.sleep(0.001)
+            self._maca_group_turn(group_peers, epochs)
+            time.sleep(0.001)
 
 
 @dataclass
@@ -1070,8 +1103,8 @@ class _NcclPeer:
             logger.exception(f"maca recv failure event record failed request_id={trans_task.request_id}")
             self.transporter.disarm_maca_recv(page)
 
-    def _wait_nccl_layout(self) -> dict:
-        raw = _NcclControlStore(self.transporter, self.peer_name).get("nccl_layout", timeout=120.0)
+    def _wait_nccl_layout(self, timeout: float = 120.0) -> dict:
+        raw = _NcclControlStore(self.transporter, self.peer_name).get("nccl_layout", timeout=timeout)
         return json.loads(raw.decode())
 
     def _join_nccl_group(self, layout: dict) -> PyNcclCommunicator:
@@ -1091,20 +1124,21 @@ class _NcclPeer:
         )
         return comm
 
-    def _ensure_comm(self, is_server: bool) -> PyNcclCommunicator:
+    def _ensure_comm(self, is_server: bool, timeout: float = 120.0) -> PyNcclCommunicator:
         if self.comm is not None:
             return self.comm
         if is_maca():
             if is_server:
                 peers, _bad = self.transporter._maca_matching_peers()
-                if len(peers) > 1 and self.peer_name in peers:
-                    self.transporter._maca_init_send_group(peers, self._get_stream())
+                same_node = [name for name in peers if _maca_node_of(name) == _maca_node_of(self.peer_name)]
+                if len(same_node) > 1 and self.peer_name in same_node:
+                    self.transporter._maca_init_send_group(same_node, self._get_stream())
                     return self.comm
                 _NcclControlStore(self.transporter, self.peer_name).set(
                     "nccl_layout", json.dumps({"world": 2, "rank": 1}).encode()
                 )
             else:
-                layout = self._wait_nccl_layout()
+                layout = self._wait_nccl_layout(timeout)
                 if int(layout["world"]) > 2:
                     self.comm = self._join_nccl_group(layout)
                     return self.comm
