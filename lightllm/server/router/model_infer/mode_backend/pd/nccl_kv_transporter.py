@@ -159,8 +159,11 @@ class NcclKVTransporter:
         self._peer_lock = threading.Lock()
         self._maca_send_q: Dict[str, deque] = {}
         self._maca_recv_q: Dict[str, deque] = {}
-        # 页还在接收：None 表示已占页、事件还没记下；Event 表示接收已提交。
-        self._maca_recv_events: Dict[int, Optional[torch.cuda.Event]] = {}
+        # 页还在接收：(event, armed_at, generation)。
+        # event 为空且 armed_at 有值：只是占了页，NCCL 还没开始收。
+        # armed_at 为空：已经进入 ncclRecv，要等 event。
+        self._maca_recv_events: Dict[int, tuple] = {}
+        self._maca_recv_gen: Dict[int, int] = {}
         self._maca_copy_events: Dict[tuple, tuple] = {}
         self._maca_q_lock = threading.RLock()
         self._maca_match_cache = None
@@ -556,38 +559,70 @@ class NcclKVTransporter:
         if page_index is None:
             return
         with self._maca_q_lock:
-            self._maca_recv_events.setdefault(int(page_index), None)
+            if page_index in self._maca_recv_events:
+                return
+            generation = self._maca_recv_gen.get(page_index, 0) + 1
+            self._maca_recv_gen[page_index] = generation
+            self._maca_recv_events[page_index] = (None, time.monotonic(), generation)
 
-    def disarm_maca_recv(self, page_index: Optional[int]) -> None:
-        # 只取消还没提交的接收。事件已经记下时，页要等这次接收结束。
+    def maca_recv_generation(self, page_index: Optional[int]) -> Optional[int]:
         if page_index is None:
-            return
-        page = int(page_index)
+            return None
         with self._maca_q_lock:
-            if page in self._maca_recv_events and self._maca_recv_events[page] is None:
-                self._maca_recv_events.pop(page, None)
+            slot = self._maca_recv_events.get(page_index)
+            if slot is None:
+                return None
+            return slot[2]
+
+    def begin_maca_recv(self, page_index: Optional[int], generation: Optional[int]) -> bool:
+        # 进入 ncclRecv 之前调用。预约已经被取消，或页已经换了主人，就不要再写这块缓冲。
+        if page_index is None or generation is None:
+            return False
+        with self._maca_q_lock:
+            slot = self._maca_recv_events.get(page_index)
+            if slot is None or slot[2] != generation:
+                return False
+            self._maca_recv_events[page_index] = (slot[0], None, slot[2])
+            return True
+
+    def disarm_maca_recv(self, page_index: Optional[int]) -> bool:
+        # 只取消还没进入 ncclRecv 的预约。已经在收的页要等这次接收结束。
+        # 取消成功时页可以回到池里。
+        if page_index is None:
+            return False
+        with self._maca_q_lock:
+            slot = self._maca_recv_events.get(page_index)
+            if slot is None:
+                return False
+            event, armed_at, _generation = slot
+            if event is not None or armed_at is None:
+                return False
+            self._maca_recv_events.pop(page_index, None)
+            return True
 
     def maca_page_recv_busy(self, page_index: Optional[int]) -> bool:
         if page_index is None:
             return False
         with self._maca_q_lock:
-            return int(page_index) in self._maca_recv_events
+            return page_index in self._maca_recv_events
 
     def settle_maca_recv(self, page_index: Optional[int]) -> None:
         # 调用方已经 synchronize 过等待这条接收的 stream。
         if page_index is None:
             return
         with self._maca_q_lock:
-            self._maca_recv_events.pop(int(page_index), None)
+            self._maca_recv_events.pop(page_index, None)
 
     def poll_maca_page_idle(self, page_index: Optional[int]) -> bool:
         if page_index is None:
             return True
-        page = int(page_index)
         with self._maca_q_lock:
-            if page not in self._maca_recv_events:
+            slot = self._maca_recv_events.get(page_index)
+            if slot is None:
                 return True
-            event = self._maca_recv_events[page]
+            event, _armed_at, generation = slot
+        # 还没记下 event 的页不能在这里放回池子。任务失败时由 disarm_maca_recv 还页，
+        # 避免和 fail_loop 各还一次。
         if event is None:
             return False
         try:
@@ -597,15 +632,23 @@ class NcclKVTransporter:
         if not done:
             return False
         with self._maca_q_lock:
-            if self._maca_recv_events.get(page) is event:
-                self._maca_recv_events.pop(page, None)
+            current = self._maca_recv_events.get(page_index)
+            if current is not None and current[2] == generation and current[0] is event:
+                self._maca_recv_events.pop(page_index, None)
         return True
 
-    def note_maca_recv(self, page_index: Optional[int], event: torch.cuda.Event) -> None:
+    def note_maca_recv(
+        self, page_index: Optional[int], event: torch.cuda.Event, generation: Optional[int] = None
+    ) -> None:
         if page_index is None:
             return
         with self._maca_q_lock:
-            self._maca_recv_events[int(page_index)] = event
+            slot = self._maca_recv_events.get(page_index)
+            if slot is None:
+                return
+            if generation is not None and slot[2] != generation:
+                return
+            self._maca_recv_events[page_index] = (event, None, slot[2])
 
     def wait_maca_recv(
         self, page_index: Optional[int], stream: torch.cuda.Stream, timeout: Optional[float] = None
@@ -613,13 +656,13 @@ class NcclKVTransporter:
         # 事件还没记下就先等。传输线程仍然不为每一页做 stream.synchronize()。
         if page_index is None:
             return True
-        page = int(page_index)
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         while True:
             with self._maca_q_lock:
-                if page not in self._maca_recv_events:
+                slot = self._maca_recv_events.get(page_index)
+                if slot is None:
                     return True
-                event = self._maca_recv_events[page]
+                event = slot[0]
             if event is not None:
                 try:
                     if event.query():
@@ -1033,8 +1076,18 @@ class _NcclPeer:
             self._recv_page(trans_task)
 
     def _recv_page(self, trans_task: PDChunckedTransTask):
+        page = trans_task.dst_page_index
+        generation = self.transporter.maca_recv_generation(page) if is_maca() else None
+        if is_maca() and generation is None:
+            return
         try:
-            page_tensor = self.transporter.kv_move_buffer[trans_task.dst_page_index]
+            stream = self._get_stream()
+            self._use_stream_for_init(stream)
+            # 建连可能停在 ncclCommInitRank。这之前不碰页缓冲，超时还页后这里直接退出。
+            comm = self._ensure_comm(is_server=False)
+            if is_maca() and not self.transporter.begin_maca_recv(page, generation):
+                return
+            page_tensor = self.transporter.kv_move_buffer[page]
             self._kv_recv_packed = False
             self._linear_rank_packed = False
             payload = self._maca_pack_payload(page_tensor, trans_task, is_recv=True)
@@ -1044,9 +1097,6 @@ class _NcclPeer:
             linear_world = getattr(self, "_linear_world", 0)
             self._kv_recv_packed = False
             self._linear_rank_packed = False
-            stream = self._get_stream()
-            self._use_stream_for_init(stream)
-            comm = self._ensure_comm(is_server=False)
             comm.recv(payload, src=0, stream=stream)
             if kv_packed:
                 with torch.cuda.stream(stream):
@@ -1075,7 +1125,7 @@ class _NcclPeer:
                 event = torch.cuda.Event()
                 event.record(stream)
                 self.last_event = event
-                self.transporter.note_maca_recv(trans_task.dst_page_index, event)
+                self.transporter.note_maca_recv(page, event, generation)
             if self.transporter.args.pd_detail_log:
                 logger.debug(
                     f"NCCL recv page posted request_id={trans_task.request_id} "
@@ -1085,11 +1135,11 @@ class _NcclPeer:
             trans_task.error_info = str(e)
             logger.exception(str(e))
             self._drop_comm()
-            self._note_recv_failure(trans_task)
+            self._note_recv_failure(trans_task, generation)
             self.transporter.send_error_info_to_prefill_node(trans_task)
         return
 
-    def _note_recv_failure(self, trans_task: PDChunckedTransTask) -> None:
+    def _note_recv_failure(self, trans_task: PDChunckedTransTask, generation: Optional[int] = None) -> None:
         page = trans_task.dst_page_index
         stream = self.stream
         if page is None or stream is None:
@@ -1098,7 +1148,7 @@ class _NcclPeer:
         try:
             event = torch.cuda.Event()
             event.record(stream)
-            self.transporter.note_maca_recv(page, event)
+            self.transporter.note_maca_recv(page, event, generation)
         except BaseException:
             logger.exception(f"maca recv failure event record failed request_id={trans_task.request_id}")
             self.transporter.disarm_maca_recv(page)

@@ -642,6 +642,12 @@ class _DecodeTransModule:
         if page_index is None:
             return
         page = int(page_index)
+        # 还没进入 ncclRecv 的预约不要占着页。NCCL 建连卡住时 event 一直是空的，
+        # 16 页会被扣光，后面的块拿不到页，也就发不出 WRITE ready。
+        disarm = getattr(self.transporter, "disarm_maca_recv", None)
+        if is_maca() and disarm is not None and disarm(page):
+            self.page_index_queue.put(page)
+            return
         busy = getattr(self.transporter, "maca_page_recv_busy", None)
         if is_maca() and busy is not None and busy(page):
             with self._held_lock:
