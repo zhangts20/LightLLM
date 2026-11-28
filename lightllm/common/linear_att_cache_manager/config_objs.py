@@ -146,10 +146,7 @@ class LinearAttCacheConfig:
             assert self.full_att_head_dim % group == 0
             per_token = (
                 2 * self.full_att_all_num_kv_heads * self.full_att_head_dim
-                + 2
-                * self.full_att_all_num_kv_heads
-                * (self.full_att_head_dim // group)
-                * self.full_att_dtype.itemsize
+                + 2 * self.full_att_all_num_kv_heads * (self.full_att_head_dim // group) * self.full_att_dtype.itemsize
             )
         elif args.hardware_platform == "ascend" and args.llm_kv_type == "int8kv":
             per_token = self.get_cpu_cache_full_att_packed_bytes_per_rank_token_layer() * self.tp_world_size
@@ -180,6 +177,7 @@ class LinearAttCacheConfig:
             "qwen3_5_moe",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "minicpmv4_6",
         ]
         llm_config = model_cfg.get("text_config", model_cfg)
         if model_type == "sensenova_loop":

@@ -1,4 +1,5 @@
 """MTP verification row-selection kernels."""
+from lightllm.platform import get_backend
 
 from typing import NamedTuple
 
@@ -111,7 +112,7 @@ def select_accepted_tail_rows(
     """Select one accepted-tail row per request in a single CUDA kernel."""
 
     req_num = b_req_mtp_start_loc.shape[0]
-    assert input_ids.is_cuda
+    assert get_backend().runtime.is_device_tensor(input_ids)
     assert hidden.ndim == 2 and hidden.shape[0] == input_ids.shape[0]
     assert hidden.shape[1] > 0
     tensors = (
@@ -126,7 +127,9 @@ def select_accepted_tail_rows(
         b_shared_radix_node_id,
         b_position_delta,
     )
-    assert all(tensor.is_cuda and tensor.device == input_ids.device for tensor in tensors)
+    assert all(
+        get_backend().runtime.is_device_tensor(tensor) and tensor.device == input_ids.device for tensor in tensors
+    )
 
     selected = SelectedMtpRows(
         input_ids=input_ids.new_empty((req_num,)),

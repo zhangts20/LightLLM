@@ -1,3 +1,4 @@
+from lightllm.platform import get_backend
 import torch
 import triton
 import triton.language as tl
@@ -42,10 +43,10 @@ def scatter_routing_topk_to_cpu(
     topk: int,
     dtype_id: int,
 ):
-    assert topk_ids.is_cuda
-    assert mem_indexes.is_cuda
+    assert get_backend().runtime.is_device_tensor(topk_ids)
+    assert get_backend().runtime.is_device_tensor(mem_indexes)
     assert mem_indexes.is_contiguous()
-    assert routing_buffer_ptr.is_cuda
+    assert get_backend().runtime.is_device_tensor(routing_buffer_ptr)
     assert routing_buffer_ptr.dtype == torch.uint64
     assert routing_buffer_ptr.numel() == 1
     assert topk_ids.dim() == 2

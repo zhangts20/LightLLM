@@ -2,7 +2,25 @@ import torch
 
 from lightllm.utils.device_utils import is_corex
 
+
+class _RawDevicePtrHolder:
+    """Expose a device pointer without retaining the allocation it references."""
+
+    def __init__(self, device_ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (device_ptr, False),
+            "version": 3,
+            "strides": None,
+        }
+
+
 def ptr_to_tensor(device_ptr: int, nbytes: int) -> torch.Tensor:
+    from lightllm.utils.device_utils import is_maca
+
+    if is_maca():
+        return torch.as_tensor(_RawDevicePtrHolder(device_ptr, nbytes), device="cuda")
     import cupy as cp
 
     mem = cp.cuda.UnownedMemory(device_ptr, nbytes, owner=None)
@@ -28,10 +46,12 @@ def tensor_to_no_ref_tensor(origin_tensor: torch.Tensor) -> torch.Tensor:
         torch.Tensor: 无引用计数的tensor
     """
     assert origin_tensor.is_contiguous(), "Only support contiguous tensor"
+    if origin_tensor.device.type == "npu":
+        from torch_npu._C import _weak_ref_tensor
+
+        return _weak_ref_tensor(origin_tensor)
     # CoreX reports device type cuda, so the platform flag is checked once and cached.
-    if origin_tensor.device.type in ("musa", "mlu") or (
-        origin_tensor.device.type == "cuda" and is_corex()
-    ):
+    if origin_tensor.device.type in ("musa", "mlu") or (origin_tensor.device.type == "cuda" and is_corex()):
         return _musa_no_ref_tensor(origin_tensor)
     device_ptr = origin_tensor.data_ptr()
     nbytes = origin_tensor.numel() * origin_tensor.element_size()

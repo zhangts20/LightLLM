@@ -3,8 +3,6 @@ from typing import Any, Callable, Optional, Tuple
 
 from lightllm.common.basemodel.triton_kernel.embedding import npu_embedding
 from lightllm.common.basemodel.triton_kernel.multimodal_emb import torch_multimodal_emb
-from lightllm.models.llama.layer_infer.transformer_layer_infer import npu_ffn_fwd
-from lightllm.models.llama.triton_kernel.rotary_emb import npu_rotary_emb_fwd
 from lightllm.platform.base.ops import register_op, out_like
 from lightllm.server.embed_cache.copy_to_cache import torch_offload_embed_tensor_to_cache
 
@@ -63,7 +61,11 @@ def rotary_emb(
     partial_rotary_factor: float = 1.0,
     rotary_impl: Optional[Callable] = None,
 ) -> None:
-    impl = rotary_impl or npu_rotary_emb_fwd
+    if rotary_impl is None:
+        from lightllm.models.llama.triton_kernel.rotary_emb import npu_rotary_emb_fwd
+
+        rotary_impl = npu_rotary_emb_fwd
+    impl = rotary_impl
     impl(
         is_prefill=is_prefill,
         batch_size=batch_size,
@@ -83,11 +85,13 @@ def ffn(
     alloc_func: Callable,
     embed_dim: int,
 ) -> torch.Tensor:
+    from lightllm.models.llama.layer_infer.transformer_layer_infer import npu_ffn_fwd
+
     return npu_ffn_fwd(input, layer_weight, embed_dim)
 
 
 @register_op(
-    "ascend", 
+    "ascend",
     out=lambda kwargs: (
         (kwargs["input_ids"].shape[0], kwargs["weight"].shape[1]),
         kwargs["weight"].dtype,
@@ -109,7 +113,7 @@ def embedding(
 
 
 @register_op(
-    "ascend", 
+    "ascend",
     out=lambda kwargs: (
         (kwargs["weight"].shape[0], kwargs["input"].shape[1]),
         kwargs["weight"].dtype,
@@ -153,6 +157,7 @@ def rms_norm(
 
     return _out
 
+
 @register_op("ascend", out=out_like("input"))
 def layer_norm(
     *,
@@ -162,7 +167,11 @@ def layer_norm(
     eps: float,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    raise NotImplementedError("layer_norm is not supported on ascend")
+    import torch.nn.functional as F
+
+    result = F.layer_norm(input, (input.shape[-1],), weight, bias, eps)
+    out.copy_(result)
+    return out
 
 
 @register_op("ascend")

@@ -20,8 +20,11 @@ class LlavaTokenizer(BaseMultiModalTokenizer):
         self.image_token = model_cfg.get("image_token", "<image>")
         # for llava-v1.5-7b-hf model
         if "text_config" in model_cfg:
-            patch_size = model_cfg["vision_config"]["patch_size"]
-            image_size = model_cfg["vision_config"]["image_size"]
+            from transformers import LlavaConfig
+
+            vision_config = LlavaConfig(**model_cfg).vision_config
+            patch_size = vision_config.patch_size
+            image_size = vision_config.image_size
         else:
             mm_vision_tower = model_cfg.get("mm_vision_tower", "openai/clip-vit-large-patch14-336")
             if isinstance(mm_vision_tower, list):
@@ -53,10 +56,13 @@ class LlavaTokenizer(BaseMultiModalTokenizer):
         raise NotImplementedError
 
     # only change the impl of the encode func:
-    def encode(self, prompt, multimodal_params: MultimodalParams = None):
+    def encode(self, prompt, multimodal_params: MultimodalParams = None, **kwargs):
 
         # split prompt by <image>, and merge parts by [pad_id] * 576
-        ids_chunks = [self.tokenizer(x).input_ids for x in prompt.split(self.image_token)]
+        add_special_tokens = kwargs.get("add_special_tokens", True)
+        ids_chunks = [
+            self.tokenizer(x, add_special_tokens=add_special_tokens).input_ids for x in prompt.split(self.image_token)
+        ]
         input_ids = ids_chunks[0]
         image_id = 0
 
