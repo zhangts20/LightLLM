@@ -312,15 +312,27 @@ class NpuLinearAttMemOperator(LinearAttMemOperator):
     def _flat_token_scale(self, buf: torch.Tensor) -> torch.Tensor:
         return buf.view(buf.shape[0], -1)
 
+    def _int8_packed_bytes(self) -> int:
+        return self.linear_config.get_cpu_cache_full_att_packed_bytes_per_rank_token_layer()
+
     def _ensure_cuda_layout_staging(self, token_num: int) -> torch.Tensor:
         k_flat = self._flat_token_kv(self.mem_manager.k_buffer)
         layers, _, head_num, head_dim = k_flat.shape
-        dtype = self.linear_config.full_att_dtype
+        if self._is_int8_split_kv():
+            packed = self._int8_packed_bytes()
+            buf = getattr(self, "_cpu_cache_kv_staging", None)
+            if buf is None or buf.shape[1] < token_num:
+                self._cpu_cache_kv_staging = torch.empty(
+                    (layers, token_num, packed),
+                    dtype=torch.uint8,
+                    device=self.mem_manager.target_device,
+                )
+            return self._cpu_cache_kv_staging
         buf = getattr(self, "_cpu_cache_kv_staging", None)
-        if buf is None or buf.shape[1] < token_num or buf.dtype != dtype or buf.shape[0] != layers:
+        if buf is None or buf.shape[1] < token_num:
             self._cpu_cache_kv_staging = torch.empty(
                 (layers, token_num, 2 * head_num, head_dim),
-                dtype=dtype,
+                dtype=self.linear_config.full_att_dtype,
                 device=self.mem_manager.target_device,
             )
         return self._cpu_cache_kv_staging
@@ -331,6 +343,31 @@ class NpuLinearAttMemOperator(LinearAttMemOperator):
         remap = torch.arange(n, device=mem_indexes.device, dtype=mem_indexes.dtype)
         remap = torch.where(valid, remap, mem_indexes.new_full((), -1))
         return valid, remap
+
+    def _pack_int8_split_kv(self, packed: torch.Tensor, k, v, k_scale, v_scale, valid):
+        head_num = self.mem_manager.head_num
+        head_dim = self.mem_manager.head_dim
+        kv_bytes = 2 * head_num * head_dim
+        kv_view = packed[:, :, :kv_bytes].view(packed.shape[0], packed.shape[1], 2, head_num, head_dim)
+        kv_view[:, :, 0].copy_(k)
+        kv_view[:, :, 1].copy_(v)
+        scale_view = packed[:, :, kv_bytes : kv_bytes + 8].view(torch.float32)
+        scale_view[:, :, 0].copy_(k_scale)
+        scale_view[:, :, 1].copy_(v_scale)
+        packed.masked_fill_(~valid.view(1, -1, 1), 0)
+        return packed
+
+    def _unpack_int8_split_kv(self, packed: torch.Tensor, valid_mask: torch.Tensor):
+        head_num = self.mem_manager.head_num
+        head_dim = self.mem_manager.head_dim
+        kv_bytes = 2 * head_num * head_dim
+        kv_view = packed[:, :, :kv_bytes].view(packed.shape[0], packed.shape[1], 2, head_num, head_dim)
+        scale_view = packed[:, :, kv_bytes : kv_bytes + 8].view(torch.float32)
+        k_src = kv_view[:, valid_mask, 0]
+        v_src = kv_view[:, valid_mask, 1]
+        k_scale = scale_view[:, valid_mask, 0]
+        v_scale = scale_view[:, valid_mask, 1]
+        return k_src, v_src, k_scale, v_scale
 
     def _gather_split_kv_to_cuda_layout(self, mem_indexes: torch.Tensor):
         n = mem_indexes.numel()
@@ -344,9 +381,8 @@ class NpuLinearAttMemOperator(LinearAttMemOperator):
         if self._is_int8_split_kv():
             k_scale = self._flat_token_scale(self.mem_manager.k_scale_buffer).index_select(1, idx)
             v_scale = self._flat_token_scale(self.mem_manager.v_scale_buffer).index_select(1, idx)
-            dest_dtype = packed.dtype
-            k = (k.float() * k_scale.unsqueeze(-1).unsqueeze(-1)).to(dest_dtype)
-            v = (v.float() * v_scale.unsqueeze(-1).unsqueeze(-1)).to(dest_dtype)
+            self._pack_int8_split_kv(packed, k, v, k_scale, v_scale, valid)
+            return packed, remap
         packed[:, :, :head_num].copy_(k)
         packed[:, :, head_num:].copy_(v)
         packed.masked_fill_(~valid.view(1, -1, 1, 1), 0)
@@ -357,32 +393,18 @@ class NpuLinearAttMemOperator(LinearAttMemOperator):
         valid_idx = mem_indexes.to(torch.int64)[valid]
         if valid_idx.numel() == 0:
             return
-        head_num = self.mem_manager.head_num
-        k_src = packed[:, valid, :head_num]
-        v_src = packed[:, valid, head_num:]
         k_flat = self._flat_token_kv(self.mem_manager.k_buffer)
         v_flat = self._flat_token_kv(self.mem_manager.v_buffer)
         if self._is_int8_split_kv():
-            import torch_npu
-
-            layers, token_num, heads, head_dim = k_src.shape
-            k_q, k_scale = torch_npu.npu_dynamic_quant(
-                k_src.reshape(layers * token_num, -1), dst_type=torch.int8
-            )
-            v_q, v_scale = torch_npu.npu_dynamic_quant(
-                v_src.reshape(layers * token_num, -1), dst_type=torch.int8
-            )
-            k_flat.index_copy_(1, valid_idx, k_q.view(layers, token_num, heads, head_dim))
-            v_flat.index_copy_(1, valid_idx, v_q.view(layers, token_num, heads, head_dim))
-            self._flat_token_scale(self.mem_manager.k_scale_buffer).index_copy_(
-                1, valid_idx, k_scale.view(layers, token_num)
-            )
-            self._flat_token_scale(self.mem_manager.v_scale_buffer).index_copy_(
-                1, valid_idx, v_scale.view(layers, token_num)
-            )
+            k_src, v_src, k_scale, v_scale = self._unpack_int8_split_kv(packed, valid)
+            k_flat.index_copy_(1, valid_idx, k_src)
+            v_flat.index_copy_(1, valid_idx, v_src)
+            self._flat_token_scale(self.mem_manager.k_scale_buffer).index_copy_(1, valid_idx, k_scale)
+            self._flat_token_scale(self.mem_manager.v_scale_buffer).index_copy_(1, valid_idx, v_scale)
             return
-        k_flat.index_copy_(1, valid_idx, k_src)
-        v_flat.index_copy_(1, valid_idx, v_src)
+        head_num = self.mem_manager.head_num
+        k_flat.index_copy_(1, valid_idx, packed[:, valid, :head_num])
+        v_flat.index_copy_(1, valid_idx, packed[:, valid, head_num:])
 
     def load_cpu_cache_to_gpu(self, mem_indexes, page_indexes, cpu_cache_client, req):
         n = mem_indexes.numel()
